@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:11-alpine
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: actix
+      POSTGRES_USER: actix
+      POSTGRES_DB: flash_sale
+    ports:
+      - 5432:5432
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - 6379:6379
+    volumes:
+      - redis_data:/data
+
+  kafka:
+    image: apache/kafka:4.2.0
+    restart: always
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # PLAINTEXT for tools on the host (localhost:9092), INTERNAL for the
+      # app containers (kafka:29092): a client connects to the address the
+      # broker advertises, and localhost means something else in a container
+      KAFKA_LISTENERS: PLAINTEXT://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports:
+      - 9092:9092
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  # The application: `docker compose --profile app up -d --build`. Without the
+  # profile only the services above start, for running the app with cargo.
+  api:
+    profiles: [app]
+    build: .
+    image: flash-sale
+    command: ["flash-sale"]
+    restart: unless-stopped
+    env_file: .env
+    environment: &app_env
+      DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:29092
+      BIND_ADDR: 0.0.0.0:8080
+    ports:
+      - 8080:8080
+    depends_on: [postgres, redis, kafka]
+
+  # Runs every scheduled and on-sale product; more replicas stand by
+  admission-worker:
+    profiles: [app]
+    build: .
+    image: flash-sale
+    command: ["admission_worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment: *app_env
+    # Tables come from the API's migrations
+    depends_on: [api]
+
+  payment-worker:
+    profiles: [app]
+    build: .
+    image: flash-sale
+    command: ["payment_worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment: *app_env
+    depends_on: [api]
+
+  cleanup-worker:
+    profiles: [app]
+    build: .
+    image: flash-sale
+    command: ["cleanup_worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment: *app_env
+    depends_on: [api]
+
+volumes:
+  redis_data:
+  kafka_data:

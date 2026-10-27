@@ -1,0 +1,13 @@
+//! Shared code for the API server and the background workers in `src/bin/`.
+
+pub mod actions;
+pub mod api;
+pub mod auth;
+pub mod cache;
+pub mod config;
+pub mod db;
+pub mod error;
+pub mod models;
+pub mod payment;
+pub mod schema;
+pub mod waiting;

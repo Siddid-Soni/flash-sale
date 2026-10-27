@@ -1,0 +1,5 @@
+target
+.git
+__pycache__
+load
+.env

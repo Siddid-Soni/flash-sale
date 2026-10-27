@@ -1,0 +1,26 @@
+[package]
+name = "flash-sale"
+version = "0.1.0"
+edition = "2021"
+default-run = "flash-sale"
+
+[dependencies]
+actix-web = "4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+argon2 = "0.6"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+kafkit-client = "=0.1.9"
+diesel = { version = "2.0", features = ["postgres", "chrono", "r2d2", "uuid", "serde_json"] }
+diesel_migrations = { version = "2", features = ["postgres"] }
+diesel-derive-enum = { version = "2.1", features = ["postgres"] }
+dotenvy = "0.15"
+r2d2 = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.10"
+uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["full"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager", "script"] }
