@@ -7,6 +7,8 @@ use actix_web::{error, web, HttpResponse};
 use crate::error::ErrorBody;
 
 pub mod admin;
+pub mod checkout;
+pub mod orders;
 pub mod sales;
 pub mod session;
 
@@ -16,6 +18,8 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/v1")
             .configure(session::configure)
             .configure(sales::configure)
+            .configure(checkout::configure)
+            .configure(orders::configure)
             .configure(admin::configure),
     );
 }

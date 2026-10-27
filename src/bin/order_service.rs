@@ -1,5 +1,5 @@
 //! The Order Service: the stateless HTTP API (guest sessions, sale details,
-//! and later checkout, status and the payment webhook). Any number of
+//! checkout and order status, and later the payment webhook). Any number of
 //! replicas can run. It owns the database migrations and the checkout topic,
 //! so it starts before the other binaries.
 //!
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use actix_web::{middleware, web, App, HttpServer};
 
 use flash_sale::{
-    api::{self, sales::SaleCache},
+    api::{self, checkout::SoldOutFlags, sales::SaleCache},
     cache,
     config::Config,
     db, queue,
@@ -45,6 +45,10 @@ async fn main() -> std::io::Result<()> {
     let next_connection = Arc::new(AtomicUsize::new(0));
 
     let sale_cache = web::Data::new(SaleCache::default());
+
+    // One flag set and one refresher task per replica, shared by all workers
+    let sold_out = web::Data::new(SoldOutFlags::default());
+    actix_web::rt::spawn(api::checkout::run_refresher(sold_out.clone(), redis[0].clone()));
     let config = web::Data::new(config);
 
     let bind_addr = config.bind_addr.clone();
@@ -58,6 +62,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(read_cache[i].clone()))
             .app_data(checkout_queue.clone())
             .app_data(sale_cache.clone())
+            .app_data(sold_out.clone())
             .app_data(config.clone())
             .app_data(api::json_config())
             .app_data(api::query_config())

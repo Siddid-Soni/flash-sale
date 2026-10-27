@@ -18,6 +18,33 @@ pub enum OrderStatus {
     Refunded,
 }
 
+impl OrderStatus {
+    /// The name used in Redis (`status:<ticket>`, holds) and in API responses
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OrderStatus::Pending => "PENDING",
+            OrderStatus::AwaitingPayment => "AWAITING_PAYMENT",
+            OrderStatus::Confirmed => "CONFIRMED",
+            OrderStatus::Expired => "EXPIRED",
+            OrderStatus::Failed => "FAILED",
+            OrderStatus::Refunded => "REFUNDED",
+        }
+    }
+
+    /// The inverse of `as_str`; `None` for anything else
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "PENDING" => OrderStatus::Pending,
+            "AWAITING_PAYMENT" => OrderStatus::AwaitingPayment,
+            "CONFIRMED" => OrderStatus::Confirmed,
+            "EXPIRED" => OrderStatus::Expired,
+            "FAILED" => OrderStatus::Failed,
+            "REFUNDED" => OrderStatus::Refunded,
+            _ => return None,
+        })
+    }
+}
+
 /// Guests only: `username` and `email` are NULL until registration exists.
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]
 #[diesel(table_name = users)]
