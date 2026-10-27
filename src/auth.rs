@@ -1,19 +1,14 @@
-//! Password hashing (Argon2id), JWT issuing/validation (HS256), and the
-//! `AuthUser` extractor.
-//! Hashing and verifying take tens of milliseconds of CPU by design, so call
-//! them inside `web::block`, never directly on an async worker.
+//! JWT issuing/validation (HS256) and the `AuthUser` extractor. Every user is
+//! a guest (`POST /v1/session`), so there are no passwords; the user always
+//! comes from the token, never from a request body.
 
 use std::future::{ready, Ready};
-use std::sync::OnceLock;
 
 use actix_web::{dev::Payload, http::header, web, FromRequest, HttpRequest};
-use argon2::{
-    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
-    Argon2,
-};
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use crate::{config::Config, error::ApiError};
 
@@ -23,24 +18,6 @@ pub struct Claims {
     pub sub: String,
     pub iat: i64,
     pub exp: i64,
-}
-
-pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    Ok(Argon2::default().hash_password(password.as_bytes())?.to_string())
-}
-
-/// Checks `password` against `stored_hash`. When the user does not exist,
-/// pass `None`: a dummy hash is still verified, so the response takes as long
-/// as for a real user and does not reveal which usernames exist.
-pub fn verify_password(password: &str, stored_hash: Option<&str>) -> bool {
-    static DUMMY_HASH: OnceLock<String> = OnceLock::new();
-    let dummy = DUMMY_HASH.get_or_init(|| hash_password("dummy-password").expect("hashing a constant succeeds"));
-
-    let hash = stored_hash.unwrap_or(dummy);
-    let matches = PasswordHash::new(hash)
-        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
-        .unwrap_or(false);
-    matches && stored_hash.is_some()
 }
 
 /// Returns a signed token for `user_id` and its expiry time.
@@ -109,18 +86,44 @@ fn authenticate(req: &HttpRequest) -> Result<AuthUser, ApiError> {
     }
 }
 
+/// Marks an operator route (`/v1/admin/*`): requires the `X-Admin-Token`
+/// header to equal `ADMIN_TOKEN`, otherwise `403` before the handler runs. The
+/// comparison takes the same time wherever the strings differ, so the token
+/// cannot be guessed byte by byte (only its length is observable). NGINX also
+/// refuses `/v1/admin/` from outside the internal network (Stage 7).
+#[derive(Debug, Clone, Copy)]
+pub struct AdminAuth;
+
+impl FromRequest for AdminAuth {
+    type Error = ApiError;
+    type Future = Ready<Result<Self, Self::Error>>;
+
+    fn from_request(req: &HttpRequest, _payload: &mut Payload) -> Self::Future {
+        ready(check_admin(req))
+    }
+}
+
+fn check_admin(req: &HttpRequest) -> Result<AdminAuth, ApiError> {
+    let config = req
+        .app_data::<web::Data<Config>>()
+        .ok_or_else(|| ApiError::Internal("Config is not registered as app data".into()))?;
+    let given = req.headers().get("X-Admin-Token").map(|value| value.as_bytes()).unwrap_or_default();
+    if tokens_match(given, config.admin_token.as_bytes()) {
+        Ok(AdminAuth)
+    } else {
+        Err(ApiError::Forbidden("a valid X-Admin-Token header is required".into()))
+    }
+}
+
+/// Constant-time equality; an empty expected token never matches, so an unset
+/// token cannot be satisfied by a missing header.
+fn tokens_match(given: &[u8], expected: &[u8]) -> bool {
+    !expected.is_empty() && bool::from(given.ct_eq(expected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn password_round_trip() {
-        let hash = hash_password("correct horse").unwrap();
-        assert!(hash.starts_with("$argon2id$"));
-        assert!(verify_password("correct horse", Some(&hash)));
-        assert!(!verify_password("wrong horse", Some(&hash)));
-        assert!(!verify_password("dummy-password", None));
-    }
 
     #[test]
     fn token_round_trip() {
@@ -128,5 +131,14 @@ mod tests {
         assert_eq!(verify_token(&token, "secret").unwrap(), 42);
         assert!(verify_token(&token, "other-secret").is_err());
         assert!(verify_token("not-a-token", "secret").is_err());
+    }
+
+    #[test]
+    fn admin_token_comparison() {
+        assert!(tokens_match(b"secret", b"secret"));
+        assert!(!tokens_match(b"secreT", b"secret"));
+        assert!(!tokens_match(b"secret2", b"secret"));
+        assert!(!tokens_match(b"", b"secret"));
+        assert!(!tokens_match(b"", b""));
     }
 }

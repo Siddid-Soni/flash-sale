@@ -1,4 +1,4 @@
-//! Shared code for the API server and the background workers in `src/bin/`.
+//! Shared code for the Order Service and the background workers in `src/bin/`.
 
 pub mod actions;
 pub mod api;
@@ -9,5 +9,5 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod payment;
+pub mod queue;
 pub mod schema;
-pub mod waiting;

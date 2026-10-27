@@ -7,33 +7,21 @@ pub mod sql_types {
 }
 
 diesel::table! {
-    inventory (product_id) {
-        product_id -> Int4,
-        stock_total -> Int4,
-        stock -> Int4,
-        version -> Int4,
-        updated_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::OrderStatus;
 
     orders (id) {
-        id -> Uuid,
+        id -> Int8,
         user_id -> Int4,
         product_id -> Int4,
-        quantity -> Int4,
-        unit_price_cents -> Int4,
-        total_cents -> Int4,
+        queue_ticket_id -> Text,
+        idempotency_key -> Text,
         status -> OrderStatus,
-        #[max_length = 255]
-        payment_idempotency_key -> Nullable<Varchar>,
-        #[max_length = 255]
-        payment_intent_id -> Nullable<Varchar>,
+        amount_cents -> Int4,
+        payment_session_id -> Nullable<Text>,
+        checkout_url -> Nullable<Text>,
+        expires_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
-        expires_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
 }
@@ -41,8 +29,6 @@ diesel::table! {
 diesel::table! {
     payment_inbox (id) {
         id -> Int8,
-        #[max_length = 50]
-        provider -> Varchar,
         #[max_length = 255]
         provider_event_id -> Varchar,
         #[max_length = 100]
@@ -58,19 +44,12 @@ diesel::table! {
 diesel::table! {
     products (id) {
         id -> Int4,
-        #[max_length = 64]
-        sku -> Varchar,
         #[max_length = 255]
         name -> Varchar,
-        description -> Text,
-        #[max_length = 1024]
-        image_url -> Nullable<Varchar>,
         price_cents -> Int4,
-        max_per_user -> Int4,
-        sale_opens_at -> Timestamptz,
-        sale_ends_at -> Timestamptz,
-        #[max_length = 20]
-        status -> Varchar,
+        total_inventory -> Int4,
+        sold -> Int4,
+        sale_start_time -> Timestamptz,
         created_at -> Timestamptz,
     }
 }
@@ -81,14 +60,12 @@ diesel::table! {
         #[max_length = 255]
         username -> Nullable<Varchar>,
         #[max_length = 255]
-        password_hash -> Nullable<Varchar>,
-        is_guest -> Bool,
+        email -> Nullable<Varchar>,
         created_at -> Timestamptz,
     }
 }
 
-diesel::joinable!(inventory -> products (product_id));
 diesel::joinable!(orders -> products (product_id));
 diesel::joinable!(orders -> users (user_id));
 
-diesel::allow_tables_to_appear_in_same_query!(inventory, orders, payment_inbox, products, users,);
+diesel::allow_tables_to_appear_in_same_query!(orders, payment_inbox, products, users,);

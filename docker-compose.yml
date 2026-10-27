@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:11-alpine
+    image: postgres:16-alpine
     restart: always
     environment:
       POSTGRES_PASSWORD: actix
@@ -46,53 +46,45 @@ services:
 
   # The application: `docker compose --profile app up -d --build`. Without the
   # profile only the services above start, for running the app with cargo.
-  api:
+  order-service:
     profiles: [app]
     build: .
-    image: flash-sale
-    command: ["flash-sale"]
+    image: flash_sale
+    command: ["order_service"]
     restart: unless-stopped
     env_file: .env
     environment: &app_env
       DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
       REDIS_URL: redis://redis:6379
+      READ_CACHE_URL: redis://redis:6379
       KAFKA_BROKERS: kafka:29092
       BIND_ADDR: 0.0.0.0:8080
     ports:
       - 8080:8080
     depends_on: [postgres, redis, kafka]
 
-  # Runs every scheduled and on-sale product; more replicas stand by
-  admission-worker:
+  # Consumes orders.checkout and the payment inbox; run as many as partitions
+  order-processor:
     profiles: [app]
     build: .
-    image: flash-sale
-    command: ["admission_worker"]
+    image: flash_sale
+    command: ["order_processor"]
     restart: unless-stopped
     env_file: .env
     environment: *app_env
-    # Tables come from the API's migrations
-    depends_on: [api]
+    # Tables and the topic come from the Order Service's startup
+    depends_on: [order-service]
 
-  payment-worker:
+  # Releases unpaid and leaked holds; several can run at once
+  expiration-worker:
     profiles: [app]
     build: .
-    image: flash-sale
-    command: ["payment_worker"]
+    image: flash_sale
+    command: ["expiration_worker"]
     restart: unless-stopped
     env_file: .env
     environment: *app_env
-    depends_on: [api]
-
-  cleanup-worker:
-    profiles: [app]
-    build: .
-    image: flash-sale
-    command: ["cleanup_worker"]
-    restart: unless-stopped
-    env_file: .env
-    environment: *app_env
-    depends_on: [api]
+    depends_on: [order-service]
 
 volumes:
   redis_data:

@@ -1,25 +1,23 @@
 //! HTTP layer. Each file owns one group of routes and exposes `configure`,
-//! which `configure` below mounts on the app. Handlers return
+//! which `configure` below mounts on the app under `/v1`. Handlers return
 //! `Result<_, ApiError>`; they call `crate::actions` inside `web::block` for database work.
 
 use actix_web::{error, web, HttpResponse};
 
 use crate::error::ErrorBody;
 
-pub mod auth;
-pub mod orders;
-pub mod payments;
-pub mod products;
-pub mod reservations;
-pub mod waiting_room;
+pub mod admin;
+pub mod sales;
+pub mod session;
 
+/// Every route lives under `/v1` (the fake payment page, added in Stage 5, is the exception).
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.configure(auth::configure)
-        .configure(products::configure)
-        .configure(waiting_room::configure)
-        .configure(reservations::configure)
-        .configure(payments::configure)
-        .configure(orders::configure);
+    cfg.service(
+        web::scope("/v1")
+            .configure(session::configure)
+            .configure(sales::configure)
+            .configure(admin::configure),
+    );
 }
 
 /// Returns malformed JSON bodies as `400 {"message": ...}` like every other error.

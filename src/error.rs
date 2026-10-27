@@ -17,6 +17,10 @@ pub enum ApiError {
     Conflict(String),
     #[error("{0}")]
     Gone(String),
+    #[error("{0}")]
+    TooManyRequests(String),
+    #[error("{0}")]
+    ServiceUnavailable(String),
     #[error("internal error")]
     Internal(String),
 }
@@ -35,6 +39,8 @@ impl ResponseError for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Gone(_) => StatusCode::GONE,
+            ApiError::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -79,8 +85,10 @@ impl From<actix_web::error::BlockingError> for ApiError {
     }
 }
 
-impl From<crate::waiting::QueueError> for ApiError {
-    fn from(err: crate::waiting::QueueError) -> Self {
-        ApiError::Internal(err.to_string())
+/// A failed publish is a temporary condition: the client retries with the same key.
+impl From<crate::queue::QueueError> for ApiError {
+    fn from(err: crate::queue::QueueError) -> Self {
+        log::error!("{err}");
+        ApiError::ServiceUnavailable("the checkout queue is unavailable, retry shortly".into())
     }
 }

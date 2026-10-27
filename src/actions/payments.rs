@@ -1,5 +1,5 @@
 //! The payment inbox: provider events are stored first and processed by the
-//! payment worker, which claims unprocessed rows with `FOR UPDATE SKIP LOCKED`
+//! order processor, which claims unprocessed rows with `FOR UPDATE SKIP LOCKED`
 //! so several workers can share the work.
 
 use chrono::Utc;
