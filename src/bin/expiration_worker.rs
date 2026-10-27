@@ -1,8 +1,11 @@
-//! Expiration worker: releases unpaid holds (`holds:expiry`) and leaked holds
-//! (`holds:pending` behind processor progress), the only place stock is
-//! returned besides immediate compensation, and sweeps up orders a crashed
-//! worker left behind. The logic is in `flash_sale::expiry`; this is the loop.
-//! Any number can run at once: the release script hands each hold to one worker.
+//! Expiration worker: settles the holds whose payment deadline has passed
+//! (`holds:expiry`): PostgreSQL says which were paid and which were not, the
+//! unpaid ones are released and the paid ones counted in `sold:{sale}`. Also
+//! releases leaked holds (`holds:pending` behind processor progress), the only
+//! other place stock is returned besides immediate compensation, and sweeps up
+//! orders a crashed worker left behind. The logic is in `flash_sale::expiry`;
+//! this is the loop. Any number can run at once: the scripts hand each hold to
+//! one worker.
 //!
 //! The sales to watch are read from PostgreSQL every few seconds. After an
 //! error in Redis, Kafka or PostgreSQL the worker backs off (0.5 s doubling
@@ -44,7 +47,7 @@ async fn main() {
     let pool = db::init_pool(&config);
     let inventory = cache::connect(&config).await;
     let read_cache = cache::connect_read_cache(&config).await;
-    let provider = payment::from_config(&config, inventory.clone());
+    let provider = payment::from_config(&config);
     let lag = KafkaLag::new(&config).expect("the Kafka consumer should start");
     let expirer = Expirer::new(pool, inventory, read_cache, provider, Arc::new(lag), Settings::from_config(&config));
 
@@ -90,11 +93,17 @@ async fn main() {
         }
 
         match expirer.unpaid_pass(&sales).await {
-            Ok(Pass { released, more: full }) => {
+            Ok(Pass { released, confirmed, dropped, more: full }) => {
                 outages.worked("The unpaid-hold loop");
                 more |= full;
                 if released > 0 {
                     log::info!("Released {released} unpaid holds");
+                }
+                if confirmed > 0 {
+                    log::info!("Counted {confirmed} paid holds as sold");
+                }
+                if dropped > 0 {
+                    log::warn!("Dropped {dropped} holds whose payment PostgreSQL refused");
                 }
             }
             Err(e) => {
@@ -105,7 +114,7 @@ async fn main() {
 
         if due(last_leaked, leaked_every) {
             match expirer.leaked_pass(&sales).await {
-                Ok(Pass { released, more: full }) => {
+                Ok(Pass { released, more: full, .. }) => {
                     last_leaked = Some(Instant::now());
                     outages.worked("The leaked-hold loop");
                     more |= full;
@@ -125,11 +134,12 @@ async fn main() {
                 Ok(swept) => {
                     last_sweep = Some(Instant::now());
                     outages.worked("The stale-order sweep");
-                    if swept.expired + swept.failed > 0 {
+                    if swept.expired + swept.failed + swept.repaired > 0 {
                         log::warn!(
-                            "Swept {} orders left AWAITING_PAYMENT and {} left PENDING after their hold ended",
+                            "Swept {} orders left AWAITING_PAYMENT and {} left PENDING after their hold ended; repaired {} EXPIRED orders",
                             swept.expired,
-                            swept.failed
+                            swept.failed,
+                            swept.repaired
                         );
                     }
                 }

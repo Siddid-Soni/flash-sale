@@ -162,7 +162,7 @@ impl Processor {
         // a. The hold must still be PENDING
         let hold = match cache::read_hold(&mut inventory, sale, ticket).await? {
             Some(hold) if hold.state == "PENDING" => hold,
-            Some(hold) if hold.state == "AWAITING_PAYMENT" || hold.state == "PAID" => {
+            Some(hold) if hold.state == "AWAITING_PAYMENT" => {
                 // Redelivery after the link was made. The crash may have come
                 // before the status write, so write it again from the order
                 let lookup = ticket.to_string();

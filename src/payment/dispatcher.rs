@@ -1,9 +1,10 @@
-//! The fake provider's webhook delivery: a background task that takes due
-//! events from the outbox and POSTs them, signed, to the merchant's webhook
-//! URL, like a real provider's delivery system. The payment page only queues
-//! an event; nothing waits for its delivery.
+//! The fake provider's webhook delivery: a background task of the
+//! `fake_payment_provider` binary that takes due events from the outbox and
+//! POSTs them, signed, to the merchant's webhook URL, like a real provider's
+//! delivery system. The payment page only queues an event; nothing waits for
+//! its delivery.
 //!
-//! - Several Order Service replicas may each run a dispatcher: an event is
+//! - Several provider replicas may each run a dispatcher: an event is
 //!   taken with a lease (`FakeProvider::claim_due_events`), so one delivers it
 //!   at a time. A dispatcher that dies mid-delivery leaves the event to be
 //!   taken again when the lease ends, so delivery is at-least-once; the
@@ -15,8 +16,8 @@
 //! - Every attempt is signed afresh, so a retry hours later carries a current
 //!   timestamp and passes the receiver's replay check.
 //!
-//! The client is `awc` without TLS: the target is the Order Service on the
-//! same network, plain HTTP.
+//! The client is `awc` without TLS: the target is the gateway (which forwards
+//! to an order processor) on the same network, plain HTTP.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +26,7 @@ use chrono::Utc;
 
 use super::{webhook::SIGNATURE_HEADER, FakeProvider, OutboxEvent, PaymentError, PaymentResult};
 
-/// Delivery timings; `Default` is what `order_service` runs with
+/// Delivery timings; `Default` is what `fake_payment_provider` runs with
 #[derive(Debug, Clone)]
 pub struct DispatcherSettings {
     /// How often an idle dispatcher looks for due events

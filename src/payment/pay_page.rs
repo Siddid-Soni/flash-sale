@@ -1,27 +1,22 @@
 //! The fake provider's payment page, `/fake-pay/{session_id}` (roadmap step
-//! 19). It stands in for the page Stripe hosts: the user sees the amount and
-//! pays or cancels with a plain HTML form, and the browser is sent back to
-//! the sale (`{FRONTEND_URL}/?sale=<id>`, where the frontend resumes).
+//! 19), served by the `fake_payment_provider` binary. It stands in for the
+//! page Stripe hosts: the user sees the amount and pays or cancels with a
+//! plain HTML form, and the browser is sent back to the sale
+//! (`{FRONTEND_URL}/?sale=<id>`, where the frontend resumes). The gateway
+//! proxies `/fake-pay/` to the provider.
 //!
 //! The page reads and writes sessions only through `FakeProvider`. It does
 //! not call the backend: pressing a button settles the session and queues a
 //! webhook event, and the provider's dispatcher delivers that separately
 //! (`crate::payment::dispatcher`). The provider does not know about our hold,
-//! so paying an `OPEN` session always works, even after the hold ran out;
-//! the backend then refunds. Paying an `EXPIRED` session is refused.
-//!
-//! Served only when `PAYMENT_PROVIDER=fake`: without a `FakeProvider` in the
-//! app data every route answers `404`.
+//! so paying an `OPEN` session always works, even after the deadline; the
+//! backend then refunds. Paying an `EXPIRED` session is refused.
 
 use actix_web::{get, http::header, post, web, HttpResponse};
 use chrono::{DateTime, Utc};
 
-use crate::{
-    cache,
-    config::Config,
-    error::ApiError,
-    payment::{FakeProvider, FakeSession, Settle, Settled},
-};
+use super::{FakeProvider, FakeSession, Settle, Settled};
+use crate::{cache, config::Config, error::ApiError};
 
 /// Escapes text for HTML element content and quoted attributes
 fn escape(text: &str) -> String {
@@ -120,10 +115,9 @@ fn redirect(location: &str) -> HttpResponse {
 #[get("/fake-pay/{session_id}")]
 async fn show(
     path: web::Path<String>,
-    provider: Option<web::Data<FakeProvider>>,
+    provider: web::Data<FakeProvider>,
     config: web::Data<Config>,
 ) -> Result<HttpResponse, ApiError> {
-    let Some(provider) = provider else { return Ok(not_found()) };
     let session_id = path.into_inner();
     let Some(session) = provider.session(&session_id).await? else { return Ok(not_found()) };
     if session.state != "OPEN" {
@@ -148,10 +142,9 @@ async fn show(
 async fn settle(
     session_id: String,
     action: Settle,
-    provider: Option<web::Data<FakeProvider>>,
+    provider: web::Data<FakeProvider>,
     config: &Config,
 ) -> Result<HttpResponse, ApiError> {
-    let Some(provider) = provider else { return Ok(not_found()) };
     let Some(session) = provider.session(&session_id).await? else { return Ok(not_found()) };
     match provider.settle(&session, action).await? {
         Settled::Moved | Settled::Already => Ok(redirect(&return_url(config, &session.ticket))),
@@ -164,7 +157,7 @@ async fn settle(
 #[post("/fake-pay/{session_id}/pay")]
 async fn pay(
     path: web::Path<String>,
-    provider: Option<web::Data<FakeProvider>>,
+    provider: web::Data<FakeProvider>,
     config: web::Data<Config>,
 ) -> Result<HttpResponse, ApiError> {
     settle(path.into_inner(), Settle::Pay, provider, &config).await
@@ -174,7 +167,7 @@ async fn pay(
 #[post("/fake-pay/{session_id}/cancel")]
 async fn cancel(
     path: web::Path<String>,
-    provider: Option<web::Data<FakeProvider>>,
+    provider: web::Data<FakeProvider>,
     config: web::Data<Config>,
 ) -> Result<HttpResponse, ApiError> {
     settle(path.into_inner(), Settle::Cancel, provider, &config).await

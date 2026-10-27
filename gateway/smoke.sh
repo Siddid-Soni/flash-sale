@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Smoke test for the gateway (Stage 7). Needs the whole stack:
+# Smoke test for the gateway (Stage 7). Needs the whole stack, including the fake
+# payment provider and the order processor behind it:
 #     docker compose --profile app up -d --build
 # Run from anywhere:  gateway/smoke.sh
 # Prints PASS or FAIL per check and exits non-zero if any check failed.
@@ -143,8 +144,28 @@ code=$(curl -s -o "$TMP/b" -w '%{http_code}' -H 'User-Agent:' "$BASE/v1/sales/$S
 [ "$code" = 403 ] && pass "bots: an empty User-Agent gets 403" || fail "bots: an empty User-Agent gets 403" "status $code"
 code=$(call "$BASE/v1/sales/$SALE")
 [ "$code" = 200 ] && pass "bots: a browser User-Agent works" || fail "bots: a browser User-Agent works" "status $code"
+# The webhook is exempt from the bot filter: a bot User-Agent gets the webhook's own answer (the
+# address check), not the bot filter's
 code=$(curl -s -o "$TMP/b" -w '%{http_code}' -A 'python-requests/2.31' -X POST -d '{}' "$BASE/v1/payments/webhook")
-{ [ "$code" != 403 ] && [ "$code" != 429 ]; } && pass "bots: the webhook is exempt from the bot filter (app answered $code)" || fail "bots: the webhook is exempt from the bot filter" "status $code"
+{ [ "$code" = 403 ] && ! grep -q 'automated clients' "$TMP/b"; } && pass "bots: the webhook is exempt from the bot filter (it answers on its own terms: $code)" || fail "bots: the webhook is exempt from the bot filter" "status $code: $(cat "$TMP/b")"
+
+# --- 6b. the payment webhook: only the provider's address -----------------------
+code=$(call -X POST -H 'Content-Type: application/json' -d '{}' "$BASE/v1/payments/webhook")
+if [ "$code" = 403 ] && jq -e '.message | contains("payment provider")' "$TMP/b" >/dev/null; then
+    pass "webhook: POST /v1/payments/webhook from the host is 403 (JSON)"
+else
+    fail "webhook: POST /v1/payments/webhook from the host is 403 (JSON)" "status $code: $(cat "$TMP/b")"
+fi
+# The provider's address in a forged X-Forwarded-For must not open it
+code=$(call -X POST -H 'X-Forwarded-For: 172.28.0.50' -H 'Content-Type: application/json' -d '{}' "$BASE/v1/payments/webhook")
+[ "$code" = 403 ] && pass "webhook: a forged X-Forwarded-For does not open it" || fail "webhook: a forged X-Forwarded-For does not open it" "status $code"
+# From inside the network but not from the provider's address (the gateway itself) it is refused too
+out=$(docker compose exec -T gateway wget -qO- --post-data '{}' --header 'Content-Type: application/json' \
+    http://127.0.0.1/v1/payments/webhook 2>&1 </dev/null)
+[[ "$out" == *"403"* ]] && pass "webhook: from the gateway container (not the provider's address) it is 403" || fail "webhook: from the gateway container it is 403" "$out"
+# The payment page is the provider's, behind the gateway
+code=$(call "$BASE/fake-pay/fake_cs_nothing")
+[ "$code" = 404 ] && grep -q 'does not exist' "$TMP/b" && pass "provider: /fake-pay/ is served by the provider (unknown session: 404 page)" || fail "provider: /fake-pay/ is served by the provider" "status $code"
 
 # --- 7. failover ------------------------------------------------------------
 docker compose --profile app stop order-service-2 >/dev/null 2>&1
@@ -206,7 +227,7 @@ if [ -n "$ticket" ] && poll_until AWAITING_PAYMENT 60; then
     code=$(call -X POST "$pay_url/pay")
     [[ "$code" == 303 ]] && pass "purchase: the fake-pay form post is accepted (303 back to the sale)" || fail "purchase: the fake-pay form post is accepted" "status $code"
     if poll_until CONFIRMED 60; then
-        pass "purchase: status reaches CONFIRMED (the webhook came back through the gateway)"
+        pass "purchase: status reaches CONFIRMED (the webhook came from the provider, through the gateway, to an order processor)"
     else
         fail "purchase: status reaches CONFIRMED" "last status: $(jq -r .status "$TMP/b")"
     fi

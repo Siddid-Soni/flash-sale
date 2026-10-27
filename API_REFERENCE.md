@@ -1,6 +1,6 @@
 # API Reference
 
-All examples go through the gateway at `http://localhost:8000` (see [README.md](README.md) to start the stack). Every route is under `/v1` except the fake provider's payment page. Bodies are JSON. Money is integer cents. Times are ISO 8601 in UTC.
+All examples go through the gateway at `http://localhost:8000` (see [README.md](README.md) to start the stack). Every route is under `/v1` except the fake provider's payment page. The Order Service replicas serve the routes under `/v1` except the webhook, which the order processors serve; the payment page is served by the fake provider's container. The gateway sends each to the right place. Bodies are JSON. Money is integer cents. Times are ISO 8601 in UTC.
 
 ## Conventions
 
@@ -32,7 +32,7 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 | `Location` | checkout `200`/`202`, fake payment page `303` | Status URL / where the browser goes back to |
 | `Retry-After` | `503` from checkout, every `429`, gateway `503` | Seconds to wait (always `1`) |
 | `Cache-Control` | sale details `public, max-age=1`; status `no-store`; gateway errors `no-store` | |
-| `X-Replica` | every Order Service response when `REPLICA_ID` is set (compose sets `1`..`3`) | Which replica answered |
+| `X-Replica` | every Order Service response when `REPLICA_ID` is set (compose sets `1`..`3`); not on the webhook or the payment page | Which replica answered |
 | `X-Cache-Status` | `GET /v1/sales/{id}` | NGINX cache result: `MISS`, `HIT`, `UPDATING`, `STALE` |
 
 ## Routes
@@ -43,9 +43,9 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 | `GET /v1/sales/{sale_id}` | none | Sale details |
 | `POST /v1/sales/{sale_id}/checkout` | user | Reserve one unit |
 | `GET /v1/orders/status/{queue_ticket_id}` | user | Poll an order |
-| `POST /v1/payments/webhook` | signature | Payment provider events |
+| `POST /v1/payments/webhook` | provider's address and signature | Payment provider events (served by the order processors) |
 | `POST /v1/admin/sales` | `X-Admin-Token` | Create a sale |
-| `GET /fake-pay/{session_id}` | none | The fake provider's payment page |
+| `GET /fake-pay/{session_id}` | none | The fake provider's payment page (served by the provider) |
 | `POST /fake-pay/{session_id}/pay` | none | Pay |
 | `POST /fake-pay/{session_id}/cancel` | none | Cancel |
 
@@ -124,10 +124,10 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 |---|---|---|
 | `PENDING` | `position` | In the queue. `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition (a fallback answer) |
 | `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds). If the cache entry is gone and the order row does not exist yet, the answer from the hold alone has neither |
-| `CONFIRMED` | | Paid and counted. Final |
+| `CONFIRMED` | | Paid in time (PostgreSQL decided) and counted. Final. Answered from PostgreSQL while the hold is still waiting for the expiration worker |
 | `EXPIRED` | | The payment window ran out and the unit was returned. Final |
 | `FAILED` | | The hold was released before a payment link existed (publish failed, a leaked hold, or released while the processor worked). Final |
-| `REFUNDED` | | A payment arrived but could not be honoured (hold already released, or the PostgreSQL guard refused) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
+| `REFUNDED` | | A payment arrived but could not be honoured (PostgreSQL's deadline had passed, the order was already `EXPIRED` or `FAILED`, or the PostgreSQL guard refused) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
 
 ```json
 {"status": "PENDING", "position": 42}
@@ -144,12 +144,16 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 
 ### `POST /v1/payments/webhook`
 
-Called by the payment provider, not by clients. The body is the event exactly as signed.
+Called by the payment provider, not by clients, and served by the order processors (`PROCESSOR_HTTP_ADDR`, port 8081), not by the Order Service. The body is the event exactly as signed.
+
+**Who may call it.** Two layers. The gateway admits only the provider's addresses (`gateway/payment_provider_ips.conf`: locally the provider container's fixed address `172.28.0.50`; in production the provider's published webhook IPs, e.g. Stripe's) and answers everyone else `403 {"message": "the payment webhook is only reachable from the payment provider"}`; it checks the real TCP peer, so a forged `X-Forwarded-For` does not help. The processor then verifies the signature (below), so an address on the list that is not the provider still cannot forge an event.
 
 | Status | Meaning |
 |---|---|
-| `200` `{"received": true}` | The event is stored in `payment_inbox` (also when it was stored before). A success event also claims the hold at once; if that fails, or the claim is lost, the response is still `200`: the event is stored and an order processor confirms or refunds it |
+| `200` `{"received": true}` | The event is stored in `payment_inbox` (also when it was stored before). A success event is handled at once: PostgreSQL decides between the payment and the deadline, and the order is `CONFIRMED`, or `REFUNDED` and refunded through the provider. If handling fails after the event was stored, the response is still `200`: the order processors' inbox loop retries it, so the provider need not |
 | `400` `{"message": "invalid webhook"}` | Signature missing, malformed, wrong, older or newer than 5 minutes, or the event is not readable. Nothing is stored |
+| `403` | Gateway: not from the provider's address |
+| `500` | The event could not be stored (database down). The provider retries |
 
 **Signature.** Header `Fake-Signature: t=<unix seconds>,v1=<hex>`, where `v1` is `HMAC-SHA256(PAYMENT_WEBHOOK_SECRET, "<t>.<raw body>")` in lowercase hex. Several `v1=` entries are accepted (key rotation). The timestamp must be within 300 seconds of the receiver's clock, so a captured request cannot be replayed later; the provider signs again for every delivery attempt, so a retry hours later still passes.
 
@@ -176,10 +180,10 @@ That event is made up, but it is stored and a processor keeps retrying it becaus
 
 | `type` | Sent when | Effect |
 |---|---|---|
-| `checkout.session.completed` | The user paid (`payment_id` is set) | The hold is claimed; a processor confirms or refunds |
+| `checkout.session.completed` | The user paid (`payment_id` is set) | The order is confirmed if its deadline is still ahead on PostgreSQL's clock, else refunded |
 | `checkout.session.payment_failed` | The user cancelled (`payment_id` is `null`) | Nothing; the hold runs out by itself |
 
-`id` and `payment_id` are derived from the session, so a redelivered event has the same id and the inbox's unique `provider_event_id` drops the duplicate. The fake provider delivers at least once: it retries with a delay of 1 s doubling to 1 h and gives up after 24 h. The webhook route has no rate limit and no bot check at the gateway.
+`id` and `payment_id` are derived from the session, so a redelivered event has the same id and the inbox's unique `provider_event_id` drops the duplicate. The fake provider delivers at least once: it retries with a delay of 1 s doubling to 1 h and gives up after 24 h. The webhook route has no rate limit and no bot check at the gateway (only the address check).
 
 ### `POST /v1/admin/sales`
 
@@ -202,7 +206,7 @@ Body: `name` (1-255 characters), `price_cents` (positive), `total_inventory` (1 
 
 ### Fake payment page
 
-`GET /fake-pay/{session_id}` is the page the user is sent to (`payment_url`): amount, ticket, deadline, a Pay and a Cancel button. It is HTML, `Cache-Control: no-store`, and exists only while `PAYMENT_PROVIDER=fake`. `POST /fake-pay/{session_id}/pay` and `/cancel` settle the session and queue the webhook event.
+`GET /fake-pay/{session_id}` is the page the user is sent to (`payment_url`): amount, ticket, deadline, a Pay and a Cancel button. It is served by the `fake_payment_provider` container (the gateway proxies `/fake-pay/` to it), is HTML with `Cache-Control: no-store`. `POST /fake-pay/{session_id}/pay` and `/cancel` settle the session and queue the webhook event.
 
 | Status | Meaning |
 |---|---|
@@ -212,31 +216,40 @@ Body: `name` (1-255 characters), `price_cents` (positive), `total_inventory` (1 
 | `409` | The session is already `PAID`, `CANCELED` or `REFUNDED` (page says so) |
 | `410` | The session is `EXPIRED`; payment is no longer possible |
 
-The provider does not know about our hold. It accepts a payment on any `OPEN` session, even after the hold's deadline, and the backend then refunds. It refuses only `EXPIRED` sessions, which the expiration worker sets after releasing a hold. Sessions live 7 days so a late payment can still be refunded.
+The provider does not know about our hold. It accepts a payment on any `OPEN` session, even after the deadline, and the backend then refunds. It refuses only `EXPIRED` sessions, which the expiration worker sets after releasing a hold. Sessions live 7 days so a late payment can still be refunded.
+
+### Fake provider API (internal)
+
+Not reachable through the gateway: the order processor and the expiration worker call it on the compose network (`PAYMENT_PROVIDER_URL`, `http://fake-payment-provider:8090`). It is shaped like Stripe's and every call is idempotent. Errors have the usual `{"message": ...}` body.
+
+| Call | Meaning |
+|---|---|
+| `POST /v1/checkout/sessions` with header `Idempotency-Key` (required) and body `{"ticket", "amount_cents", "expires_at"}` (RFC 3339) | Creates a session; `200 {"id", "url", "state"}`. The same ticket always gets the same session, whatever the key or the session's state. `400` for a missing key, a negative amount or a malformed body |
+| `POST /v1/checkout/sessions/{id}/expire` | Stops an open session from accepting payment. `200 {"id", "state"}` also for an unknown, paid or already expired session |
+| `POST /v1/refunds` with body `{"session_id"}` | Refunds a paid session: `200`, and `200` again when repeated. `409` for a session that was not paid or is unknown |
 
 ## Order and hold states
 
-An order has one of six statuses (`orders.status`, `status:<ticket>`, API). The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it.
+An order has one of six statuses (`orders.status`, `status:<ticket>`, API). The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker settles the hold.
 
 ```
-checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(payment claimed)--> PAID --> CONFIRMED
+checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_at)--> CONFIRMED
                |                              |
                | leaked: behind progress      | unpaid: 5 min after the link
                v                              v
-            FAILED                         EXPIRED
+            FAILED                         EXPIRED          (a payment after the deadline: REFUNDED)
 ```
 
 | Status | Hold state | Waiting for | Leaves by |
 |---|---|---|---|
 | `PENDING` | `PENDING` | An order processor (no clock runs) | Link ready; or release: publish failed (at once), or leaked (expiration worker) |
-| `AWAITING_PAYMENT` | `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment claimed; or release when `expires_at` has passed (expiration worker) |
-| (none: still `AWAITING_PAYMENT` to clients) | `PAID` | A processor to commit the order | `CONFIRMED`, or `REFUNDED` if the PostgreSQL guard refuses. Never released |
-| `CONFIRMED` | `CONFIRMED` | | Final |
+| `AWAITING_PAYMENT` | `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment: the order becomes `CONFIRMED` in PostgreSQL (the hold stays `AWAITING_PAYMENT` and in `holds:expiry`); or, at `expires_at`, the expiration worker expires the order and releases the hold |
+| `CONFIRMED` | `AWAITING_PAYMENT`, then `CONFIRMED` | The expiration worker, at the deadline | The worker closes the hold and counts it in `sold:{sale}` (no stock returned). Final |
 | `EXPIRED` | `EXPIRED` | | Final (a late payment still turns it into `REFUNDED`) |
 | `FAILED` | `FAILED` | | Final (same) |
-| `REFUNDED` | `REFUNDED` (guard failure) | | Final |
+| `REFUNDED` | `AWAITING_PAYMENT`, then `EXPIRED` (late payment) or `REFUNDED` (guard failure) | The expiration worker, at the deadline | Late payment: the worker releases the hold. Guard failure: it closes the hold without stock or count. Final |
 
-The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`).
+The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`). A paid hold stays `AWAITING_PAYMENT` in Redis until the worker settles it, so the status endpoint reads the order row from PostgreSQL when the hold says `AWAITING_PAYMENT` and the read cache has no entry. `sold:{sale}` is counted only by the worker, so it follows `products.sold` up to one payment window later.
 
 ## Gateway behaviour
 
@@ -247,6 +260,7 @@ What a client sees from NGINX before the app answers (details in [gateway/README
 | Over a rate limit | `429 {"message": "too many requests, retry after a moment"}` with `Retry-After: 1`. Limits: `POST /v1/session` 1 r/s per IP (burst 5); checkout 2 r/s per user (burst 5) and 20 r/s per IP (burst 40); status 2 r/s per user (burst 10); 100 concurrent connections per IP on `/v1/*` and `/fake-pay/*`. The webhook and static files are not limited |
 | Empty `User-Agent`, or one containing `bot`, `crawler`, `spider`, or matching `python-requests`, `python-urllib`, `go-http-client`, `scrapy`, `headlesschrome`, `phantomjs` | `403 {"message": "automated clients are not allowed"}` on `/v1/` (not the webhook). `curl` and `wget` pass |
 | `/v1/admin/*` from outside the compose network (the host included, also with a forged `X-Forwarded-For`) | `403 {"message": "admin routes are only reachable from the internal network"}` |
+| `/v1/payments/webhook` from any address but the payment provider's (the host included, also with a forged `X-Forwarded-For`) | `403 {"message": "the payment webhook is only reachable from the payment provider"}` |
 | A replica is down or does not answer | A failed or timed-out connect is retried on the next replica; a request that was already sent is never repeated. NGINX's own 502, 503 and 504 become `503 {"message": "service temporarily unavailable, retry shortly"}` with `Retry-After: 1`. An app `503` (checkout queue) is passed on as it is |
 
 A client that gets `429` or `503` should wait `Retry-After` seconds and retry with the same `Idempotency-Key`; the frontend does. `202`, `409` and `410` are the app's real answers and are never replaced by the gateway.

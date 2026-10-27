@@ -1,54 +1,60 @@
-//! The payment inbox loop of the order processor (roadmap steps 8 and 21):
-//! turns each provider event stored by the webhook into a confirmed order or a
-//! refund.
+//! Payment events: the order processor turns each provider event into a
+//! confirmed order or a refund (roadmap steps 8 and 21, redesigned so that
+//! PostgreSQL alone decides between a payment and the payment deadline).
 //!
-//! A successful payment is confirmed in phases, and a crash between any two is
-//! repaired by running the event again (it stays in the inbox until the last
-//! phase is done):
+//! `InboxWorker::handle_event` is the one place an event is acted on. It runs
+//! from two callers, so a payment is confirmed at once and still converges
+//! after any failure:
 //!
-//! 1. **Claim** the hold in Redis (`confirm.lua claim`: `AWAITING_PAYMENT` to
-//!    `PAID`, out of `holds:expiry`). The webhook already did this on receipt;
-//!    here the call finds its own claim. If the hold was released, or its
-//!    deadline passed, the claim is lost: refund (see below).
-//! 2. **Commit** in one PostgreSQL transaction: the order `AWAITING_PAYMENT` to
-//!    `CONFIRMED` and `UPDATE products SET sold = sold + 1 WHERE id = $1 AND
-//!    sold < total_inventory`. If the guard matches no row the transaction
-//!    rolls back and the payment is refunded.
-//! 3. **Finalize** in Redis (`confirm.lua finalize`: `sold:{sale}` + 1, hold
-//!    `CONFIRMED`), then write `status:<ticket>` `CONFIRMED`.
-//! 4. **Mark the event processed**, only now.
+//! - **on receipt**: the webhook endpoint of the order processor
+//!   (`crate::api::payments`) stores the event in `payment_inbox`, then calls
+//!   `receive`, which handles it and marks the row processed;
+//! - **on retry**: the inbox loop (`run`) takes every row not yet processed
+//!   and handles it again.
 //!
-//! Why a rerun converges: every step is idempotent and each leaves a trace the
-//! next run reads. Before phase 2 commits, the order is `AWAITING_PAYMENT`, so
-//! the run starts at phase 1 again. After it commits, the order is `CONFIRMED`:
-//! the run goes straight to phase 3 (a crash after the commit but before the
-//! finalize leaves the hold `PAID` by this session, which finalize counts
-//! once; a finalize that already ran finds the hold `CONFIRMED` and does
-//! nothing). Counting `sold:{sale}` only in the finalize, which flips the hold
-//! out of `PAID` in the same step, and `products.sold` only in the confirming
-//! transaction, which flips the order out of `AWAITING_PAYMENT` in the same
-//! step, makes `sold:{sale}` = `products.sold` = number of `CONFIRMED` orders
-//! once every event is processed. The status write is forward-only, so
-//! repeating it is harmless.
+//! **The decision** is one PostgreSQL transaction (`actions::orders::settle_payment`):
+//! the order goes `AWAITING_PAYMENT` to `CONFIRMED` only if, at PostgreSQL's
+//! own `now()`, its session matches and its deadline is ahead, together with
+//! `UPDATE products SET sold = sold + 1 WHERE id = $1 AND sold <
+//! total_inventory` (no row: the confirmation rolls back). The expiration
+//! worker's `UPDATE ... SET status = 'EXPIRED' ... AND expires_at <= now()`
+//! is its mirror image; both take the order's row lock and see each other's
+//! result afterwards, on one clock, so exactly one of them wins an order. There
+//! is no claim in Redis: the payment path writes no inventory key, only the
+//! read-cache status.
 //!
-//! A refund (lost claim, or guard failure) goes: refund the provider's
-//! payment (a no-op the second time, and only a `PAID` session can be
-//! refunded, which a success event guarantees), order `REFUNDED`, then
-//! `status` `REFUNDED` (and, after a guard failure, the hold leaves `PAID`).
-//! A rerun finds the order `REFUNDED` and repeats only the Redis writes.
-//! Stock is not returned on either path: after a lost claim whoever released
-//! the hold already returned it, and after a guard failure the unit was
-//! never really free.
+//! **If the order cannot be confirmed** (the deadline passed, it is already
+//! `EXPIRED` or `FAILED`, or the guard failed) the same transaction marks it
+//! `REFUNDED`. That is the durable record of the decision. Afterwards, outside
+//! any transaction, the provider is asked to refund the session and
+//! `status:<ticket>` is set `REFUNDED`; only when both worked is the inbox row
+//! marked processed. A guard failure means Redis and PostgreSQL disagree (Redis
+//! reserved a unit PostgreSQL does not have) and is logged as an error.
+//!
+//! **Why a rerun converges.** Every step is idempotent and the decision
+//! leaves a trace the next run reads:
+//!
+//! - crash before the decision commits: nothing happened, the run starts over;
+//! - crash after it commits, before the refund call: the order is `REFUNDED`,
+//!   the run goes straight to the refund;
+//! - crash after the refund, before the row is marked processed: the provider's
+//!   refund is idempotent per session, so the run repeats it harmlessly;
+//! - a status write that failed is repeated (a `CONFIRMED` order only needs
+//!   that write); the write only moves forward.
+//!
+//! Two handlers may run the same event at once (the webhook request and the
+//! inbox loop); the row lock of the decision lets one decide and the other see
+//! the result. Stock is never returned here, and `sold:{sale}` is never touched:
+//! the expiration worker settles the hold (and counts the sale) when it finds
+//! the hold due.
 //!
 //! Failure events (the user cancelled) need nothing: the hold runs out by
 //! itself. The event is just marked processed.
 //!
 //! Several processors may run: each locks one inbox row at a time with `FOR
-//! UPDATE SKIP LOCKED` for the whole event, on a connection of its own, while
-//! the confirming transaction uses another. (If two ever did handle the same
-//! event, the order's status guard lets only one confirm it.) An event that
-//! fails is recorded (`attempts`, `last_error`), skipped by this processor for
-//! a growing delay and retried; the ones behind it carry on.
+//! UPDATE SKIP LOCKED` for the whole event, on a connection of its own. An
+//! event that fails is recorded (`attempts`, `last_error`), skipped by this
+//! processor for a growing delay and retried; the ones behind it carry on.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,10 +64,10 @@ use diesel::{prelude::*, PgConnection};
 use tokio::{runtime::Handle, sync::watch};
 
 use crate::{
-    actions::{self, orders::Confirm},
-    cache::{self, ClaimOutcome, ReadCache, RedisConn, StatusUpdate},
+    actions::{self, orders::Settlement},
+    cache::{self, ReadCache, StatusUpdate},
     db::DbPool,
-    models::{Order, OrderStatus, PaymentInboxEntry},
+    models::{NewPaymentInboxEntry, Order, OrderStatus, PaymentInboxEntry},
     payment::{EventKind, ProviderEvent, SharedProvider},
     processor::ProcessError,
 };
@@ -76,9 +82,9 @@ const MAX_EVENT_BACKOFF: Duration = Duration::from_secs(60);
 /// What handling one event came to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handled {
-    /// The order is `CONFIRMED`, counted in PostgreSQL and in Redis
+    /// The order is `CONFIRMED` in PostgreSQL and the status says so
     Confirmed,
-    /// The payment was refunded and the order is `REFUNDED`
+    /// The payment was refunded at the provider and the order is `REFUNDED`
     Refunded,
     /// A failure or unknown event: nothing to do
     NoAction,
@@ -86,10 +92,21 @@ pub enum Handled {
     Ignored,
 }
 
-/// Confirms or refunds paid orders from the payment inbox
+/// What `receive` did with a webhook event
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Received {
+    /// The event had been stored and processed before: nothing to do
+    Duplicate,
+    /// Stored (now or before) and handled at once; the row is marked processed
+    Handled(Handled),
+    /// Stored, but handling failed; the row stays unprocessed and the inbox
+    /// loop retries it. The reason is recorded in the row.
+    Deferred(String),
+}
+
+/// Confirms or refunds paid orders from provider events
 pub struct InboxWorker {
     pool: DbPool,
-    inventory: RedisConn,
     read_cache: ReadCache,
     provider: SharedProvider,
     /// Events that failed here: id -> (failures, skipped until)
@@ -97,8 +114,8 @@ pub struct InboxWorker {
 }
 
 impl InboxWorker {
-    pub fn new(pool: DbPool, inventory: RedisConn, read_cache: ReadCache, provider: SharedProvider) -> Self {
-        Self { pool, inventory, read_cache, provider, backoff: Mutex::new(HashMap::new()) }
+    pub fn new(pool: DbPool, read_cache: ReadCache, provider: SharedProvider) -> Self {
+        Self { pool, read_cache, provider, backoff: Mutex::new(HashMap::new()) }
     }
 
     async fn db<T, F>(&self, work: F) -> Result<T, ProcessError>
@@ -123,52 +140,22 @@ impl InboxWorker {
         Ok(())
     }
 
-    /// Phase 1: claims the order's hold for the event's payment
-    pub async fn claim(&self, order: &Order, event: &ProviderEvent) -> Result<ClaimOutcome, ProcessError> {
-        let payment_id = event.payment_id.as_deref().unwrap_or(&event.session_id);
-        let mut con = self.inventory.clone();
-        Ok(cache::claim_hold(&mut con, order.product_id, &order.queue_ticket_id, &event.session_id, payment_id).await?)
-    }
-
-    /// Phase 2: the confirming transaction
-    pub async fn commit(&self, order: &Order) -> Result<Confirm, ProcessError> {
-        let (ticket, product) = (order.queue_ticket_id.clone(), order.product_id);
-        self.db(move |conn| actions::orders::confirm_order(conn, &ticket, product)).await
-    }
-
-    /// Phase 3: counts the sale in Redis and tells the client. Safe to repeat.
-    pub async fn finalize(&self, order: &Order) -> Result<(), ProcessError> {
-        let session = order.payment_session_id.as_deref().unwrap_or_default();
-        let mut con = self.inventory.clone();
-        cache::finalize_hold(&mut con, order.product_id, &order.queue_ticket_id, session).await?;
-        self.write_status(order, OrderStatus::Confirmed).await
-    }
-
     /// Refunds the payment of `session_id`; a repeat is a no-op
     async fn refund(&self, session_id: &str) -> Result<(), ProcessError> {
         Ok(self.provider.refund(session_id).await?)
     }
 
-    /// The Redis side of a refunded order: the hold leaves `PAID` (only
-    /// matters after a guard failure) and the client is told. Safe to repeat.
-    async fn finish_refund(&self, order: &Order) -> Result<(), ProcessError> {
-        let session = order.payment_session_id.as_deref().unwrap_or_default();
-        let mut con = self.inventory.clone();
-        cache::close_refunded_hold(&mut con, order.product_id, &order.queue_ticket_id, session).await?;
-        self.write_status(order, OrderStatus::Refunded).await
-    }
-
-    /// Refunds the payment, marks the order `REFUNDED`, tells Redis
-    async fn refund_order(&self, order: &Order, session_id: &str) -> Result<Handled, ProcessError> {
+    /// After the decision recorded `REFUNDED`: the provider refund, then the
+    /// status. Safe to repeat.
+    async fn finish_refund(&self, order: &Order, session_id: &str) -> Result<Handled, ProcessError> {
         self.refund(session_id).await?;
-        let ticket = order.queue_ticket_id.clone();
-        self.db(move |conn| actions::orders::mark_refunded(conn, &ticket)).await?;
-        self.finish_refund(order).await?;
+        self.write_status(order, OrderStatus::Refunded).await?;
         Ok(Handled::Refunded)
     }
 
-    /// Handles one verified event, all phases. Safe to run again after any failure.
-    pub async fn handle(&self, event: &ProviderEvent) -> Result<Handled, ProcessError> {
+    /// Handles one verified event, all of it. Safe to run again after any
+    /// failure and while another caller runs the same event.
+    pub async fn handle_event(&self, event: &ProviderEvent) -> Result<Handled, ProcessError> {
         if event.kind != EventKind::PaymentSucceeded {
             log::info!("Event {} ({}) needs no action; the hold runs out by itself", event.id, event.event_type);
             return Ok(Handled::NoAction);
@@ -192,61 +179,77 @@ impl InboxWorker {
             return Ok(Handled::Refunded);
         }
 
-        match order.status {
-            // The commit happened earlier: only the Redis side may be missing
-            OrderStatus::Confirmed => {
-                self.finalize(&order).await?;
-                Ok(Handled::Confirmed)
-            }
-            OrderStatus::Refunded => {
-                self.finish_refund(&order).await?;
-                Ok(Handled::Refunded)
-            }
-            _ => match self.claim(&order, event).await? {
-                ClaimOutcome::Won => self.confirm(order, event).await,
-                ClaimOutcome::Gone => {
-                    log::info!("The hold of {} ended before payment {} arrived; refunding", order.queue_ticket_id, event.session_id);
-                    self.refund_order(&order, &event.session_id).await
-                }
-            },
-        }
-    }
-
-    /// Phases 2 and 3 for an order whose claim is won
-    async fn confirm(&self, order: Order, event: &ProviderEvent) -> Result<Handled, ProcessError> {
-        match self.commit(&order).await? {
-            Confirm::Confirmed => {
+        // The decision: one transaction, one clock
+        let (ticket, session_id) = (order.queue_ticket_id.clone(), event.session_id.clone());
+        let settlement = self.db(move |conn| actions::orders::settle_payment(conn, &ticket, &session_id, sale)).await?;
+        match settlement {
+            Settlement::Confirmed => {
                 log::info!("Order {} is CONFIRMED", order.queue_ticket_id);
-                self.finalize(&order).await?;
+                self.write_status(&order, OrderStatus::Confirmed).await?;
                 Ok(Handled::Confirmed)
             }
-            Confirm::SoldOut => {
+            // Decided by an earlier run (or the other caller): only the status may be missing
+            Settlement::AlreadyConfirmed => {
+                self.write_status(&order, OrderStatus::Confirmed).await?;
+                Ok(Handled::Confirmed)
+            }
+            Settlement::Refund => {
+                log::info!("The deadline of {} ended before payment {} could be kept; refunding", order.queue_ticket_id, event.session_id);
+                self.finish_refund(&order, &event.session_id).await
+            }
+            Settlement::SoldOut => {
                 log::error!(
                     "Order {}: PostgreSQL has no unit of product {} left although Redis reserved one; refunding",
                     order.queue_ticket_id,
                     order.product_id
                 );
-                self.refund_order(&order, &event.session_id).await
+                self.finish_refund(&order, &event.session_id).await
             }
-            Confirm::NotAwaiting => {
-                // Another processor got there first: do what its result needs
-                let ticket = order.queue_ticket_id.clone();
-                let current = self.db(move |conn| actions::orders::find_by_ticket(conn, &ticket)).await?;
-                match current {
-                    Some(o) if o.status == OrderStatus::Confirmed => {
-                        self.finalize(&o).await?;
-                        Ok(Handled::Confirmed)
-                    }
-                    Some(o) if o.status == OrderStatus::Refunded => {
-                        self.finish_refund(&o).await?;
-                        Ok(Handled::Refunded)
-                    }
-                    other => Err(ProcessError::Invalid(format!(
-                        "order {} won its claim but is {:?}",
-                        order.queue_ticket_id,
-                        other.map(|o| o.status)
-                    ))),
+            Settlement::AlreadyRefunded => self.finish_refund(&order, &event.session_id).await,
+            Settlement::Unexpected(status) => Err(ProcessError::Invalid(format!(
+                "order {} has a payment but is {status:?}",
+                order.queue_ticket_id
+            ))),
+            Settlement::Missing => Err(ProcessError::Invalid(format!("order {} vanished", order.queue_ticket_id))),
+        }
+    }
+
+    /// A verified webhook event arrives: stores it in the inbox, handles it at
+    /// once and marks the row processed. An error is returned only if the event
+    /// could not be stored (the provider must retry); a handling error after
+    /// that is recorded and the inbox loop retries, so the provider need not.
+    pub async fn receive(&self, event: &ProviderEvent) -> Result<Received, ProcessError> {
+        let stored = event.clone();
+        let (id, processed) = self
+            .db(move |conn| {
+                let entry =
+                    NewPaymentInboxEntry { provider_event_id: &stored.id, event_type: &stored.event_type, payload: &stored.payload };
+                actions::payments::insert_inbox(conn, &entry)?;
+                let row = actions::payments::find_inbox(conn, &stored.id)?;
+                Ok((row.id, row.processed_at.is_some()))
+            })
+            .await?;
+        if processed {
+            log::debug!("Webhook event {} was already processed", event.id);
+            return Ok(Received::Duplicate);
+        }
+        match self.handle_event(event).await {
+            Ok(handled) => {
+                log::debug!("Webhook event {}: {handled:?}", event.id);
+                match self.db(move |conn| actions::payments::mark_processed(conn, id)).await {
+                    Ok(()) => Ok(Received::Handled(handled)),
+                    // Handled, but the row is still open: the loop repeats the (idempotent) handling
+                    Err(e) => Ok(Received::Deferred(e.to_string())),
                 }
+            }
+            Err(e) => {
+                log::warn!("Handling webhook event {} failed, the inbox loop will retry: {e}", event.id);
+                let reason = e.to_string();
+                let recorded = reason.clone();
+                if let Err(record_error) = self.db(move |conn| actions::payments::record_failure(conn, id, &recorded)).await {
+                    log::error!("Recording the failure of inbox event {id} failed: {record_error}");
+                }
+                Ok(Received::Deferred(reason))
             }
         }
     }
@@ -255,7 +258,7 @@ impl InboxWorker {
     async fn process_entry(&self, entry: &PaymentInboxEntry) -> Result<(), ProcessError> {
         match ProviderEvent::from_json(entry.payload.clone()) {
             Some(event) => {
-                let handled = self.handle(&event).await?;
+                let handled = self.handle_event(&event).await?;
                 log::debug!("Inbox event {}: {handled:?}", entry.provider_event_id);
             }
             // The webhook parses before it stores, so this is not expected

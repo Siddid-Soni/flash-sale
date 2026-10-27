@@ -84,12 +84,7 @@ impl SaleFixture {
     }
 
     pub fn inbox_worker(&self) -> Arc<InboxWorker> {
-        Arc::new(InboxWorker::new(
-            self.env.pool.clone(),
-            self.env.redis.clone(),
-            self.env.read_cache.clone(),
-            self.env.shared_provider(),
-        ))
+        Arc::new(InboxWorker::new(self.env.pool.clone(), self.env.read_cache.clone(), self.env.shared_provider()))
     }
 
     /// A new guest with a `PENDING` hold and the event its checkout would publish
@@ -119,6 +114,49 @@ impl SaleFixture {
 
     pub fn product(&self) -> flash_sale::models::Product {
         actions::products::find_product(&mut self.env.pool.get().unwrap(), self.sale).unwrap().unwrap()
+    }
+
+    /// Moves the payment deadline of an `AWAITING_PAYMENT` order, in PostgreSQL
+    /// (which decides) and in `holds:expiry` (which says when to look), to `at_ms`
+    /// (epoch ms)
+    pub async fn set_deadline(&self, ticket: &str, at_ms: i64) {
+        self.set_pg_deadline(ticket, at_ms);
+        self.set_redis_deadline(ticket, at_ms).await;
+    }
+
+    /// Only PostgreSQL's deadline of the order
+    pub fn set_pg_deadline(&self, ticket: &str, at_ms: i64) {
+        use flash_sale::schema::orders;
+        let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap();
+        let changed = diesel::update(orders::table.filter(orders::queue_ticket_id.eq(ticket)))
+            .set(orders::expires_at.eq(at))
+            .execute(&mut self.env.pool.get().unwrap())
+            .unwrap();
+        assert_eq!(changed, 1, "{ticket} has no order");
+    }
+
+    /// Only the hold's score in `holds:expiry`
+    pub async fn set_redis_deadline(&self, ticket: &str, at_ms: i64) {
+        let changed: i64 = redis::cmd("ZADD")
+            .arg(cache::holds_expiry_key(self.sale))
+            .arg("XX")
+            .arg("CH")
+            .arg(at_ms)
+            .arg(ticket)
+            .query_async(&mut self.env.redis.clone())
+            .await
+            .unwrap();
+        assert_eq!(changed, 1, "{ticket} is not in holds:expiry");
+    }
+
+    /// The deadline has passed, for PostgreSQL and for Redis
+    pub async fn make_due(&self, ticket: &str) {
+        self.set_deadline(ticket, Utc::now().timestamp_millis() - 1_000).await;
+    }
+
+    /// Holds waiting in `holds:expiry:{sale}`
+    pub async fn expiry_len(&self) -> i64 {
+        self.env.redis.clone().zcard(cache::holds_expiry_key(self.sale)).await.unwrap()
     }
 
     pub async fn hold_state(&self, ticket: &str) -> String {

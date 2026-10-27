@@ -1,6 +1,7 @@
-//! The payment inbox: provider events are stored first and processed by the
-//! order processor, which claims unprocessed rows with `FOR UPDATE SKIP LOCKED`
-//! so several workers can share the work.
+//! The payment inbox: provider events are stored first, handled at once by the
+//! webhook endpoint of the order processor, and handled again by the inbox
+//! loop until they are marked processed. The loop claims unprocessed rows with
+//! `FOR UPDATE SKIP LOCKED` so several workers can share the work.
 
 use chrono::Utc;
 use diesel::prelude::*;
@@ -18,6 +19,14 @@ pub fn insert_inbox(conn: &mut PgConnection, entry: &NewPaymentInboxEntry) -> Qu
         .do_nothing()
         .execute(conn)?;
     Ok(inserted == 1)
+}
+
+/// The stored row of a provider event (it must exist: call after `insert_inbox`)
+pub fn find_inbox(conn: &mut PgConnection, provider_event_id: &str) -> QueryResult<PaymentInboxEntry> {
+    payment_inbox::table
+        .filter(payment_inbox::provider_event_id.eq(provider_event_id))
+        .select(PaymentInboxEntry::as_select())
+        .first(conn)
 }
 
 /// Locks the oldest unprocessed event no other worker holds, for the rest of

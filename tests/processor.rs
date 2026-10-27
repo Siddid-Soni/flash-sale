@@ -51,7 +51,8 @@ async fn fixture(stock: i32) -> Fixture {
     )
     .unwrap();
     cache::init_sale(&mut env.redis.clone(), product.id, stock, product.sale_start_time).await.unwrap();
-    let fake = Arc::new(FakeProvider::new(env.redis.clone(), "http://pay.test".into(), "secret".into()));
+    // The provider's state, to look at sessions; the processor reaches it over HTTP
+    let fake = env.provider.clone();
     Fixture { env, fake, sale: product.id }
 }
 
@@ -61,7 +62,7 @@ impl Fixture {
     }
 
     fn processor(&self) -> Processor {
-        self.processor_with(self.fake.clone())
+        self.processor_with(self.env.shared_provider())
     }
 
     /// A new guest with a `PENDING` hold and the event its checkout would publish
@@ -213,7 +214,7 @@ async fn a_released_hold_is_skipped_without_an_order() {
 /// Releases the hold while the processor is creating the session: the window
 /// between the order insert and `link_ready.lua`
 struct ReleasingProvider {
-    inner: Arc<FakeProvider>,
+    inner: SharedProvider,
     fixture_redis: cache::RedisConn,
     sale: i32,
 }
@@ -259,7 +260,7 @@ async fn a_hold_released_before_the_link_fails_the_order_and_expires_the_session
     let fx = fixture(5).await;
     let event = fx.winner().await;
     let provider: SharedProvider =
-        Arc::new(ReleasingProvider { inner: fx.fake.clone(), fixture_redis: fx.env.redis.clone(), sale: fx.sale });
+        Arc::new(ReleasingProvider { inner: fx.env.shared_provider(), fixture_redis: fx.env.redis.clone(), sale: fx.sale });
 
     assert_eq!(fx.processor_with(provider).handle(&event).await.unwrap(), Outcome::Failed);
 
@@ -302,7 +303,7 @@ async fn an_order_another_constraint_refuses_leaves_the_hold_alone() {
 
 /// Fails its first `failures` calls, as a provider having a bad moment would
 struct FlakyProvider {
-    inner: Arc<FakeProvider>,
+    inner: SharedProvider,
     failures: usize,
     calls: AtomicUsize,
 }
@@ -337,7 +338,7 @@ impl PaymentProvider for FlakyProvider {
 async fn a_transient_error_is_retried_not_skipped() {
     let fx = fixture(5).await;
     let event = fx.winner().await;
-    let flaky = Arc::new(FlakyProvider { inner: fx.fake.clone(), failures: 2, calls: AtomicUsize::new(0) });
+    let flaky = Arc::new(FlakyProvider { inner: fx.env.shared_provider(), failures: 2, calls: AtomicUsize::new(0) });
     let processor = fx.processor_with(flaky.clone());
 
     assert!(processor.handle(&event).await.is_err(), "the error surfaces from a single attempt");
@@ -349,7 +350,7 @@ async fn a_transient_error_is_retried_not_skipped() {
 
     // At shutdown a failing message is given up on (left undone), not retried forever
     let event = fx.winner().await;
-    let failing = fx.processor_with(Arc::new(FlakyProvider { inner: fx.fake.clone(), failures: usize::MAX, calls: AtomicUsize::new(0) }));
+    let failing = fx.processor_with(Arc::new(FlakyProvider { inner: fx.env.shared_provider(), failures: usize::MAX, calls: AtomicUsize::new(0) }));
     let (stop, shutdown) = watch::channel(false);
     stop.send(true).unwrap();
     assert_eq!(failing.handle_with_retry(&event, &shutdown).await, None);

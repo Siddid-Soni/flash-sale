@@ -1,36 +1,48 @@
 //! The expiration worker's logic (roadmap steps 22-24): give back the stock of
-//! holds that will never be paid or processed, and tidy up the orders.
+//! holds that will never be paid or processed, count the holds that were paid,
+//! and tidy up the orders.
 //!
 //! Three passes, each a method of `Expirer` that the binary calls on a timer
 //! and the tests call directly:
 //!
 //! - `unpaid_pass` (step 22): `AWAITING_PAYMENT` holds whose deadline in
-//!   `holds:expiry:{sale}` has passed. Release, then the order `EXPIRED`, the
-//!   read cache, and last the payment session.
+//!   `holds:expiry:{sale}` has passed (by Redis `TIME`). **PostgreSQL decides
+//!   what each one is**: one batch `UPDATE orders SET status = 'EXPIRED' ...
+//!   AND status = 'AWAITING_PAYMENT' AND expires_at <= now()` (the mirror image
+//!   of the payment's confirmation, see `crate::inbox`), then a read of the
+//!   status of the others. Per ticket: an order the batch expired (or that is
+//!   already `EXPIRED`) is released with `release.lua`, which returns the unit
+//!   to stock; a `CONFIRMED` order is settled with `settle_hold.lua`, which
+//!   counts the sale in `sold:{sale}` (the only place it is counted) and
+//!   returns no stock; a `REFUNDED` one (the payment came too late, or the
+//!   guard failed) is released, or, if PostgreSQL has no unit left for it,
+//!   dropped without stock or count; an order still `AWAITING_PAYMENT` (the
+//!   Redis clock is ahead of PostgreSQL's) is left for the next pass; a ticket
+//!   with no order is left and logged.
 //! - `leaked_pass` (step 23): `PENDING` holds that no message can still reach,
 //!   because the processors' progress is past them by more than the producer's
 //!   delivery timeout (see `release_cutoff`). Release, then the order
 //!   `FAILED` (if the processor made one), the read cache and the session.
 //! - `sweep` (the baseline's `expire_stale`): orders a worker left behind when
-//!   it crashed between a release and the order update.
+//!   it crashed between a release and the order update, and `EXPIRED` orders
+//!   whose status or session step never happened.
 //!
-//! Any number of workers may run at once. Correctness comes from
-//! `release.lua`, which hands each hold to exactly one caller; a worker acts on
-//! a hold only when its own call got `released`.
+//! Any number of workers may run at once. Correctness comes from the scripts:
+//! `release.lua` and `settle_hold.lua` hand each hold to exactly one caller (the
+//! one whose `ZREM` removes it), and a worker acts in Redis on a hold only
+//! when its own call won; the order's state is decided by PostgreSQL's row lock.
 //!
 //! **The steps after a release are idempotent and retried.** The unit is back
 //! in stock the moment `release.lua` returns, but the order, the status and
 //! the session follow in separate systems. If one of them fails, the hold is
 //! remembered in memory and finished again before the next pass; if the worker
-//! dies instead, the sweep finds the order later (its hold is `EXPIRED` or
-//! `FAILED`, or gone).
+//! dies instead, the sweep finds the order later. A crash between the order
+//! update and the release needs no memory at all: the hold is still in
+//! `holds:expiry`, the next pass finds its order `EXPIRED` and releases it.
 //!
-//! **The order of the steps matters.** The order is set `EXPIRED` only
-//! `WHERE status = 'AWAITING_PAYMENT'`, so the `REFUNDED` that the payment
-//! inbox writes for a payment that slipped in after the release is never
-//! overwritten; and the session is expired only after the release, never
-//! before. A payment that lands in between loses its claim (the hold is gone)
-//! and the inbox refunds it.
+//! **The order of the steps matters.** The order is decided first, in
+//! PostgreSQL; Redis follows. The session is expired only after the release,
+//! never before.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +57,7 @@ use rdkafka::{
 
 use crate::{
     actions,
-    cache::{self, HoldState, MaxScore, ReadCache, RedisConn, ReleaseOutcome, ReleasedAs, StatusUpdate},
+    cache::{self, HoldState, MaxScore, ReadCache, RedisConn, ReleaseOutcome, ReleasedAs, SettleAs, StatusUpdate},
     config::Config,
     db::DbPool,
     models::{Order, OrderStatus},
@@ -84,6 +96,9 @@ pub struct Settings {
     pub stale_after: chrono::Duration,
     /// Sales that started longer ago than this are no longer watched
     pub sale_lookback: chrono::Duration,
+    /// How long after becoming stale the sweep keeps re-checking an `EXPIRED`
+    /// order's status and session
+    pub expired_recheck: chrono::Duration,
 }
 
 impl Settings {
@@ -93,6 +108,7 @@ impl Settings {
             delivery_timeout_ms: config.kafka_delivery_timeout_ms as i64,
             stale_after: chrono::Duration::minutes(10),
             sale_lookback: chrono::Duration::days(3),
+            expired_recheck: chrono::Duration::minutes(30),
         }
     }
 }
@@ -228,15 +244,24 @@ struct Released {
 /// What a pass did
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pass {
-    /// Holds this call released
+    /// Holds this call released: the unit went back to stock
     pub released: usize,
-    /// A batch came back full: another pass is due at once
+    /// Paid holds this call settled: counted in `sold:{sale}`
+    pub confirmed: usize,
+    /// Holds this call closed without stock or count (the PostgreSQL guard refused the payment)
+    pub dropped: usize,
+    /// A batch came back full and made progress: another pass is due at once
     pub more: bool,
 }
 
 impl Pass {
     pub fn merge(self, other: Pass) -> Pass {
-        Pass { released: self.released + other.released, more: self.more || other.more }
+        Pass {
+            released: self.released + other.released,
+            confirmed: self.confirmed + other.confirmed,
+            dropped: self.dropped + other.dropped,
+            more: self.more || other.more,
+        }
     }
 }
 
@@ -245,6 +270,8 @@ impl Pass {
 pub struct Swept {
     pub expired: usize,
     pub failed: usize,
+    /// `EXPIRED` orders whose status or session step had been missed
+    pub repaired: usize,
 }
 
 pub struct Expirer {
@@ -414,24 +441,86 @@ impl Expirer {
     // ---- The passes ----
 
     /// Unpaid-hold loop (step 22): one batch per sale of `AWAITING_PAYMENT`
-    /// holds whose deadline has passed. The candidates are read by score
-    /// (Redis `TIME`); the script re-checks the score and the state, so a hold
-    /// paid or released meanwhile is left alone.
+    /// holds whose deadline has passed by Redis `TIME`. PostgreSQL decides each
+    /// (see the module docs); the scripts re-check the hold, so one released,
+    /// settled or paid meanwhile is left alone.
     pub async fn unpaid_pass(&self, sales: &[i32]) -> Result<Pass, ExpiryError> {
         self.finish_unfinished().await?;
         let mut pass = Pass::default();
         for &sale in sales {
             let now = self.redis_now_ms().await?;
             let candidates = self.due(cache::holds_expiry_key(sale), now, self.settings.batch).await?;
-            pass.more |= candidates.len() >= self.settings.batch;
-            for ticket in candidates {
-                let released = self
-                    .release_and_finish(sale, &ticket, HoldState::AwaitingPayment, MaxScore::Now, ReleasedAs::Expired)
-                    .await?;
-                pass.released += usize::from(released);
+            if candidates.is_empty() {
+                continue;
             }
+            let full = candidates.len() >= self.settings.batch;
+            let before = (pass.released, pass.confirmed, pass.dropped);
+            self.decide_due(sale, candidates, &mut pass).await?;
+            // A batch of tickets PostgreSQL says are not due yet would come back
+            // unchanged: asking again at once would spin
+            pass.more |= full && before != (pass.released, pass.confirmed, pass.dropped);
         }
         Ok(pass)
+    }
+
+    /// Asks PostgreSQL what became of each due ticket and follows it in Redis
+    async fn decide_due(&self, sale: i32, tickets: Vec<String>, pass: &mut Pass) -> Result<(), ExpiryError> {
+        let asked = tickets.clone();
+        let (expired, others) = self
+            .db(move |conn| {
+                let expired = actions::orders::expire_due(conn, &asked)?;
+                let rest: Vec<String> = asked.into_iter().filter(|t| !expired.contains(t)).collect();
+                let others = if rest.is_empty() { Vec::new() } else { actions::orders::find_by_tickets(conn, &rest)? };
+                Ok((expired, others))
+            })
+            .await?;
+
+        // The batch expired these: the unit goes back
+        for ticket in &expired {
+            pass.released += usize::from(self.release_unpaid(sale, ticket).await?);
+        }
+
+        let by_ticket: std::collections::HashMap<&str, &Order> =
+            others.iter().map(|o| (o.queue_ticket_id.as_str(), o)).collect();
+        let others_asked: Vec<&String> = tickets.iter().filter(|t| !expired.contains(t)).collect();
+        for ticket in others_asked {
+            let Some(order) = by_ticket.get(ticket.as_str()) else {
+                // Holds are linked only after their order is updated, so this should not happen
+                log::warn!("The hold {ticket} is due but has no order; left alone");
+                continue;
+            };
+            match order.status {
+                // Expired by an earlier pass or another worker that did not finish the release
+                OrderStatus::Expired => pass.released += usize::from(self.release_unpaid(sale, ticket).await?),
+                OrderStatus::Confirmed => {
+                    let mut con = self.inventory.clone();
+                    pass.confirmed += usize::from(cache::settle_hold(&mut con, sale, ticket, SettleAs::Confirmed).await?);
+                }
+                OrderStatus::Refunded => {
+                    let product = order.product_id;
+                    if self.db(move |conn| actions::orders::has_free_unit(conn, product)).await? {
+                        // The payment came after the deadline: the hold is unpaid, the unit comes back
+                        pass.released += usize::from(self.release_unpaid(sale, ticket).await?);
+                    } else {
+                        log::error!(
+                            "The payment of {ticket} was refunded because PostgreSQL has no unit of product {product} left, \
+                             although Redis held one for it; the hold is dropped without returning stock"
+                        );
+                        let mut con = self.inventory.clone();
+                        pass.dropped += usize::from(cache::settle_hold(&mut con, sale, ticket, SettleAs::Dropped).await?);
+                    }
+                }
+                // PostgreSQL's clock says the deadline is not here yet: try again later
+                OrderStatus::AwaitingPayment => log::debug!("The hold {ticket} is due by Redis' clock but not by PostgreSQL's"),
+                other => log::warn!("The hold {ticket} is due but its order is {other:?}; left alone"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Releases a due unpaid hold and finishes it (order, status, session)
+    async fn release_unpaid(&self, sale: i32, ticket: &str) -> Result<bool, ExpiryError> {
+        self.release_and_finish(sale, ticket, HoldState::AwaitingPayment, MaxScore::Now, ReleasedAs::Expired).await
     }
 
     /// The lag of the topic, and each sale's cutoff
@@ -503,14 +592,17 @@ impl Expirer {
     }
 
     /// Stale-order sweep. Orders whose worker died between a release and the
-    /// order update:
+    /// order update, or after the order update:
     /// - `AWAITING_PAYMENT` more than `stale_after` past their deadline, whose
     ///   hold is gone or `EXPIRED`, become `EXPIRED`;
     /// - `PENDING` more than `stale_after` old, whose hold is `FAILED` or gone,
-    ///   become `FAILED`.
+    ///   become `FAILED`;
+    /// - `EXPIRED` orders (changed between `stale_after` and `stale_after +
+    ///   expired_recheck` ago) whose read-cache status is not `EXPIRED` get their
+    ///   status and session finished.
     ///
-    /// An order whose hold is still live (or is `PAID`, `CONFIRMED`...) is
-    /// never touched. Status and session follow as after a release.
+    /// An order whose hold is still live (or is `CONFIRMED`, ...) is never
+    /// touched. Status and session follow as after a release.
     pub async fn sweep(&self, now: DateTime<Utc>) -> Result<Swept, ExpiryError> {
         let before = now - self.settings.stale_after;
         let limit = self.settings.batch as i64;
@@ -540,6 +632,26 @@ impl Expirer {
                     && self.finish_failed(order.product_id, &order.queue_ticket_id).await?
                 {
                     swept.failed += 1;
+                }
+            }
+            match page.last() {
+                Some(last) if page.len() as i64 == limit => after = last.id,
+                _ => break,
+            }
+        }
+
+        // The unpaid loop expires the order first, so a crash after that leaves
+        // an EXPIRED order and maybe a stale status or an open session
+        let since = before - self.settings.expired_recheck;
+        let mut after = 0;
+        loop {
+            let page = self.db(move |conn| actions::orders::recently_expired(conn, since, before, after, limit)).await?;
+            for order in &page {
+                let mut cache = self.read_cache.clone();
+                let cached = cache::read_status(&mut cache, &order.queue_ticket_id).await?;
+                if cached.is_none_or(|c| c.status != OrderStatus::Expired) {
+                    self.finish_expired(order.product_id, &order.queue_ticket_id).await?;
+                    swept.repaired += 1;
                 }
             }
             match page.last() {

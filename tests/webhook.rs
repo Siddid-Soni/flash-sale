@@ -1,15 +1,27 @@
-//! `POST /v1/payments/webhook`: signature, inbox, claim on receipt.
+//! `POST /v1/payments/webhook` on the order processor: signature, inbox, and
+//! the decision on receipt.
 
 mod common;
 
-use actix_web::{http::StatusCode, test};
-use chrono::Utc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use actix_web::http::{header::HeaderMap, StatusCode};
+use actix_web::test;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 
-use common::sale::SaleFixture;
+use common::sale::{clear_inbox, SaleFixture};
 use flash_sale::{
+    inbox::InboxWorker,
     models::OrderStatus,
-    payment::webhook::{self, SIGNATURE_HEADER},
+    payment::{
+        webhook::{self, SIGNATURE_HEADER},
+        PaymentError, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider,
+    },
     schema::payment_inbox,
 };
 
@@ -32,31 +44,34 @@ fn stored(fx: &SaleFixture, event_id: &str) -> i64 {
         .unwrap()
 }
 
+async fn assert_not_decided(fx: &SaleFixture, ticket: &str) {
+    assert_eq!(fx.order(ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.hold_state(ticket).await, "AWAITING_PAYMENT");
+}
+
 #[actix_web::test]
-async fn a_signed_success_is_stored_and_claims_the_hold() {
+async fn a_signed_success_is_stored_and_confirms_the_order_at_once() {
     let fx = SaleFixture::new(3).await;
     let a = fx.awaiting().await;
     let wire = fx.pay(&a).await;
-    let app = test_app!(fx.env);
+    let app = processor_app!(fx.env, fx.inbox_worker());
 
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
 
     let row = fx.inbox_row(&wire.event.id).expect("the event is in the inbox");
     assert_eq!(row.event_type, "checkout.session.completed");
-    assert!(row.processed_at.is_none());
+    assert!(row.processed_at.is_some(), "handled on receipt");
     assert_eq!(row.payload["data"]["object"]["ticket"], a.event.ticket.as_str());
-    // Claimed on receipt, before any processor ran: PAID, out of the expiry set
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "PAID");
-    let still_queued: Option<f64> = redis::AsyncCommands::zscore(
-        &mut fx.env.redis.clone(),
-        flash_sale::cache::holds_expiry_key(fx.sale),
-        &a.event.ticket,
-    )
-    .await
-    .unwrap();
-    assert!(still_queued.is_none());
-    // The order is not confirmed yet: that is the processor's job
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    // Decided by PostgreSQL, not by a claim in Redis
+    let order = fx.order(&a.event.ticket).unwrap();
+    assert_eq!(order.status, OrderStatus::Confirmed);
+    assert_eq!(fx.product().sold, 1);
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Confirmed);
+    // The payment path writes no inventory key: the worker settles the hold
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
+    assert_eq!(fx.expiry_len().await, 1);
+    assert_eq!(fx.sold_counter().await, 0);
+    assert_eq!(fx.stock().await, 2);
     fx.cleanup().await;
 }
 
@@ -65,12 +80,13 @@ async fn a_duplicate_event_is_answered_200_and_stored_once() {
     let fx = SaleFixture::new(3).await;
     let a = fx.awaiting().await;
     let wire = fx.pay(&a).await;
-    let app = test_app!(fx.env);
+    let app = processor_app!(fx.env, fx.inbox_worker());
 
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
     assert_eq!(stored(&fx, &wire.event.id), 1);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "PAID");
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.product().sold, 1, "counted once");
     fx.cleanup().await;
 }
 
@@ -79,7 +95,7 @@ async fn a_bad_signature_is_refused_and_nothing_is_stored() {
     let fx = SaleFixture::new(3).await;
     let a = fx.awaiting().await;
     let wire = fx.pay(&a).await;
-    let app = test_app!(fx.env);
+    let app = processor_app!(fx.env, fx.inbox_worker());
 
     // No header, a wrong secret, a tampered body, a stale timestamp, garbage
     let wrong_secret = webhook::sign("another-secret", Utc::now().timestamp(), wire.body.as_bytes()).unwrap();
@@ -92,45 +108,43 @@ async fn a_bad_signature_is_refused_and_nothing_is_stored() {
     assert_eq!(post!(app, &wire.body, Some("garbage".to_string())), StatusCode::BAD_REQUEST);
 
     assert_eq!(stored(&fx, &wire.event.id), 0);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT", "an unverified event claims nothing");
+    assert_not_decided(&fx, &a.event.ticket).await;
     fx.cleanup().await;
 }
 
 #[actix_web::test]
 async fn a_signed_body_that_is_not_an_event_is_refused() {
     let fx = SaleFixture::new(1).await;
-    let app = test_app!(fx.env);
+    let app = processor_app!(fx.env, fx.inbox_worker());
     let body = r#"{"hello":"world"}"#;
     let signature = webhook::sign(common::WEBHOOK_SECRET, Utc::now().timestamp(), body.as_bytes()).unwrap();
     assert_eq!(post!(app, body, Some(signature)), StatusCode::BAD_REQUEST);
     fx.cleanup().await;
 }
 
-/// A payment that arrives after the deadline is stored (the processor will
-/// refund it) but the hold is not claimed
+/// A payment that arrives after PostgreSQL's deadline is stored, answered 200
+/// and refunded on the spot; nothing is confirmed or counted
 #[actix_web::test]
-async fn a_late_payment_is_stored_without_claiming() {
+async fn a_late_payment_is_refunded_on_receipt() {
     let fx = SaleFixture::new(3).await;
     let a = fx.awaiting().await;
     let wire = fx.pay(&a).await;
-    // The deadline passes and the hold is released
-    let released = flash_sale::cache::release_hold(
-        &mut fx.env.redis.clone(),
-        fx.sale,
-        &a.event.ticket,
-        flash_sale::cache::HoldState::AwaitingPayment,
-        flash_sale::cache::MaxScore::Any,
-        flash_sale::cache::ReleasedAs::Expired,
-        false,
-    )
-    .await
-    .unwrap();
-    assert_eq!(released, flash_sale::cache::ReleaseOutcome::Released);
-    let app = test_app!(fx.env);
+    // The deadline passes before the worker has looked at the hold
+    fx.make_due(&a.event.ticket).await;
+    let app = processor_app!(fx.env, fx.inbox_worker());
 
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
+
     assert_eq!(stored(&fx, &wire.event.id), 1);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
+    assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "REFUNDED");
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.product().sold, 0);
+    assert_eq!(fx.sold_counter().await, 0);
+    // The hold is still the worker's: it is due, and it will return the unit
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
+    assert_eq!(fx.stock().await, 2);
     fx.cleanup().await;
 }
 
@@ -139,10 +153,81 @@ async fn a_failure_event_is_stored_and_changes_nothing() {
     let fx = SaleFixture::new(3).await;
     let a = fx.awaiting().await;
     let wire = fx.cancel(&a).await;
-    let app = test_app!(fx.env);
+    let app = processor_app!(fx.env, fx.inbox_worker());
 
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
     assert_eq!(stored(&fx, &wire.event.id), 1);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
+    assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
+    assert_not_decided(&fx, &a.event.ticket).await;
+    fx.cleanup().await;
+}
+
+/// Delegates to the real provider, but its refunds fail while `fail` is set
+struct FailingRefund {
+    inner: SharedProvider,
+    fail: AtomicBool,
+}
+
+#[async_trait]
+impl PaymentProvider for FailingRefund {
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+
+    async fn create_session(&self, t: &str, amount: i32, at: DateTime<Utc>, key: &str) -> PaymentResult<Session> {
+        self.inner.create_session(t, amount, at, key).await
+    }
+
+    async fn expire_session(&self, id: &str) -> PaymentResult<()> {
+        self.inner.expire_session(id).await
+    }
+
+    async fn refund(&self, id: &str) -> PaymentResult<()> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(PaymentError("provider is down".into()));
+        }
+        self.inner.refund(id).await
+    }
+
+    fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> PaymentResult<ProviderEvent> {
+        self.inner.verify_webhook(headers, body)
+    }
+}
+
+/// Once the event is stored the answer is 200 even if handling fails: the row
+/// stays unprocessed with the error recorded, and the inbox loop finishes it
+#[actix_web::test]
+async fn a_handling_error_after_the_insert_still_answers_200_and_the_loop_retries() {
+    let fx = SaleFixture::new(3).await;
+    clear_inbox(&fx.env);
+    let a = fx.awaiting().await;
+    let wire = fx.pay(&a).await;
+    fx.make_due(&a.event.ticket).await;
+    let failing = Arc::new(FailingRefund { inner: fx.env.shared_provider(), fail: AtomicBool::new(true) });
+    let provider: SharedProvider = failing.clone();
+    let inbox = Arc::new(InboxWorker::new(fx.env.pool.clone(), fx.env.read_cache.clone(), provider.clone()));
+    let app = test::init_service(
+        actix_web::App::new()
+            .app_data(actix_web::web::Data::new(provider))
+            .app_data(actix_web::web::Data::from(inbox.clone()))
+            .configure(flash_sale::api::payments::configure),
+    )
+    .await;
+
+    assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
+    let row = fx.inbox_row(&wire.event.id).unwrap();
+    assert!(row.processed_at.is_none());
+    assert!(row.last_error.unwrap().contains("provider is down"));
+    // The decision was made and recorded before the refund was tried
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment, "not told before the refund");
+
+    // The provider's redelivery meanwhile is answered 200 too; then the loop gets there
+    assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
+    failing.fail.store(false, Ordering::SeqCst);
+    assert!(inbox.process_next().await.unwrap());
+    assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
+    assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "REFUNDED");
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
     fx.cleanup().await;
 }

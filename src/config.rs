@@ -30,18 +30,31 @@ pub struct Config {
     pub admin_token: String,
     /// How long a user has to pay once the payment link is ready
     pub payment_window_secs: u64,
-    /// `fake` (default) or `stripe`
+    /// `fake` (default): the only provider implemented
     pub payment_provider: String,
+    /// Where the order processor and the expiration worker reach the provider's
+    /// HTTP API (`http://fake-payment-provider:8090` in compose). Plain `http://` only
+    pub payment_provider_url: String,
+    /// Where the `fake_payment_provider` binary listens; `0.0.0.0:8090` in a container
+    pub provider_bind_addr: String,
     /// How long the fake provider takes to report a payment
     pub fake_payment_delay_ms: u64,
-    /// Where clients reach the API; the fake provider builds its payment page
-    /// URL (`{PUBLIC_BASE_URL}/fake-pay/{session}`) from it
+    /// Where clients reach the API; also the default of the two URLs below
     pub public_base_url: String,
-    /// Where the fake provider sends its webhooks; default
-    /// `{PUBLIC_BASE_URL}/v1/payments/webhook`. Plain `http://` only
+    /// Where users reach the provider's payment page: the fake provider builds
+    /// the session URL `{PAYMENT_PAGE_BASE_URL}/fake-pay/{session}` from it.
+    /// Default `PUBLIC_BASE_URL` (the gateway proxies `/fake-pay/` to the
+    /// provider); a local run without the gateway uses the provider's own port
+    pub payment_page_base_url: String,
+    /// Where the fake provider sends its webhooks: an order processor, through
+    /// the gateway in compose (`http://gateway/v1/payments/webhook`). Default
+    /// the local processor, `http://127.0.0.1:8081/v1/payments/webhook`. Plain `http://` only
     pub payment_webhook_url: String,
-    /// Signs and verifies webhooks (HMAC-SHA256); shared by the provider and the Order Service
+    /// Signs and verifies webhooks (HMAC-SHA256); shared by the provider and the order processor
     pub payment_webhook_secret: String,
+    /// Where the order processor serves the provider's webhook
+    /// (`POST /v1/payments/webhook`); `0.0.0.0:8081`
+    pub processor_http_addr: String,
     /// Where the fake payment page sends the browser back to (`/?sale=<id>`);
     /// default `PUBLIC_BASE_URL`. Differs from it when the frontend is served elsewhere
     pub frontend_url: String,
@@ -99,12 +112,13 @@ impl Config {
             admin_token: required("ADMIN_TOKEN"),
             payment_window_secs: or_default("PAYMENT_WINDOW_SECS", 300),
             payment_provider: or_default("PAYMENT_PROVIDER", "fake".to_string()),
+            payment_provider_url: or_default("PAYMENT_PROVIDER_URL", "http://127.0.0.1:8090".to_string()),
+            provider_bind_addr: or_default("PROVIDER_BIND_ADDR", "127.0.0.1:8090".to_string()),
             fake_payment_delay_ms: or_default("FAKE_PAYMENT_DELAY_MS", 2000),
-            payment_webhook_url: or_default(
-                "PAYMENT_WEBHOOK_URL",
-                format!("{}/v1/payments/webhook", public_base_url.trim_end_matches('/')),
-            ),
+            payment_page_base_url: or_default("PAYMENT_PAGE_BASE_URL", public_base_url.clone()),
+            payment_webhook_url: or_default("PAYMENT_WEBHOOK_URL", "http://127.0.0.1:8081/v1/payments/webhook".to_string()),
             payment_webhook_secret: required("PAYMENT_WEBHOOK_SECRET"),
+            processor_http_addr: or_default("PROCESSOR_HTTP_ADDR", "0.0.0.0:8081".to_string()),
             frontend_url: or_default("FRONTEND_URL", public_base_url.clone()),
             public_base_url,
             processor_concurrency: or_default("PROCESSOR_CONCURRENCY", 32),

@@ -1,6 +1,8 @@
 //! HTTP layer. Each file owns one group of routes and exposes `configure`,
-//! which `configure` below mounts on the app under `/v1`. Handlers return
-//! `Result<_, ApiError>`; they call `crate::actions` inside `web::block` for database work.
+//! which `configure` below mounts on the Order Service under `/v1`, except
+//! `payments`, the provider's webhook, which the order processor serves (see
+//! `bin/order_processor.rs`). Handlers return `Result<_, ApiError>`; they call
+//! `crate::actions` inside `web::block` for database work.
 
 use actix_web::{error, web, HttpResponse};
 
@@ -8,21 +10,19 @@ use crate::error::ErrorBody;
 
 pub mod admin;
 pub mod checkout;
-pub mod fake_pay;
 pub mod orders;
 pub mod payments;
 pub mod sales;
 pub mod session;
 
-/// Every route lives under `/v1`, except the fake provider's payment page.
+/// The Order Service's routes, all under `/v1`
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.configure(fake_pay::configure).service(
+    cfg.service(
         web::scope("/v1")
             .configure(session::configure)
             .configure(sales::configure)
             .configure(checkout::configure)
             .configure(orders::configure)
-            .configure(payments::configure)
             .configure(admin::configure),
     );
 }

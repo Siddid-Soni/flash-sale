@@ -1,8 +1,8 @@
 //! The Order Service: the stateless HTTP API (guest sessions, sale details,
-//! checkout and order status, the payment webhook and, with the fake provider,
-//! its payment page and webhook delivery). Any number of
-//! replicas can run. It owns the database migrations and the checkout topic,
-//! so it starts before the other binaries.
+//! checkout and order status, admin). Any number of replicas can run. It owns
+//! the database migrations and the checkout topic, so it starts before the
+//! other binaries. The payment webhook is served by the order processor and the
+//! payment page by the fake provider, each in its own container.
 //!
 //! Usage: `cargo run --bin order_service`
 
@@ -17,7 +17,6 @@ use flash_sale::{
     cache, challenge,
     config::Config,
     db,
-    payment::{self, dispatcher::{Dispatcher, DispatcherSettings}, SharedProvider},
     queue,
     queue::{KafkaQueue, SharedQueue},
 };
@@ -55,20 +54,6 @@ async fn main() -> std::io::Result<()> {
     let sold_out = web::Data::new(SoldOutFlags::default());
     actix_web::rt::spawn(api::checkout::run_refresher(sold_out.clone(), redis[0].clone()));
 
-    // The fake provider is part of this service: its payment page is served
-    // here and a background task delivers its (signed) webhooks, to this
-    // service or any replica behind PAYMENT_WEBHOOK_URL
-    let fake_provider = (config.payment_provider == "fake").then(|| payment::fake_from_config(&config, redis[0].clone()));
-    let provider: SharedProvider = match &fake_provider {
-        Some(fake) => fake.clone(),
-        None => payment::from_config(&config, redis[0].clone()),
-    };
-    let provider = web::Data::new(provider);
-    let fake_page = fake_provider.clone().map(web::Data::from);
-    if let Some(fake) = &fake_provider {
-        let dispatcher = Dispatcher::new(fake.clone(), config.payment_webhook_url.clone(), DispatcherSettings::default());
-        actix_web::rt::spawn(dispatcher.run());
-    }
     let challenge = web::Data::new(challenge::from_config(&config));
     let config = web::Data::new(config);
 
@@ -85,12 +70,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(redis[i].clone()))
             .app_data(web::Data::new(read_cache[i].clone()))
             .app_data(checkout_queue.clone())
-            .app_data(provider.clone())
-            .configure(|cfg| {
-                if let Some(fake) = &fake_page {
-                    cfg.app_data(fake.clone());
-                }
-            })
             .app_data(sale_cache.clone())
             .app_data(progress_cache.clone())
             .app_data(sold_out.clone())

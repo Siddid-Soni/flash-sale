@@ -4,8 +4,8 @@
 -- ARGV: 1 ticket  2 payment session id  3 expires_at (epoch ms: the payment
 --       window ends then; this becomes the hold's score in holds:expiry)
 -- Returns 'ready'    the hold was PENDING and is now AWAITING_PAYMENT
---         'already'  the hold is already AWAITING_PAYMENT (or PAID) with this
---                    payment session: a redelivered message, success
+--         'already'  the hold is already AWAITING_PAYMENT with this payment
+--                    session: a redelivered message, success
 --         'gone'     anything else: released, expired, or another session
 --
 -- Like release.lua it is decided by ZREM on the sorted set: whoever removes
@@ -24,8 +24,7 @@ if state == 'PENDING' then
   return 'gone'
 end
 
-if (state == 'AWAITING_PAYMENT' or state == 'PAID')
-    and redis.call('HGET', KEYS[1], 'payment_session') == ARGV[2] then
+if state == 'AWAITING_PAYMENT' and redis.call('HGET', KEYS[1], 'payment_session') == ARGV[2] then
   return 'already'
 end
 return 'gone'

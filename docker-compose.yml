@@ -8,7 +8,8 @@ networks:
         - subnet: 172.28.0.0/16
           gateway: 172.28.0.1
 
-# Shared by the Order Service replicas, the order processor and the expiration worker
+# Shared by the Order Service replicas, the order processor, the expiration
+# worker and the fake payment provider
 x-app-env: &app_env
   DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
   REDIS_URL: redis://redis:6379
@@ -18,9 +19,15 @@ x-app-env: &app_env
   # Clients (and the fake payment page's links) use the gateway's host port
   PUBLIC_BASE_URL: http://localhost:8000
   FRONTEND_URL: http://localhost:8000
-  # The fake provider delivers webhooks through the gateway, as a real provider would
-  # (PAYMENT_WEBHOOK_SECRET comes from .env)
+  PAYMENT_PAGE_BASE_URL: http://localhost:8000
+  # The processor and the worker call the provider's API on the compose network
+  PAYMENT_PROVIDER_URL: http://fake-payment-provider:8090
+  PROVIDER_BIND_ADDR: 0.0.0.0:8090
+  # The provider delivers webhooks through the gateway, as a real provider would: the gateway
+  # lets only the provider's address through and sends them to the order processors, which
+  # serve them on PROCESSOR_HTTP_ADDR (PAYMENT_WEBHOOK_SECRET comes from .env)
   PAYMENT_WEBHOOK_URL: http://gateway/v1/payments/webhook
+  PROCESSOR_HTTP_ADDR: 0.0.0.0:8081
   # Overridable from the shell for the Stage 9 load tests (load/flash.sh and
   # load/backlog.sh set them); the defaults are the values in .env
   PAYMENT_WINDOW_SECS: ${PAYMENT_WINDOW_SECS:-300}
@@ -91,8 +98,8 @@ services:
   # profile only the services above start, for running the app with cargo.
 
   # Three identical Order Service replicas behind the gateway. Their DB pool is
-  # small: checkout and status never touch PostgreSQL (only sessions, admin and
-  # the webhook do), and Postgres allows 100 connections in all. Replica 1 starts
+  # small: checkout and status never touch PostgreSQL (only sessions and admin
+  # do), and Postgres allows 100 connections in all. Replica 1 starts
   # first because it runs the migrations and creates the topic; 2 and 3 wait
   # for it to be healthy so the three do not race on them.
   order-service-1:
@@ -156,8 +163,35 @@ services:
       order-service-1: {condition: service_healthy}
       order-service-2: {condition: service_healthy}
       order-service-3: {condition: service_healthy}
+      fake-payment-provider: {condition: service_healthy}
 
-  # Consumes orders.checkout and the payment inbox; run as many as partitions
+  # The stand-in for Stripe, a service of its own: the payment page (the gateway
+  # proxies /fake-pay/ to it), the HTTP API the processor and the worker call
+  # (create session, expire, refund), and the delivery of its signed webhooks.
+  # It owns the fakepay:* keys in Redis. Its address is fixed because the
+  # gateway admits the webhook only from it (gateway/payment_provider_ips.conf).
+  fake-payment-provider:
+    profiles: [app]
+    build: .
+    image: flash_sale
+    command: ["fake_payment_provider"]
+    restart: unless-stopped
+    env_file: .env
+    environment: *app_env
+    networks:
+      default:
+        ipv4_address: 172.28.0.50
+    depends_on:
+      redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8090'"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Consumes orders.checkout, serves the provider's webhook on port 8081 (the
+  # compose network only; the gateway forwards to it) and retries the payment
+  # inbox; run as many as partitions
   order-processor:
     profiles: [app]
     build: .
@@ -166,11 +200,15 @@ services:
     restart: unless-stopped
     env_file: .env
     environment: *app_env
+    expose:
+      - "8081"
     # Tables and the topic come from the Order Service's startup
     depends_on:
       order-service-1: {condition: service_healthy}
+      fake-payment-provider: {condition: service_healthy}
 
-  # Releases unpaid and leaked holds; several can run at once
+  # Settles holds at their payment deadline (releases the unpaid, counts the
+  # paid) and releases leaked ones; several can run at once
   expiration-worker:
     profiles: [app]
     build: .
@@ -181,6 +219,7 @@ services:
     environment: *app_env
     depends_on:
       order-service-1: {condition: service_healthy}
+      fake-payment-provider: {condition: service_healthy}
 
 volumes:
   redis_data:

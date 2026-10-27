@@ -1,6 +1,7 @@
 //! The fake provider's payment page and webhook dispatcher, against real
 //! Postgres and Redis. The outbox (`fakepay:outbox`) is one queue for the
 //! whole Redis database, so these tests take a lock and empty it first.
+//! (The whole path from the page to a confirmed order is in `payment_flow.rs`.)
 
 mod common;
 
@@ -16,14 +17,12 @@ use actix_web::{
 };
 use redis::AsyncCommands;
 
-use common::sale::{clear_inbox, drain, SaleFixture};
+use common::sale::{clear_inbox, SaleFixture};
 use flash_sale::{
-    api,
-    models::OrderStatus,
     payment::{
         dispatcher::{Dispatcher, DispatcherSettings},
         webhook::{CHECKOUT_COMPLETED, CHECKOUT_PAYMENT_FAILED},
-        EventKind, PaymentProvider, ProviderEvent, Settle,
+        EventKind, ProviderEvent, Settle,
     },
 };
 
@@ -50,7 +49,7 @@ fn location(resp: &actix_web::dev::ServiceResponse) -> &str {
 async fn the_page_shows_the_session_and_escapes_what_it_prints() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    let app = test_app!(fx.env);
+    let app = provider_app!(fx.env);
 
     let resp = test::call_service(&app, test::TestRequest::get().uri(&format!("/fake-pay/{}", a.session.id)).to_request()).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -81,7 +80,7 @@ async fn the_page_shows_the_session_and_escapes_what_it_prints() {
 async fn paying_redirects_to_the_sale_and_queues_one_event() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    let app = test_app!(fx.env);
+    let app = provider_app!(fx.env);
 
     let pay = || test::TestRequest::post().uri(&format!("/fake-pay/{}/pay", a.session.id)).to_request();
     let resp = test::call_service(&app, pay()).await;
@@ -115,7 +114,7 @@ async fn paying_redirects_to_the_sale_and_queues_one_event() {
 async fn cancelling_queues_a_failure_event_and_closes_the_session() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    let app = test_app!(fx.env);
+    let app = provider_app!(fx.env);
 
     let resp = test::call_service(&app, test::TestRequest::post().uri(&format!("/fake-pay/{}/cancel", a.session.id)).to_request()).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -139,7 +138,7 @@ async fn an_expired_session_cannot_be_paid() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
     fx.fake().expire_session(&a.session.id).await.unwrap();
-    let app = test_app!(fx.env);
+    let app = provider_app!(fx.env);
 
     let resp = test::call_service(&app, test::TestRequest::post().uri(&format!("/fake-pay/{}/pay", a.session.id)).to_request()).await;
     assert_eq!(resp.status(), StatusCode::GONE);
@@ -171,7 +170,7 @@ async fn the_provider_accepts_a_payment_the_merchant_will_have_to_refund() {
     )
     .await
     .unwrap();
-    let app = test_app!(fx.env);
+    let app = provider_app!(fx.env);
 
     let resp = test::call_service(&app, test::TestRequest::post().uri(&format!("/fake-pay/{}/pay", a.session.id)).to_request()).await;
     assert_eq!(resp.status(), StatusCode::SEE_OTHER);
@@ -260,7 +259,7 @@ async fn the_dispatcher_retries_after_a_500_and_removes_the_event_after_a_2xx() 
         let calls = receiver.calls.lock().unwrap();
         assert_eq!(calls[0].1, calls[1].1);
         for (headers, body) in calls.iter() {
-            let event = fx.env.provider.verify_webhook(headers, body).unwrap();
+            let event = fx.env.shared_provider().verify_webhook(headers, body).unwrap();
             assert_eq!(event.kind, EventKind::PaymentSucceeded);
             assert_eq!(event.ticket, a.event.ticket);
         }
@@ -299,48 +298,5 @@ async fn a_leased_event_is_not_taken_twice_and_returns_when_the_lease_ends() {
     tokio::time::sleep(Duration::from_millis(350)).await;
     let again = fx.fake().claim_due_events(10, Duration::from_secs(30)).await.unwrap();
     assert_eq!(again, first);
-    fx.cleanup().await;
-}
-
-/// The whole path: the user pays at the page, the dispatcher delivers the
-/// signed event to the real webhook endpoint, a processor confirms the order
-#[actix_web::test]
-async fn paying_at_the_page_ends_with_a_confirmed_order() {
-    let (_guard, fx) = setup(3).await;
-    let a = fx.awaiting().await;
-
-    // The Order Service on a real port
-    let (pool, redis, read_cache) = (fx.env.pool.clone(), fx.env.redis.clone(), fx.env.read_cache.clone());
-    let (provider, fake, config) = (fx.env.shared_provider(), fx.env.provider.clone(), fx.env.config.clone());
-    let server = HttpServer::new(move || {
-        App::new()
-            .app_data(web::Data::new(pool.clone()))
-            .app_data(web::Data::new(redis.clone()))
-            .app_data(web::Data::new(read_cache.clone()))
-            .app_data(web::Data::new(provider.clone()))
-            .app_data(web::Data::from(fake.clone()))
-            .app_data(web::Data::new(config.clone()))
-            .app_data(api::json_config())
-            .configure(api::configure)
-    })
-    .workers(1)
-    .bind(("127.0.0.1", 0))
-    .unwrap();
-    let addr = server.addrs()[0];
-    actix_web::rt::spawn(server.run());
-    let dispatcher = Dispatcher::new(fx.fake(), format!("http://{addr}/v1/payments/webhook"), quick_settings());
-
-    let client = awc::Client::builder().disable_redirects().finish();
-    let resp = client.post(format!("http://{addr}/fake-pay/{}/pay", a.session.id)).send().await.unwrap();
-    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
-
-    assert_eq!(dispatcher.sweep().await.unwrap(), 1);
-    assert_eq!(fx.fake().outbox_len().await.unwrap(), 0, "the endpoint answered 200");
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "PAID", "claimed on receipt");
-
-    assert_eq!(drain(&fx.inbox_worker()).await, 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
-    assert_eq!(fx.product().sold, 1);
-    assert_eq!(fx.sold_counter().await, 1);
     fx.cleanup().await;
 }

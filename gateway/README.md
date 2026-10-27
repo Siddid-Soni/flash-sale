@@ -19,6 +19,7 @@ The Dockerfile builds `web/` (node) and copies `web/dist` into the NGINX image, 
 | `nginx.conf` | Everything: capacity sizing, upstream, limits, locations. Comments explain each choice |
 | `bots.conf` | User-Agent patterns for `$is_bot`, in its own file so the list is easy to edit |
 | `jwt.js` | njs: reads the user id (`sub`) from the bearer token, to pick the per-user rate-limit bucket |
+| `payment_provider_ips.conf` | The addresses the payment webhook accepts (locally the provider container's fixed `172.28.0.50`; in production the provider's published webhook IPs) |
 | `realip.conf` | Empty by default. Overwritten at start by `docker-entrypoint.d/25-realip.sh` |
 | `realip-trusted.conf` | Trust `X-Forwarded-For` from the bridge address (load tests only) |
 | `smoke.sh` | End-to-end check of the points below |
@@ -41,7 +42,7 @@ The Dockerfile builds `web/` (node) and copies `web/dist` into the NGINX image, 
   | `GET /v1/orders/status/*` | user | 2 r/s, burst 10 (clients poll at 0.5 r/s) |
   | `/v1/*` and `/fake-pay/*` | IP | 100 concurrent connections |
 
-  No limit on `/v1/payments/webhook` or static files. The token is not verified at the gateway: its `sub`
+  No limit on `/v1/payments/webhook` (only the address check below) or static files. The token is not verified at the gateway: its `sub`
   only picks a bucket, and the Order Service rejects a forged token.
 - **Bots.** `403 {"message": ...}` on `/v1/` (not the webhook) for an empty User-Agent and the patterns in
   `bots.conf`. `curl` and `wget` are deliberately allowed because ops scripts use them; the trade-off is that
@@ -50,6 +51,14 @@ The Dockerfile builds `web/` (node) and copies `web/dist` into the NGINX image, 
 - **Admin.** `/v1/admin/` is `403` unless the TCP peer is inside the compose network (`172.28.0.0/16`, fixed in
   `docker-compose.yml`) or the gateway itself. Requests from the host appear from the bridge address
   `172.28.0.1` and are refused. The check uses the real peer, so a forged `X-Forwarded-For` cannot open it.
+- **Payment provider.** `/fake-pay/` goes to the `fake-payment-provider` container (its own upstream), not to the
+  replicas. `POST /v1/payments/webhook` goes to the `order_processor` upstream (port 8081) and is allowed only from
+  the addresses in `payment_provider_ips.conf`; everyone else, the host and the gateway container included, gets
+  `403 {"message": ...}`. Like the admin check it tests the real TCP peer (`$realip_remote_addr`), so a forged
+  `X-Forwarded-For` cannot pass, not even with `GATEWAY_TRUST_XFF=1` (which is why the list is a `geo` block and
+  not `allow`/`deny`, which look at the replaced address). In production the file lists the provider's published
+  webhook IPs; the signature check in the processor stays as the second layer. The compose file gives the
+  provider the fixed address `172.28.0.50` so this works.
 - **Static and cache.** `/assets/*` is `public, max-age=31536000, immutable`; `index.html` is `no-cache`;
   `gzip_static` serves pre-compressed files, `gzip` covers other text. `GET /v1/sales/{id}` is cached by
   NGINX for the 1 s the app allows (`X-Cache-Status`); `proxy_cache_lock` and `use_stale updating` make a

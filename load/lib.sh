@@ -21,11 +21,12 @@ start_stack() {
     sleep 1
   done
   [ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/gateway-health")" = 200 ] || { echo "gateway is not healthy"; exit 1; }
-  # Every app container must be up (the processor and the worker have no health check)
+  # Every app container must be up (the processor and the worker have no health check; the
+  # provider has one, and the gateway waits for it)
   for i in $(seq 60); do
     local running
     running=$(docker compose --profile app ps --status running --format '{{.Service}}' | sort | tr '\n' ' ')
-    [[ "$running" == *"expiration-worker"* && "$running" == *"order-processor"* ]] && break
+    [[ "$running" == *"expiration-worker"* && "$running" == *"order-processor"* && "$running" == *"fake-payment-provider"* ]] && break
     sleep 1
   done
   sleep 5   # let the processor join its consumer group
@@ -72,7 +73,9 @@ create_sale() {
 }
 
 # wait_converged SALE TIMEOUT_SECS: no PENDING / AWAITING_PAYMENT orders, no holds queued, the
-# sale's payment inbox events and the provider's webhook outbox drained
+# sale's payment inbox events and the provider's webhook outbox drained. Waiting for
+# holds:expiry to be empty includes the paid holds: the expiration worker counts a sale in
+# sold:{sale} only when it settles the hold at its deadline, so sold:{sale} is final after this.
 wait_converged() {
   local sale=$1 limit=$2 t=0 live pend exp inbox outbox
   while [ "$t" -lt "$limit" ]; do

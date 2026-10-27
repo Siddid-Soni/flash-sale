@@ -77,9 +77,9 @@ async fn a_redelivery_with_the_same_session_is_already_done() {
     // Another session is not this message's link
     assert_eq!(cache::link_ready(&mut con, sale, &ticket, "sess-2", first).await.unwrap(), LinkOutcome::Gone);
 
-    // A paid hold counts as already linked
-    let _: () = con.hset(cache::hold_key(sale, &ticket), "state", "PAID").await.unwrap();
-    assert_eq!(cache::link_ready(&mut con, sale, &ticket, "sess-1", first).await.unwrap(), LinkOutcome::Already);
+    // A hold the worker has settled (sold) is past linking
+    let _: () = con.hset(cache::hold_key(sale, &ticket), "state", "CONFIRMED").await.unwrap();
+    assert_eq!(cache::link_ready(&mut con, sale, &ticket, "sess-1", first).await.unwrap(), LinkOutcome::Gone);
     cleanup(&mut con, sale).await;
 }
 

@@ -342,6 +342,54 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
     cleanup(&env, sale).await;
 }
 
+/// A paid hold stays AWAITING_PAYMENT in Redis until the expiration worker
+/// settles it, so the status must not be answered from the hold then: the
+/// order row says CONFIRMED. A hold the worker has settled answers by itself.
+#[actix_web::test]
+async fn a_paid_hold_the_worker_has_not_settled_reports_confirmed_from_postgres() {
+    let env = common::env().await;
+    let app = test_app!(env);
+    let sale = sale(&env, 5, 60).await;
+    let owner = guest(&env);
+    let mut redis = env.redis.clone();
+
+    let body: Value =
+        test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
+    let ticket = body["queue_ticket_id"].as_str().unwrap().to_string();
+    let expires = Utc::now() + Duration::minutes(5);
+    let mut conn = env.pool.get().unwrap();
+    diesel::insert_into(orders::table)
+        .values(&NewOrder {
+            user_id: owner.id,
+            product_id: sale,
+            queue_ticket_id: &ticket,
+            idempotency_key: "k",
+            status: OrderStatus::Confirmed,
+            amount_cents: 59_900,
+        })
+        .execute(&mut conn)
+        .unwrap();
+    diesel::update(orders::table.filter(orders::queue_ticket_id.eq(&ticket)))
+        .set((orders::checkout_url.eq("http://localhost/fake-pay/xyz"), orders::expires_at.eq(expires)))
+        .execute(&mut conn)
+        .unwrap();
+    // The hold is AWAITING_PAYMENT (the worker has not been there) and the status write was lost
+    let _: () = redis
+        .hset_multiple(cache::hold_key(sale, &ticket), &[("state", "AWAITING_PAYMENT"), ("user", &owner.id.to_string())])
+        .await
+        .unwrap();
+    let _: () = redis.del(cache::status_key(&ticket)).await.unwrap();
+    let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
+    assert_eq!(body, json!({ "status": "CONFIRMED" }), "no payment link for a paid order");
+
+    // Once the worker has settled the hold, it answers without PostgreSQL
+    let _: () = redis.hset(cache::hold_key(sale, &ticket), "state", "CONFIRMED").await.unwrap();
+    diesel::delete(orders::table.filter(orders::queue_ticket_id.eq(&ticket))).execute(&mut conn).unwrap();
+    let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
+    assert_eq!(body, json!({ "status": "CONFIRMED" }));
+    cleanup(&env, sale).await;
+}
+
 #[actix_web::test]
 async fn the_position_follows_processor_progress() {
     let mut env = common::env().await;

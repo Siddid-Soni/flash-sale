@@ -154,8 +154,11 @@ async fn order_status(
         }));
     }
 
-    // 2. The hold. It knows the state but not the payment link, so an
-    // unpaid or paid hold goes on to the order for the rest
+    // 2. The hold. It knows the state but not the payment link, and it can be
+    // behind: a paid hold stays AWAITING_PAYMENT until the expiration worker
+    // settles it, so AWAITING_PAYMENT is never answered from the hold; the
+    // order row has the truth. A hold the worker settled (CONFIRMED, or
+    // REFUNDED after a guard failure) or released is final and answers here.
     let mut con = redis.get_ref().clone();
     let mut from_hold = None;
     if let Some(hold) = cache::read_hold(&mut con, sale, &ticket).await? {
@@ -172,10 +175,9 @@ async fn order_status(
             ) => {
                 return Ok(respond(StatusResponse::bare(status)));
             }
+            // Used only if there is no order row yet
             Some(OrderStatus::AwaitingPayment) => from_hold = Some(StatusResponse::bare(OrderStatus::AwaitingPayment)),
-            // `PAID`: confirmation is in progress, the order row has the state
-            // (`CONFIRMED` and `REFUNDED` are written after the commit, so they are final)
-            _ => {}
+            None => {}
         }
     }
 

@@ -96,7 +96,7 @@ pub struct ProviderEvent {
     /// Our queue ticket, which the session was created for
     pub ticket: String,
     pub amount_cents: i64,
-    /// The payment to refund or to record as the claim's winner; set for a success
+    /// The payment to refund; set for a success
     pub payment_id: Option<String>,
     pub payload: Value,
 }

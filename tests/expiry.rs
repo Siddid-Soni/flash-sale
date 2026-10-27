@@ -73,6 +73,7 @@ fn settings(batch: usize, delivery_timeout_ms: i64) -> Settings {
         delivery_timeout_ms,
         stale_after: Duration::minutes(10),
         sale_lookback: Duration::days(3),
+        expired_recheck: Duration::minutes(30),
     }
 }
 
@@ -89,22 +90,9 @@ fn quiet(fx: &SaleFixture) -> Expirer {
     expirer(fx, StubLag::new(&[(0, false)]), 100, 30_000)
 }
 
-async fn set_expiry_score(fx: &SaleFixture, ticket: &str, score_ms: i64) {
-    let changed: i64 = redis::cmd("ZADD")
-        .arg(cache::holds_expiry_key(fx.sale))
-        .arg("XX")
-        .arg("CH")
-        .arg(score_ms)
-        .arg(ticket)
-        .query_async(&mut fx.env.redis.clone())
-        .await
-        .unwrap();
-    assert_eq!(changed, 1, "{ticket} is not in holds:expiry");
-}
-
-/// The hold's deadline has passed
+/// The hold's deadline has passed, for PostgreSQL and for Redis
 async fn make_due(fx: &SaleFixture, ticket: &str) {
-    set_expiry_score(fx, ticket, Utc::now().timestamp_millis() - 1_000).await;
+    fx.make_due(ticket).await;
 }
 
 async fn session_state(fx: &SaleFixture, session_id: &str) -> String {
@@ -238,7 +226,9 @@ async fn a_refunded_order_is_never_overwritten_with_expired() {
     let a = fx.awaiting().await;
     let ticket = a.event.ticket.clone();
 
-    // The hold is released ...
+    // The order is expired and the hold released ...
+    make_due(&fx, &ticket).await;
+    assert_eq!(actions::orders::expire_due(&mut fx.env.pool.get().unwrap(), std::slice::from_ref(&ticket)).unwrap().len(), 1);
     release_by_hand(&fx, &ticket, HoldState::AwaitingPayment, ReleasedAs::Expired).await;
     // ... the user pays before the session is expired, and the inbox refunds it
     let wire = fx.pay(&a).await;
@@ -254,6 +244,197 @@ async fn a_refunded_order_is_never_overwritten_with_expired() {
     assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::Refunded);
     assert_eq!(session_state(&fx, &a.session.id).await, "REFUNDED", "a paid session is not expired");
     assert_eq!(fx.stock().await, 5, "released once, refunded without returning stock again");
+    fx.cleanup().await;
+}
+
+/// The worker died between PostgreSQL's expiry and the release: the hold is
+/// still in `holds:expiry`, its order is EXPIRED, and the next pass finishes it
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_between_the_order_update_and_the_release_converges() {
+    let (_guard, fx) = setup(3).await;
+    let a = fx.awaiting().await;
+    make_due(&fx, &a.event.ticket).await;
+    let expired = actions::orders::expire_due(&mut fx.env.pool.get().unwrap(), std::slice::from_ref(&a.event.ticket)).unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(fx.stock().await, 2);
+
+    let pass = quiet(&fx).unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped), (1, 0, 0));
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
+    assert_eq!(fx.stock().await, 3);
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Expired);
+    assert_eq!(session_state(&fx, &a.session.id).await, "EXPIRED");
+    fx.cleanup().await;
+}
+
+// ---- Paid holds ----
+
+/// A paid order's hold waits in `holds:expiry` until its deadline; then the
+/// worker counts the sale once and returns no stock
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paid_hold_is_counted_as_sold_when_it_is_due_and_returns_no_stock() {
+    let (_guard, fx) = setup(5).await;
+    let paid = fx.awaiting().await;
+    let wire = fx.pay(&paid).await;
+    fx.store(&wire);
+    assert_eq!(drain(&fx.inbox_worker()).await, 1);
+    let unpaid = fx.awaiting().await;
+    assert_eq!(fx.stock().await, 3);
+    let worker = quiet(&fx);
+
+    // Not due yet: the payment path wrote no inventory key, and the worker has nothing to do
+    let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped, pass.more), (0, 0, 0, false));
+    assert_eq!(fx.sold_counter().await, 0);
+    assert_eq!(fx.hold_state(&paid.event.ticket).await, "AWAITING_PAYMENT");
+
+    make_due(&fx, &paid.event.ticket).await;
+    let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped), (0, 1, 0));
+    assert_eq!(fx.hold_state(&paid.event.ticket).await, "CONFIRMED");
+    assert_eq!(fx.sold_counter().await, 1);
+    assert_eq!(fx.stock().await, 3, "the unit is sold, not returned");
+    assert_eq!(fx.order(&paid.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.status(&paid.event.ticket).await.unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(session_state(&fx, &paid.session.id).await, "PAID", "a paid session is left alone");
+    assert_eq!(user_live(&fx, paid.event.user).await.as_deref(), Some(paid.event.ticket.as_str()), "the user bought one");
+    // The unpaid one is untouched
+    assert_eq!(fx.order(&unpaid.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+
+    // Counted once, however often the worker looks
+    for _ in 0..3 {
+        assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().confirmed, 0);
+    }
+    assert_eq!(fx.sold_counter().await, 1);
+    assert_eq!(fx.product().sold, 1);
+    fx.cleanup().await;
+}
+
+/// A payment that came after the deadline was refunded by the processor; the
+/// hold is still in `holds:expiry`, so the worker returns the unit
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_whose_late_payment_was_refunded_is_released() {
+    let (_guard, fx) = setup(3).await;
+    let a = fx.awaiting().await;
+    make_due(&fx, &a.event.ticket).await;
+    let wire = fx.pay(&a).await;
+    fx.store(&wire);
+    assert_eq!(drain(&fx.inbox_worker()).await, 1);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.stock().await, 2);
+
+    let pass = quiet(&fx).unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped), (1, 0, 0));
+    assert_eq!(fx.stock().await, 3, "the unit is back");
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded, "REFUNDED is not overwritten");
+    assert_eq!(session_state(&fx, &a.session.id).await, "REFUNDED", "a paid session is not expired");
+    assert_eq!(fx.sold_counter().await, 0);
+    assert_eq!(user_live(&fx, a.event.user).await, None);
+    fx.cleanup().await;
+}
+
+/// PostgreSQL refused the payment because it had no unit left although Redis
+/// held one: the hold is dropped without stock and without a count
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_whose_payment_failed_the_guard_is_dropped_without_stock_or_count() {
+    let (_guard, fx) = setup(3).await;
+    let a = fx.awaiting().await;
+    diesel::update(flash_sale::schema::products::table.find(fx.sale))
+        .set(flash_sale::schema::products::sold.eq(flash_sale::schema::products::total_inventory))
+        .execute(&mut fx.env.pool.get().unwrap())
+        .unwrap();
+    let wire = fx.pay(&a).await;
+    fx.store(&wire);
+    assert_eq!(drain(&fx.inbox_worker()).await, 1);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    make_due(&fx, &a.event.ticket).await;
+
+    let worker = quiet(&fx);
+    let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped), (0, 0, 1));
+    assert_eq!(fx.stock().await, 2, "no unit came back");
+    assert_eq!(fx.sold_counter().await, 0);
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "REFUNDED");
+    assert_eq!(fx.expiry_len().await, 0);
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
+    // Nothing more to do
+    let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped), (0, 0, 0));
+    fx.cleanup().await;
+}
+
+/// Redis' clock says due, PostgreSQL's says not yet: nothing is released or
+/// counted, the pass does not ask for another at once, and a later pass
+/// expires the order when PostgreSQL agrees
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hold_due_by_redis_but_not_by_postgres_is_left_for_a_later_pass() {
+    let (_guard, fx) = setup(3).await;
+    let a = fx.awaiting().await;
+    fx.set_redis_deadline(&a.event.ticket, Utc::now().timestamp_millis() - 1_000).await;
+    let worker = expirer(&fx, StubLag::new(&[(0, false)]), 1, 30_000);
+
+    for _ in 0..2 {
+        let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
+        assert_eq!((pass.released, pass.confirmed, pass.dropped, pass.more), (0, 0, 0, false));
+    }
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
+    assert_eq!(fx.expiry_len().await, 1);
+    assert_eq!(fx.stock().await, 2);
+    assert_eq!(session_state(&fx, &a.session.id).await, "OPEN");
+
+    // PostgreSQL's clock catches up
+    fx.set_pg_deadline(&a.event.ticket, Utc::now().timestamp_millis() - 1_000);
+    assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().released, 1);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
+    assert_eq!(fx.stock().await, 3);
+    fx.cleanup().await;
+}
+
+/// A payment in that window is decided by PostgreSQL's deadline too: it is
+/// ahead, so the payment wins, and the worker then counts the sale at once
+/// (a confirmed order never turns back, whatever the clocks say)
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_in_the_clock_skew_window_wins_and_is_counted() {
+    let (_guard, fx) = setup(3).await;
+    let a = fx.awaiting().await;
+    fx.set_redis_deadline(&a.event.ticket, Utc::now().timestamp_millis() - 1_000).await;
+    let wire = fx.pay(&a).await;
+    fx.store(&wire);
+    assert_eq!(drain(&fx.inbox_worker()).await, 1);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+
+    let worker = quiet(&fx);
+    assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().confirmed, 1);
+    assert_eq!(fx.sold_counter().await, 1);
+    assert_eq!(fx.hold_state(&a.event.ticket).await, "CONFIRMED");
+    fx.cleanup().await;
+}
+
+/// Holds are linked only after their order is updated, so a due hold without
+/// an order should not exist; if it does the worker leaves it alone
+#[tokio::test(flavor = "multi_thread")]
+async fn a_due_hold_without_an_order_is_left_alone() {
+    let (_guard, fx) = setup(3).await;
+    let event = fx.winner().await;
+    let linked = cache::link_ready(
+        &mut fx.env.redis.clone(),
+        fx.sale,
+        &event.ticket,
+        "sess-x",
+        Utc::now().timestamp_millis() - 1_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(linked, cache::LinkOutcome::Ready);
+
+    let pass = quiet(&fx).unpaid_pass(&[fx.sale]).await.unwrap();
+    assert_eq!((pass.released, pass.confirmed, pass.dropped, pass.more), (0, 0, 0, false));
+    assert_eq!(fx.hold_state(&event.ticket).await, "AWAITING_PAYMENT");
+    assert_eq!(fx.stock().await, 2);
     fx.cleanup().await;
 }
 
@@ -497,37 +678,35 @@ async fn the_lag_of_a_partition_is_its_committed_offset_against_its_watermark() 
 
 // ---- Payment and expiry racing ----
 
-/// Roadmap step 24: many holds just past due against payments claiming at the
-/// same moment, through the real inbox path. Exactly one side wins each hold;
-/// every losing payment is refunded; the counts add up.
+/// Roadmap step 24: many holds just past due against payments handled at the
+/// same moment (concurrent webhook handlers) and the expiration worker. Both
+/// sides decide in PostgreSQL, on its one clock: exactly one wins each order,
+/// every losing payment is refunded, and once the worker has settled every hold
+/// the counts add up, `sold:{sale}` counted once per sale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn payment_and_expiry_racing_leave_exactly_one_winner_per_hold() {
+async fn payment_and_expiry_racing_leave_exactly_one_winner_per_order() {
     const N: usize = 40;
     let (_guard, fx) = setup(N as i32).await;
-    let mut holds: Vec<(Awaiting, bool)> = Vec::new();
+    let mut holds: Vec<(Awaiting, Option<flash_sale::payment::ProviderEvent>)> = Vec::new();
     for i in 0..N {
         let a = fx.awaiting().await;
-        let pays = i % 2 == 0;
-        if pays {
-            let wire = fx.pay(&a).await;
-            fx.store(&wire);
-        }
-        holds.push((a, pays));
+        let event = if i % 2 == 0 { Some(fx.pay(&a).await.event) } else { None };
+        holds.push((a, event));
     }
 
     // The deadlines fall about a millisecond apart; the payments and the
-    // expiration worker start a few milliseconds before the first, so the
-    // claims and the releases meet around the deadlines
-    let worker = Arc::new(quiet(&fx));
-    let t0 = worker.redis_now_ms().await.unwrap();
+    // expiration workers start a few milliseconds before the first, so the
+    // decisions meet around the deadlines
+    let workers: Vec<Arc<Expirer>> = (0..2).map(|_| Arc::new(quiet(&fx))).collect();
+    let t0 = workers[0].redis_now_ms().await.unwrap();
     for (i, (a, _)) in holds.iter().enumerate() {
-        set_expiry_score(&fx, &a.event.ticket, t0 + 150 + (i / 2) as i64).await;
+        fx.set_deadline(&a.event.ticket, t0 + 150 + (i / 2) as i64).await;
     }
     let stop = Arc::new(AtomicBool::new(false));
-    let until_first_deadline = t0 + 150 - worker.redis_now_ms().await.unwrap();
+    let until_first_deadline = t0 + 150 - workers[0].redis_now_ms().await.unwrap();
     let start_after = StdDuration::from_millis((until_first_deadline - 25).max(0) as u64);
     let mut tasks = Vec::new();
-    {
+    for worker in &workers {
         let (worker, stop, sale) = (worker.clone(), stop.clone(), fx.sale);
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(start_after).await;
@@ -537,32 +716,27 @@ async fn payment_and_expiry_racing_leave_exactly_one_winner_per_hold() {
             }
         }));
     }
+    // The payments arrive as webhook requests do: three handlers, each event handled on receipt
+    let events: Vec<_> = holds.iter().filter_map(|(_, e)| e.clone()).collect();
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let events = Arc::new(events);
     for _ in 0..3 {
-        let (inbox, stop) = (fx.inbox_worker(), stop.clone());
+        let (inbox, events, next) = (fx.inbox_worker(), events.clone(), next.clone());
         tasks.push(tokio::spawn(async move {
             tokio::time::sleep(start_after).await;
-            while !stop.load(Ordering::SeqCst) {
-                // A pause after each event keeps the claims spread over the deadlines
-                let found = inbox.process_next().await.unwrap();
-                tokio::time::sleep(StdDuration::from_millis(if found { 2 } else { 3 })).await;
+            loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(event) = events.get(i) else { return };
+                inbox.receive(event).await.unwrap();
+                // A pause after each event keeps the decisions spread over the deadlines
+                tokio::time::sleep(StdDuration::from_millis(3)).await;
             }
         }));
     }
 
-    // Until every hold has left the expiry queue (claimed or released) and the inbox is empty
+    // Until every hold has left the expiry queue (settled by a worker)
     let give_up = tokio::time::Instant::now() + StdDuration::from_secs(20);
-    loop {
-        let unprocessed: i64 = {
-            use flash_sale::schema::payment_inbox;
-            payment_inbox::table
-                .filter(payment_inbox::processed_at.is_null())
-                .count()
-                .get_result(&mut fx.env.pool.get().unwrap())
-                .unwrap()
-        };
-        if unprocessed == 0 && zcard(&fx, cache::holds_expiry_key(fx.sale)).await == 0 {
-            break;
-        }
+    while fx.expiry_len().await > 0 {
         assert!(tokio::time::Instant::now() < give_up, "the race did not settle");
         tokio::time::sleep(StdDuration::from_millis(20)).await;
     }
@@ -570,22 +744,35 @@ async fn payment_and_expiry_racing_leave_exactly_one_winner_per_hold() {
     for task in tasks {
         task.await.unwrap();
     }
-    worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    for worker in &workers {
+        worker.unpaid_pass(&[fx.sale]).await.unwrap();
+    }
+
+    let unprocessed: i64 = {
+        use flash_sale::schema::payment_inbox;
+        payment_inbox::table
+            .filter(payment_inbox::processed_at.is_null())
+            .count()
+            .get_result(&mut fx.env.pool.get().unwrap())
+            .unwrap()
+    };
+    assert_eq!(unprocessed, 0, "every payment was handled on receipt");
 
     let (mut confirmed, mut refunded, mut expired) = (0i64, 0i64, 0i64);
-    for (a, pays) in &holds {
+    for (a, event) in &holds {
+        let pays = event.is_some();
         let ticket = &a.event.ticket;
         let order = fx.order(ticket).unwrap();
         let status = fx.status(ticket).await.unwrap().status;
         let hold = fx.hold_state(ticket).await;
         let session = session_state(&fx, &a.session.id).await;
         match (pays, order.status) {
-            // The claim won before the deadline
+            // The payment beat PostgreSQL's deadline: the worker counted the sale
             (true, OrderStatus::Confirmed) => {
                 assert_eq!((status, hold.as_str(), session.as_str()), (OrderStatus::Confirmed, "CONFIRMED", "PAID"));
                 confirmed += 1;
             }
-            // The release won; the payment was refunded
+            // The deadline won; the payment was refunded and the worker returned the unit
             (true, OrderStatus::Refunded) => {
                 assert_eq!((status, hold.as_str(), session.as_str()), (OrderStatus::Refunded, "EXPIRED", "REFUNDED"));
                 refunded += 1;
@@ -603,9 +790,9 @@ async fn payment_and_expiry_racing_leave_exactly_one_winner_per_hold() {
     assert_eq!(expired, (N / 2) as i64);
 
     // stock + live holds + sold == total
-    let live = zcard(&fx, cache::holds_expiry_key(fx.sale)).await + zcard(&fx, cache::holds_pending_key(fx.sale)).await;
+    let live = fx.expiry_len().await + zcard(&fx, cache::holds_pending_key(fx.sale)).await;
     assert_eq!(live, 0);
-    assert_eq!(fx.sold_counter().await, confirmed);
+    assert_eq!(fx.sold_counter().await, confirmed, "counted once per sale, by the workers");
     assert_eq!(fx.product().sold as i64, confirmed);
     assert_eq!(fx.stock().await + live + fx.sold_counter().await, N as i64);
     fx.cleanup().await;
@@ -614,13 +801,15 @@ async fn payment_and_expiry_racing_leave_exactly_one_winner_per_hold() {
 // ---- Several workers ----
 
 /// Roadmap step 24: concurrent workers over the same due holds. Each unit is
-/// returned once, each hold is finished by one worker, the stock is exact.
+/// returned once, each paid hold is counted once, each hold is finished by one
+/// worker, the stock is exact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn several_workers_release_each_hold_once() {
     const UNPAID: usize = 28;
+    const PAID: usize = 14;
     const LEAKED: usize = 20;
     const TIMEOUT: i64 = 100;
-    let (_guard, fx) = setup((UNPAID + LEAKED) as i32).await;
+    let (_guard, fx) = setup((UNPAID + PAID + LEAKED) as i32).await;
     let mut leaked = Vec::new();
     for _ in 0..LEAKED {
         leaked.push(leaked_hold(&fx).await);
@@ -631,6 +820,18 @@ async fn several_workers_release_each_hold_once() {
         make_due(&fx, &a.event.ticket).await;
         unpaid.push(a);
     }
+    let mut paid = Vec::new();
+    let worker_inbox = fx.inbox_worker();
+    for _ in 0..PAID {
+        let a = fx.awaiting().await;
+        let wire = fx.pay(&a).await;
+        fx.store(&wire);
+        paid.push(a);
+    }
+    assert_eq!(drain(&worker_inbox).await, PAID);
+    for a in &paid {
+        make_due(&fx, &a.event.ticket).await;
+    }
     assert_eq!(fx.stock().await, 0);
     tokio::time::sleep(StdDuration::from_millis(TIMEOUT as u64 + 100)).await;
 
@@ -640,23 +841,34 @@ async fn several_workers_release_each_hold_once() {
             let worker = expirer(&fx, StubLag::new(&[(0, false), (1, false)]), 7, TIMEOUT);
             let sale = fx.sale;
             tokio::spawn(async move {
-                let mut released = 0;
+                let (mut released, mut confirmed) = (0, 0);
                 loop {
                     let pass = worker.round(&[sale]).await.unwrap();
                     released += pass.released;
+                    confirmed += pass.confirmed;
                     if !pass.more {
-                        return released;
+                        return (released, confirmed);
                     }
                 }
             })
         })
         .collect();
-    let mut released = 0;
+    let (mut released, mut confirmed) = (0, 0);
     for task in tasks {
-        released += task.await.unwrap();
+        let (r, c) = task.await.unwrap();
+        released += r;
+        confirmed += c;
     }
     assert_eq!(released, UNPAID + LEAKED, "every hold was released by exactly one worker");
-    assert_eq!(fx.stock().await, (UNPAID + LEAKED) as i64, "every unit returned once");
+    assert_eq!(confirmed, PAID, "every paid hold was counted by exactly one worker");
+    assert_eq!(fx.stock().await, (UNPAID + LEAKED) as i64, "every unit returned once; the paid ones stay taken");
+    assert_eq!(fx.sold_counter().await, PAID as i64, "sold:{{sale}} counted once per paid hold");
+    assert_eq!(fx.product().sold as usize, PAID);
+    assert_eq!(fx.expiry_len().await, 0);
+    for a in &paid {
+        assert_eq!(fx.hold_state(&a.event.ticket).await, "CONFIRMED");
+        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    }
 
     for a in &unpaid {
         assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
@@ -730,6 +942,42 @@ async fn the_sweep_finishes_orders_whose_hold_ended_and_leaves_live_ones() {
     // Idempotent
     let again = worker.sweep(Utc::now()).await.unwrap();
     assert_eq!((again.expired, again.failed), (0, 0));
+    fx.cleanup().await;
+}
+
+/// The unpaid loop expires the order first, so a worker that dies after that
+/// (before the status or the session) leaves an EXPIRED order: the sweep finishes it
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_finishes_an_expired_order_whose_status_and_session_were_missed() {
+    let (_guard, fx) = setup(5).await;
+    let worker = quiet(&fx);
+    let missed = fx.awaiting().await;
+    let done = fx.awaiting().await;
+    for a in [&missed, &done] {
+        make_due(&fx, &a.event.ticket).await;
+    }
+    // The worker died right after the release of `missed`
+    let ticket = missed.event.ticket.clone();
+    assert_eq!(actions::orders::expire_due(&mut fx.env.pool.get().unwrap(), std::slice::from_ref(&ticket)).unwrap().len(), 1);
+    release_by_hand(&fx, &ticket, HoldState::AwaitingPayment, ReleasedAs::Expired).await;
+    assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().released, 1, "the other one is done normally");
+    assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(session_state(&fx, &missed.session.id).await, "OPEN");
+
+    // Too recent for the sweep
+    worker.sweep(Utc::now()).await.unwrap();
+    assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::AwaitingPayment);
+
+    // Later: the missed one is finished, the finished one is left alone
+    let later = Utc::now() + Duration::minutes(15);
+    // (Other tests leave EXPIRED orders behind in the shared database, so only this one is checked)
+    let swept = worker.sweep(later).await.unwrap();
+    assert!(swept.repaired >= 1, "{swept:?}");
+    assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::Expired);
+    assert_eq!(session_state(&fx, &missed.session.id).await, "EXPIRED");
+    assert_eq!(fx.status(&done.event.ticket).await.unwrap().status, OrderStatus::Expired);
+    worker.sweep(later).await.unwrap();
+    assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::Expired, "idempotent");
     fx.cleanup().await;
 }
 
