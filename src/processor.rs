@@ -69,6 +69,9 @@ pub enum ProcessError {
     Payment(#[from] PaymentError),
     #[error("blocking task: {0}")]
     Join(String),
+    /// A state that should be impossible; the event stays in the inbox with this as its error
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Creates orders and payment links from checkout events

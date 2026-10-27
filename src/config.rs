@@ -37,6 +37,14 @@ pub struct Config {
     /// Where clients reach the API; the fake provider builds its payment page
     /// URL (`{PUBLIC_BASE_URL}/fake-pay/{session}`) from it
     pub public_base_url: String,
+    /// Where the fake provider sends its webhooks; default
+    /// `{PUBLIC_BASE_URL}/v1/payments/webhook`. Plain `http://` only
+    pub payment_webhook_url: String,
+    /// Signs and verifies webhooks (HMAC-SHA256); shared by the provider and the Order Service
+    pub payment_webhook_secret: String,
+    /// Where the fake payment page sends the browser back to (`/?sale=<id>`);
+    /// default `PUBLIC_BASE_URL`. Differs from it when the frontend is served elsewhere
+    pub frontend_url: String,
     /// Checkout messages one order processor works on at once, per partition
     pub processor_concurrency: usize,
     /// Cap on checkout messages one order processor starts per second
@@ -49,6 +57,7 @@ impl Config {
         dotenvy::dotenv().ok();
 
         let redis_url = or_default("REDIS_URL", "redis://127.0.0.1:6379".to_string());
+        let public_base_url = or_default("PUBLIC_BASE_URL", "http://localhost:8080".to_string());
         Self {
             database_url: required("DATABASE_URL"),
             bind_addr: or_default("BIND_ADDR", "127.0.0.1:8080".to_string()),
@@ -66,7 +75,13 @@ impl Config {
             payment_window_secs: or_default("PAYMENT_WINDOW_SECS", 300),
             payment_provider: or_default("PAYMENT_PROVIDER", "fake".to_string()),
             fake_payment_delay_ms: or_default("FAKE_PAYMENT_DELAY_MS", 2000),
-            public_base_url: or_default("PUBLIC_BASE_URL", "http://localhost:8080".to_string()),
+            payment_webhook_url: or_default(
+                "PAYMENT_WEBHOOK_URL",
+                format!("{}/v1/payments/webhook", public_base_url.trim_end_matches('/')),
+            ),
+            payment_webhook_secret: required("PAYMENT_WEBHOOK_SECRET"),
+            frontend_url: or_default("FRONTEND_URL", public_base_url.clone()),
+            public_base_url,
             processor_concurrency: or_default("PROCESSOR_CONCURRENCY", 32),
             processor_max_per_sec: or_default("PROCESSOR_MAX_PER_SEC", 0),
         }

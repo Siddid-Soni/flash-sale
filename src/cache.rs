@@ -48,7 +48,7 @@ pub fn stock_key(sale: i32) -> String {
     format!("stock:{{{sale}}}")
 }
 
-/// Units paid
+/// Units paid and confirmed (counted by `confirm.lua` after the order commits)
 pub fn sold_key(sale: i32) -> String {
     format!("sold:{{{sale}}}")
 }
@@ -69,7 +69,7 @@ pub fn idem_key(sale: i32, user: i32, key: &str) -> String {
 }
 
 /// Hash with `state`, `user`, `checkout_ms`, `idem` (the idempotency key the
-/// order is stored with), later `payment_session`
+/// order is stored with), later `payment_session` and, once paid, `paid_by`
 pub fn hold_key(sale: i32, ticket: &str) -> String {
     format!("hold:{{{sale}}}:{ticket}")
 }
@@ -316,7 +316,7 @@ pub async fn release_hold(
 /// A hold as stored in `hold:{sale}:{ticket}`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hold {
-    /// `PENDING`, `AWAITING_PAYMENT`, `PAID`, `FAILED` or `EXPIRED`
+    /// `PENDING`, `AWAITING_PAYMENT`, `PAID`, `CONFIRMED`, `REFUNDED`, `FAILED` or `EXPIRED`
     pub state: String,
     pub user: i32,
     pub checkout_ms: i64,
@@ -376,6 +376,95 @@ pub async fn link_ready(
         "already" => Ok(LinkOutcome::Already),
         "gone" => Ok(LinkOutcome::Gone),
         _ => Err(unexpected_reply("unexpected link_ready.lua reply")),
+    }
+}
+
+static CONFIRM_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(include_str!("../scripts/confirm.lua")));
+
+/// What claiming a hold for a payment decided
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The hold is `PAID` by this payment session (just now, or by an earlier
+    /// call: a retry finds its own claim)
+    Won,
+    /// Released, past due, or held for another session: refund the payment
+    Gone,
+}
+
+/// What finalizing a hold did
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// `sold:{sale}` was incremented and the hold is `CONFIRMED`
+    Finalized,
+    /// The hold is not `PAID` by this session (already finalized, or not ours)
+    Noop,
+}
+
+async fn confirm_script(
+    con: &mut RedisConn,
+    mode: &str,
+    sale: i32,
+    ticket: &str,
+    session: &str,
+    payment_id: &str,
+) -> redis::RedisResult<String> {
+    CONFIRM_SCRIPT
+        .key(hold_key(sale, ticket))
+        .key(holds_expiry_key(sale))
+        .key(sold_key(sale))
+        .arg(mode)
+        .arg(ticket)
+        .arg(session)
+        .arg(payment_id)
+        .arg(DAY_SECS)
+        .invoke_async(con)
+        .await
+}
+
+/// Runs `confirm.lua` in `claim` mode: `AWAITING_PAYMENT` to `PAID` for the
+/// payment session `session`, only while the hold's deadline in
+/// `holds:expiry` is still ahead. The Order Service does this when the
+/// webhook arrives; the order processor repeats it and finds its own claim.
+pub async fn claim_hold(
+    con: &mut RedisConn,
+    sale: i32,
+    ticket: &str,
+    session: &str,
+    payment_id: &str,
+) -> redis::RedisResult<ClaimOutcome> {
+    match confirm_script(con, "claim", sale, ticket, session, payment_id).await?.as_str() {
+        "won" => Ok(ClaimOutcome::Won),
+        "gone" => Ok(ClaimOutcome::Gone),
+        _ => Err(unexpected_reply("unexpected confirm.lua reply")),
+    }
+}
+
+/// Runs `confirm.lua` in `finalize` mode, after the order is `CONFIRMED` in
+/// PostgreSQL: counts the unit in `sold:{sale}` and marks the hold
+/// `CONFIRMED`, once however often it is called.
+pub async fn finalize_hold(
+    con: &mut RedisConn,
+    sale: i32,
+    ticket: &str,
+    session: &str,
+) -> redis::RedisResult<FinalizeOutcome> {
+    match confirm_script(con, "finalize", sale, ticket, session, "").await?.as_str() {
+        "finalized" => Ok(FinalizeOutcome::Finalized),
+        "noop" => Ok(FinalizeOutcome::Noop),
+        _ => Err(unexpected_reply("unexpected confirm.lua reply")),
+    }
+}
+
+/// Runs `confirm.lua` in `refunded` mode: a payment that won the claim was
+/// refunded (the PostgreSQL guard refused it), so the hold stops being `PAID`
+/// and is kept only for the status fallback. Nothing is counted and no stock
+/// returns: the unit was never sold. Returns whether the hold was changed.
+pub async fn close_refunded_hold(con: &mut RedisConn, sale: i32, ticket: &str, session: &str) -> redis::RedisResult<bool> {
+    match confirm_script(con, "refunded", sale, ticket, session, "").await?.as_str() {
+        "closed" => Ok(true),
+        "noop" => Ok(false),
+        _ => Err(unexpected_reply("unexpected confirm.lua reply")),
     }
 }
 

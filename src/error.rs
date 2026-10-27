@@ -92,3 +92,9 @@ impl From<crate::queue::QueueError> for ApiError {
         ApiError::ServiceUnavailable("the checkout queue is unavailable, retry shortly".into())
     }
 }
+
+impl From<crate::payment::PaymentError> for ApiError {
+    fn from(err: crate::payment::PaymentError) -> Self {
+        ApiError::Internal(err.to_string())
+    }
+}

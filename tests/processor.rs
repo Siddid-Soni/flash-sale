@@ -9,6 +9,7 @@ use std::sync::{
 };
 use std::time::Duration as StdDuration;
 
+use actix_web::http::header::HeaderMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use diesel::prelude::*;
@@ -23,7 +24,7 @@ use flash_sale::{
     actions,
     cache::{self, CheckoutOutcome, HoldState, MaxScore, ReleasedAs},
     models::{NewOrder, NewProduct, Order, OrderStatus},
-    payment::{FakeProvider, PaymentProvider, PaymentResult, Session, SharedProvider},
+    payment::{FakeProvider, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider},
     processor::{self, Outcome, Processor},
     queue::{ensure_topic, CheckoutEvent, CheckoutQueue, KafkaQueue},
     schema::orders,
@@ -50,7 +51,7 @@ async fn fixture(stock: i32) -> Fixture {
     )
     .unwrap();
     cache::init_sale(&mut env.redis.clone(), product.id, stock, product.sale_start_time).await.unwrap();
-    let fake = Arc::new(FakeProvider::new(env.redis.clone(), "http://pay.test".into()));
+    let fake = Arc::new(FakeProvider::new(env.redis.clone(), "http://pay.test".into(), "secret".into()));
     Fixture { env, fake, sale: product.id }
 }
 
@@ -247,6 +248,10 @@ impl PaymentProvider for ReleasingProvider {
     async fn refund(&self, id: &str) -> PaymentResult<()> {
         self.inner.refund(id).await
     }
+
+    fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> PaymentResult<ProviderEvent> {
+        self.inner.verify_webhook(headers, body)
+    }
 }
 
 #[tokio::test]
@@ -321,6 +326,10 @@ impl PaymentProvider for FlakyProvider {
 
     async fn refund(&self, id: &str) -> PaymentResult<()> {
         self.inner.refund(id).await
+    }
+
+    fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> PaymentResult<ProviderEvent> {
+        self.inner.verify_webhook(headers, body)
     }
 }
 

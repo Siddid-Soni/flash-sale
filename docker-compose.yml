@@ -59,6 +59,9 @@ services:
       READ_CACHE_URL: redis://redis:6379
       KAFKA_BROKERS: kafka:29092
       BIND_ADDR: 0.0.0.0:8080
+      # The fake provider (inside the Order Service) delivers webhooks to the
+      # service by name; PAYMENT_WEBHOOK_SECRET and FRONTEND_URL come from .env
+      PAYMENT_WEBHOOK_URL: http://order-service:8080/v1/payments/webhook
     ports:
       - 8080:8080
     depends_on: [postgres, redis, kafka]

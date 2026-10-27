@@ -21,10 +21,13 @@ pub fn insert_inbox(conn: &mut PgConnection, entry: &NewPaymentInboxEntry) -> Qu
 }
 
 /// Locks the oldest unprocessed event no other worker holds, for the rest of
-/// the caller's transaction. `None` when there is nothing to do.
-pub fn claim_next(conn: &mut PgConnection) -> QueryResult<Option<PaymentInboxEntry>> {
+/// the caller's transaction. `None` when there is nothing to do. `skip` lists
+/// events to pass over (the caller's own backoff for events that keep
+/// failing), so one that fails always does not hold up the ones behind it.
+pub fn claim_next(conn: &mut PgConnection, skip: &[i64]) -> QueryResult<Option<PaymentInboxEntry>> {
     payment_inbox::table
         .filter(payment_inbox::processed_at.is_null())
+        .filter(payment_inbox::id.ne_all(skip))
         .order(payment_inbox::id.asc())
         .for_update()
         .skip_locked()

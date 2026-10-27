@@ -14,16 +14,29 @@ use flash_sale::{
     cache::{self, ReadCache, RedisConn},
     config::Config,
     db::{self, DbPool},
+    payment::{self, FakeProvider, SharedProvider},
     queue::{CheckoutEvent, CheckoutQueue, Published, QueueError, QueueResult, SharedQueue},
 };
 
+pub mod sale;
+
 pub const ADMIN_TOKEN: &str = "test-admin-token";
+pub const WEBHOOK_SECRET: &str = "test-webhook-secret";
 
 pub struct Env {
     pub config: Config,
     pub pool: DbPool,
     pub redis: RedisConn,
     pub read_cache: ReadCache,
+    /// The fake provider on the test Redis, as the Order Service builds it
+    pub provider: Arc<FakeProvider>,
+}
+
+impl Env {
+    /// The provider as the webhook endpoint takes it
+    pub fn shared_provider(&self) -> SharedProvider {
+        self.provider.clone()
+    }
 }
 
 pub async fn env() -> Env {
@@ -32,11 +45,13 @@ pub async fn env() -> Env {
         std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/15".to_string());
     config.read_cache_url = config.redis_url.clone();
     config.admin_token = ADMIN_TOKEN.to_string();
+    config.payment_webhook_secret = WEBHOOK_SECRET.to_string();
     let pool = db::init_pool(&config);
     db::run_migrations(&pool);
     let redis = cache::connect(&config).await;
     let read_cache = cache::connect_read_cache(&config).await;
-    Env { config, pool, redis, read_cache }
+    let provider = payment::fake_from_config(&config, redis.clone());
+    Env { config, pool, redis, read_cache, provider }
 }
 
 /// A `CheckoutQueue` without Kafka: records what is published, hands out
@@ -95,6 +110,8 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new($env.redis.clone()))
                 .app_data(actix_web::web::Data::new($env.read_cache.clone()))
                 .app_data(actix_web::web::Data::new($queue))
+                .app_data(actix_web::web::Data::new($env.shared_provider()))
+                .app_data(actix_web::web::Data::from($env.provider.clone()))
                 .app_data(actix_web::web::Data::new(flash_sale::api::sales::SaleCache::default()))
                 .app_data(actix_web::web::Data::new(flash_sale::api::orders::ProgressCache::default()))
                 .app_data($flags.clone())

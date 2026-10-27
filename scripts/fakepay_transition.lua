@@ -3,8 +3,9 @@
 -- ARGV: 1 from state  2 to state
 -- Returns 'moved' (it was in `from`), 'already' (it is already in `to`),
 -- 'missing' (no such session) or the current state if it is in neither.
--- Used for expire (OPEN -> EXPIRED) and refund (PAID -> REFUNDED); Stage 5
--- adds OPEN -> PAID for the payment page.
+-- Used for expire (OPEN -> EXPIRED) and refund (PAID -> REFUNDED). The payment
+-- page's OPEN -> PAID and OPEN -> CANCELED go through fakepay_settle.lua, which
+-- queues the webhook event in the same step.
 
 local state = redis.call('HGET', KEYS[1], 'state')
 if not state then

@@ -144,11 +144,13 @@ async fn order_status(
             }
             _ => None,
         };
+        // The link and deadline stay in the entry after payment; only an unpaid order shows them
+        let awaiting = cached.status == OrderStatus::AwaitingPayment;
         return Ok(respond(StatusResponse {
             status: cached.status,
             position,
-            payment_url: cached.payment_url,
-            expires_at: cached.expires_at,
+            payment_url: cached.payment_url.filter(|_| awaiting),
+            expires_at: cached.expires_at.filter(|_| awaiting),
         }));
     }
 
@@ -161,11 +163,18 @@ async fn order_status(
             return Err(forbidden());
         }
         match OrderStatus::parse(&hold.state) {
-            Some(status @ (OrderStatus::Pending | OrderStatus::Failed | OrderStatus::Expired)) => {
+            Some(
+                status @ (OrderStatus::Pending
+                | OrderStatus::Confirmed
+                | OrderStatus::Refunded
+                | OrderStatus::Failed
+                | OrderStatus::Expired),
+            ) => {
                 return Ok(respond(StatusResponse::bare(status)));
             }
             Some(OrderStatus::AwaitingPayment) => from_hold = Some(StatusResponse::bare(OrderStatus::AwaitingPayment)),
             // `PAID`: confirmation is in progress, the order row has the state
+            // (`CONFIRMED` and `REFUNDED` are written after the commit, so they are final)
             _ => {}
         }
     }

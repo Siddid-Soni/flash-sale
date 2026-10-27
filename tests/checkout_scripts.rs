@@ -337,12 +337,22 @@ async fn set_status_only_moves_forward() {
     // The same rank refreshes
     assert!(cache::set_status(&mut cache_con, &ticket, &link).await.unwrap());
 
-    // The first final state wins, even over another final state
+    // The first final state wins over the other final states...
     assert!(cache::set_status(&mut cache_con, &ticket, &write(OrderStatus::Expired, |_| {})).await.unwrap());
-    for later in [OrderStatus::Pending, OrderStatus::AwaitingPayment, OrderStatus::Confirmed, OrderStatus::Refunded, OrderStatus::Expired] {
+    for later in [OrderStatus::Pending, OrderStatus::AwaitingPayment, OrderStatus::Confirmed, OrderStatus::Failed, OrderStatus::Expired] {
         assert!(!cache::set_status(&mut cache_con, &ticket, &write(later, |_| {})).await.unwrap(), "{later:?}");
     }
     assert_eq!(cache::read_status(&mut cache_con, &ticket).await.unwrap().unwrap().status, OrderStatus::Expired);
+    // ...except that a late payment's refund replaces EXPIRED, and then nothing replaces it
+    assert!(cache::set_status(&mut cache_con, &ticket, &write(OrderStatus::Refunded, |_| {})).await.unwrap());
+    for later in [OrderStatus::Confirmed, OrderStatus::Expired, OrderStatus::Failed, OrderStatus::Refunded] {
+        assert!(!cache::set_status(&mut cache_con, &ticket, &write(later, |_| {})).await.unwrap(), "{later:?}");
+    }
+    assert_eq!(cache::read_status(&mut cache_con, &ticket).await.unwrap().unwrap().status, OrderStatus::Refunded);
+    // A CONFIRMED entry is never replaced, not even by REFUNDED
+    let confirmed = cache::new_ticket(sale);
+    assert!(cache::set_status(&mut cache_con, &confirmed, &write(OrderStatus::Confirmed, |_| {})).await.unwrap());
+    assert!(!cache::set_status(&mut cache_con, &confirmed, &write(OrderStatus::Refunded, |_| {})).await.unwrap());
     cleanup(&mut con, sale).await;
 }
 

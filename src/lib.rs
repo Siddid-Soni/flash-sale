@@ -7,6 +7,7 @@ pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod inbox;
 pub mod models;
 pub mod payment;
 pub mod processor;

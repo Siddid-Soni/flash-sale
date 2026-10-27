@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 
 use crate::models::{NewOrder, Order, OrderStatus};
-use crate::schema::orders;
+use crate::schema::{orders, products};
 
 /// The order for a queue ticket, if the processor has created it. The last
 /// fallback of the status endpoint, after the read cache and the hold.
@@ -58,6 +58,71 @@ pub fn mark_failed(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
             .filter(orders::status.eq_any([OrderStatus::Pending, OrderStatus::AwaitingPayment])),
     )
     .set(orders::status.eq(OrderStatus::Failed))
+    .execute(conn)?;
+    Ok(updated == 1)
+}
+
+/// How the confirming transaction ended
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirm {
+    /// The order is now `CONFIRMED` and the product's `sold` went up by one
+    Confirmed,
+    /// The order was not `AWAITING_PAYMENT` (another processor confirmed or
+    /// refunded it first); nothing changed
+    NotAwaiting,
+    /// The product has no unit left (`sold = total_inventory`): the guard
+    /// refused, the transaction rolled back and nothing changed
+    SoldOut,
+}
+
+/// The confirming transaction (roadmap step 8): the order goes
+/// `AWAITING_PAYMENT` to `CONFIRMED` and the backstop
+/// `UPDATE products SET sold = sold + 1 WHERE id = $1 AND sold < total_inventory`
+/// runs, both or neither. The order row is locked first, so two processors
+/// handling the same event cannot both count it, and every transaction takes
+/// the order lock before the product's, so they cannot deadlock.
+pub fn confirm_order(conn: &mut PgConnection, ticket: &str, product_id: i32) -> QueryResult<Confirm> {
+    let result = conn.transaction(|conn| {
+        let moved = diesel::update(
+            orders::table
+                .filter(orders::queue_ticket_id.eq(ticket))
+                .filter(orders::status.eq(OrderStatus::AwaitingPayment)),
+        )
+        .set(orders::status.eq(OrderStatus::Confirmed))
+        .execute(conn)?;
+        if moved == 0 {
+            return Ok(Confirm::NotAwaiting);
+        }
+        let sold = diesel::update(
+            products::table.filter(products::id.eq(product_id)).filter(products::sold.lt(products::total_inventory)),
+        )
+        .set(products::sold.eq(products::sold + 1))
+        .execute(conn)?;
+        if sold == 0 {
+            // Rolls the order update back too
+            return Err(diesel::result::Error::RollbackTransaction);
+        }
+        Ok(Confirm::Confirmed)
+    });
+    match result {
+        Err(diesel::result::Error::RollbackTransaction) => Ok(Confirm::SoldOut),
+        other => other,
+    }
+}
+
+/// Marks an order whose payment was refunded `REFUNDED`: from any state that
+/// is not `CONFIRMED` (a late payment finds the order `AWAITING_PAYMENT`, or
+/// already `EXPIRED` or `FAILED`). Returns false if it was left alone.
+pub fn mark_refunded(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
+    let updated = diesel::update(
+        orders::table.filter(orders::queue_ticket_id.eq(ticket)).filter(orders::status.eq_any([
+            OrderStatus::Pending,
+            OrderStatus::AwaitingPayment,
+            OrderStatus::Expired,
+            OrderStatus::Failed,
+        ])),
+    )
+    .set(orders::status.eq(OrderStatus::Refunded))
     .execute(conn)?;
     Ok(updated == 1)
 }

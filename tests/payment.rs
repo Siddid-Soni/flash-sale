@@ -7,7 +7,7 @@ use flash_sale::payment::{fake_session_id, FakeProvider, PaymentProvider};
 
 async fn provider() -> FakeProvider {
     let env = common::env().await;
-    FakeProvider::new(env.redis.clone(), "http://pay.test/".into())
+    FakeProvider::new(env.redis.clone(), "http://pay.test/".into(), "secret".into())
 }
 
 fn ticket() -> String {

@@ -8,18 +8,21 @@ use crate::error::ErrorBody;
 
 pub mod admin;
 pub mod checkout;
+pub mod fake_pay;
 pub mod orders;
+pub mod payments;
 pub mod sales;
 pub mod session;
 
-/// Every route lives under `/v1` (the fake payment page, added in Stage 5, is the exception).
+/// Every route lives under `/v1`, except the fake provider's payment page.
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(
+    cfg.configure(fake_pay::configure).service(
         web::scope("/v1")
             .configure(session::configure)
             .configure(sales::configure)
             .configure(checkout::configure)
             .configure(orders::configure)
+            .configure(payments::configure)
             .configure(admin::configure),
     );
 }
