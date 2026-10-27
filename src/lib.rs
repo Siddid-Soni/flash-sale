@@ -9,5 +9,6 @@ pub mod db;
 pub mod error;
 pub mod models;
 pub mod payment;
+pub mod processor;
 pub mod queue;
 pub mod schema;

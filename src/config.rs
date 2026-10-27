@@ -34,6 +34,14 @@ pub struct Config {
     pub payment_provider: String,
     /// How long the fake provider takes to report a payment
     pub fake_payment_delay_ms: u64,
+    /// Where clients reach the API; the fake provider builds its payment page
+    /// URL (`{PUBLIC_BASE_URL}/fake-pay/{session}`) from it
+    pub public_base_url: String,
+    /// Checkout messages one order processor works on at once, per partition
+    pub processor_concurrency: usize,
+    /// Cap on checkout messages one order processor starts per second
+    /// (0 = unlimited); the Stage 9 backlog test throttles with it
+    pub processor_max_per_sec: u32,
 }
 
 impl Config {
@@ -58,6 +66,9 @@ impl Config {
             payment_window_secs: or_default("PAYMENT_WINDOW_SECS", 300),
             payment_provider: or_default("PAYMENT_PROVIDER", "fake".to_string()),
             fake_payment_delay_ms: or_default("FAKE_PAYMENT_DELAY_MS", 2000),
+            public_base_url: or_default("PUBLIC_BASE_URL", "http://localhost:8080".to_string()),
+            processor_concurrency: or_default("PROCESSOR_CONCURRENCY", 32),
+            processor_max_per_sec: or_default("PROCESSOR_MAX_PER_SEC", 0),
         }
     }
 }

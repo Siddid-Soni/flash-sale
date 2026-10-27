@@ -11,7 +11,7 @@ use std::sync::Arc;
 use actix_web::{middleware, web, App, HttpServer};
 
 use flash_sale::{
-    api::{self, checkout::SoldOutFlags, sales::SaleCache},
+    api::{self, checkout::SoldOutFlags, orders::ProgressCache, sales::SaleCache},
     cache,
     config::Config,
     db, queue,
@@ -45,6 +45,7 @@ async fn main() -> std::io::Result<()> {
     let next_connection = Arc::new(AtomicUsize::new(0));
 
     let sale_cache = web::Data::new(SaleCache::default());
+    let progress_cache = web::Data::new(ProgressCache::default());
 
     // One flag set and one refresher task per replica, shared by all workers
     let sold_out = web::Data::new(SoldOutFlags::default());
@@ -62,6 +63,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(read_cache[i].clone()))
             .app_data(checkout_queue.clone())
             .app_data(sale_cache.clone())
+            .app_data(progress_cache.clone())
             .app_data(sold_out.clone())
             .app_data(config.clone())
             .app_data(api::json_config())

@@ -96,6 +96,7 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new($env.read_cache.clone()))
                 .app_data(actix_web::web::Data::new($queue))
                 .app_data(actix_web::web::Data::new(flash_sale::api::sales::SaleCache::default()))
+                .app_data(actix_web::web::Data::new(flash_sale::api::orders::ProgressCache::default()))
                 .app_data($flags.clone())
                 .app_data(actix_web::web::Data::new($env.config.clone()))
                 .app_data(flash_sale::api::json_config())

@@ -3,8 +3,9 @@
 //! There are two roles. The inventory Redis (`REDIS_URL`) holds stock, holds,
 //! queues and processor progress; every inventory Lua script runs there and
 //! touches only inventory keys. The read cache (`READ_CACHE_URL`, the same
-//! instance locally) holds only `status:<ticket>`, what clients poll, so
-//! polling can never slow down checkout.
+//! instance locally) holds only `status:<ticket>`, what clients poll, and
+//! `progress:<topic>:<partition>`, what turns an offset into a queue position,
+//! so polling can never slow down checkout.
 //!
 //! Keys for one sale carry the literal hash tag `{sale}`, e.g. `stock:{42}`,
 //! so a script's keys stay in one slot if Redis is clustered.
@@ -86,6 +87,15 @@ pub fn holds_expiry_key(sale: i32) -> String {
 /// Order processor progress for one partition: checkout time (ms)
 pub fn processed_upto_key(sale: i32, partition: i32) -> String {
     format!("processed_upto:{{{sale}}}:{partition}")
+}
+
+/// Processor progress for one partition in the *read cache*: the highest
+/// offset below which every message has been processed (a plain string, no
+/// hash tag). With `status:<ticket>` it is the only other key the read cache
+/// holds: the status endpoint turns a ticket's offset and this into a queue
+/// position, so polling never reads the inventory Redis.
+pub fn progress_key(topic: &str, partition: i32) -> String {
+    format!("progress:{topic}:{partition}")
 }
 
 /// Read-cache hash with `status`, `user`, `payment_url`, `expires_at` (RFC 3339,
@@ -329,6 +339,90 @@ pub async fn read_hold(con: &mut RedisConn, sale: i32, ticket: &str) -> redis::R
     }))
 }
 
+static LINK_READY_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(include_str!("../scripts/link_ready.lua")));
+
+/// What `link_ready.lua` decided
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The hold moved from `PENDING` to `AWAITING_PAYMENT`
+    Ready,
+    /// It already was, with this session (a redelivered message): success
+    Already,
+    /// Released, expired or linked to another session
+    Gone,
+}
+
+/// Runs `link_ready.lua`: moves the hold from `holds:pending` to
+/// `holds:expiry` with score `expires_at_ms`, only if it is still `PENDING`.
+pub async fn link_ready(
+    con: &mut RedisConn,
+    sale: i32,
+    ticket: &str,
+    payment_session: &str,
+    expires_at_ms: i64,
+) -> redis::RedisResult<LinkOutcome> {
+    let reply: String = LINK_READY_SCRIPT
+        .key(hold_key(sale, ticket))
+        .key(holds_pending_key(sale))
+        .key(holds_expiry_key(sale))
+        .arg(ticket)
+        .arg(payment_session)
+        .arg(expires_at_ms)
+        .invoke_async(con)
+        .await?;
+    match reply.as_str() {
+        "ready" => Ok(LinkOutcome::Ready),
+        "already" => Ok(LinkOutcome::Already),
+        "gone" => Ok(LinkOutcome::Gone),
+        _ => Err(unexpected_reply("unexpected link_ready.lua reply")),
+    }
+}
+
+static SET_MAX_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(include_str!("../scripts/set_max.lua")));
+
+/// Raises the integer at `key` to `value` and never lowers it (`set_max.lua`).
+/// Returns whether it changed. For `processed_upto` and `progress` keys, which
+/// several replicas write and which must only move forward.
+pub async fn raise_to(con: &mut RedisConn, key: &str, value: i64) -> redis::RedisResult<bool> {
+    let changed: i64 = SET_MAX_SCRIPT.key(key).arg(value).invoke_async(con).await?;
+    Ok(changed == 1)
+}
+
+/// Reads `processed_upto:{sale}:{partition}`: checkout time (ms) up to which
+/// the partition's processor has finished; `None` if never written
+pub async fn read_processed_upto(con: &mut RedisConn, sale: i32, partition: i32) -> redis::RedisResult<Option<i64>> {
+    redis::cmd("GET").arg(processed_upto_key(sale, partition)).query_async(con).await
+}
+
+/// Reports that the contiguous prefix of `partition` is processed up to and
+/// including `offset`. The one place both progress keys are written, so they
+/// cannot drift apart: `processed_upto:{sale}:{partition}` (inventory; for each
+/// `(sale, checkout_ms)` in `upto`, the checkout time of the last message of
+/// that sale in the prefix) and `progress:<topic>:<partition>` (read cache; the
+/// offset, for queue positions). Both only ever rise.
+pub async fn record_progress(
+    inventory: &mut RedisConn,
+    read_cache: &mut ReadCache,
+    topic: &str,
+    partition: i32,
+    offset: i64,
+    upto: &[(i32, i64)],
+) -> redis::RedisResult<()> {
+    for &(sale, checkout_ms) in upto {
+        raise_to(inventory, &processed_upto_key(sale, partition), checkout_ms).await?;
+    }
+    raise_to(&mut read_cache.0, &progress_key(topic, partition), offset).await?;
+    Ok(())
+}
+
+/// The highest offset of `partition` up to which everything is processed;
+/// `None` if no processor has recorded progress yet
+pub async fn read_progress(cache: &mut ReadCache, topic: &str, partition: i32) -> redis::RedisResult<Option<i64>> {
+    redis::cmd("GET").arg(progress_key(topic, partition)).query_async(&mut cache.0).await
+}
+
 static SET_STATUS_SCRIPT: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(include_str!("../scripts/set_status.lua")));
 
@@ -430,6 +524,7 @@ mod tests {
         assert_eq!(holds_expiry_key(42), "holds:expiry:{42}");
         assert_eq!(processed_upto_key(42, 3), "processed_upto:{42}:3");
         assert_eq!(status_key("42.abc"), "status:42.abc");
+        assert_eq!(progress_key("orders.checkout", 3), "progress:orders.checkout:3");
     }
 
     #[test]

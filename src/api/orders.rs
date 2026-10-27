@@ -5,6 +5,10 @@
 //! hold in the inventory Redis, then to the order in PostgreSQL, so a lost
 //! cache write never shows a winner the wrong thing.
 
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::{Duration, Instant};
+
 use actix_web::{get, http::header, web, HttpResponse};
 use chrono::SecondsFormat;
 use serde::Serialize;
@@ -13,10 +17,49 @@ use crate::{
     actions,
     auth::AuthUser,
     cache::{self, ReadCache, RedisConn},
+    config::Config,
     db::DbPool,
     error::ApiError,
     models::{Order, OrderStatus},
 };
+
+/// How long a replica reuses a partition's processor progress before reading
+/// it again, so polling clients do not each cause a Redis read
+const PROGRESS_TTL: Duration = Duration::from_millis(500);
+
+/// Per-replica cache of `progress:<topic>:<partition>` (see
+/// `cache::progress_key`), refreshed at most every 500 ms.
+#[derive(Default)]
+pub struct ProgressCache {
+    /// partition -> (when it was read, the value)
+    entries: RwLock<HashMap<i32, (Instant, Option<i64>)>>,
+}
+
+impl ProgressCache {
+    /// The highest processed offset of a partition (`None` if none recorded).
+    /// A failed read counts as unknown: the position is then an upper bound.
+    async fn get(&self, read_cache: &mut ReadCache, topic: &str, partition: i32) -> Option<i64> {
+        let fresh = self
+            .entries
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&partition)
+            .filter(|(read_at, _)| read_at.elapsed() < PROGRESS_TTL)
+            .map(|(_, value)| *value);
+        if let Some(value) = fresh {
+            return value;
+        }
+        let value = match cache::read_progress(read_cache, topic, partition).await {
+            Ok(value) => value,
+            Err(e) => {
+                log::warn!("progress of partition {partition} unreadable: {e}");
+                None
+            }
+        };
+        self.entries.write().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(partition, (Instant::now(), value));
+        value
+    }
+}
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct StatusResponse {
@@ -36,15 +79,25 @@ impl StatusResponse {
     }
 }
 
-/// The queue position shown for a `PENDING` ticket.
+/// The queue position of a `PENDING` ticket: how many messages of its
+/// partition the processors still have to finish up to and including this
+/// one, `offset - processed_offset`, where `processed_offset` is the highest
+/// offset with everything before it done. 1 means it is next.
 ///
-/// For now only the message's offset in its partition is known, so the
-/// position is that offset plus one: how many messages precede it in the
-/// partition, not how many are still unprocessed. Stage 4 replaces this with
-/// the position relative to what the processors have finished (their
-/// progress per partition), which is why it takes the partition too.
-fn queue_position(_partition: Option<i32>, offset: Option<i64>) -> Option<i64> {
-    offset.map(|offset| offset + 1)
+/// `0` means "processing": a stale cached progress value (read up to 500 ms
+/// ago, or written by a processor after the ticket's status was) can put the
+/// progress at or past the ticket's offset, so the difference is clamped at 0
+/// instead of going negative. With no progress recorded yet the position is
+/// `offset + 1`, the number of messages ahead of it plus itself.
+///
+/// The count includes other sales' messages on the same topic: the topic is
+/// shared by all sales, so this is an upper bound on the place in line for
+/// this sale. That is accepted; it is a progress indicator, not a promise.
+fn queue_position(offset: i64, processed_offset: Option<i64>) -> i64 {
+    match processed_offset {
+        Some(processed) => (offset - processed).max(0),
+        None => offset + 1,
+    }
 }
 
 fn order_response(order: Order) -> StatusResponse {
@@ -59,6 +112,9 @@ fn order_response(order: Order) -> StatusResponse {
 
 /// The status of the caller's ticket: `200 {status, position?, payment_url?,
 /// expires_at?}`, `403` for someone else's ticket, `404` if nobody knows it.
+/// `position` (only while `PENDING`, and only if the entry knows its
+/// partition and offset) is the place in the queue, 1 being next, and `0`
+/// while the ticket is being processed (see `queue_position`).
 /// Never cached: the answer changes every few seconds.
 #[get("/orders/status/{ticket}")]
 async fn order_status(
@@ -67,6 +123,8 @@ async fn order_status(
     pool: web::Data<DbPool>,
     redis: web::Data<RedisConn>,
     read_cache: web::Data<ReadCache>,
+    progress: web::Data<ProgressCache>,
+    config: web::Data<Config>,
 ) -> Result<HttpResponse, ApiError> {
     let ticket = path.into_inner();
     let not_found = || ApiError::NotFound("no such ticket".into());
@@ -79,10 +137,16 @@ async fn order_status(
         if cached.user != user.id {
             return Err(forbidden());
         }
-        let pending = cached.status == OrderStatus::Pending;
+        let position = match (cached.status, cached.partition, cached.offset) {
+            (OrderStatus::Pending, Some(partition), Some(offset)) => {
+                let processed = progress.get(&mut cache_con, &config.checkout_topic, partition).await;
+                Some(queue_position(offset, processed))
+            }
+            _ => None,
+        };
         return Ok(respond(StatusResponse {
             status: cached.status,
-            position: cached.offset.filter(|_| pending).and_then(|o| queue_position(cached.partition, Some(o))),
+            position,
             payment_url: cached.payment_url,
             expires_at: cached.expires_at,
         }));
@@ -127,4 +191,22 @@ fn respond(body: StatusResponse) -> HttpResponse {
 // GET /v1/orders/status/{ticket}
 pub fn configure(cfg: &mut web::ServiceConfig) {
     cfg.service(order_status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_counts_down_and_clamps_at_zero() {
+        // Nothing processed yet: offset 0 is first in line
+        assert_eq!(queue_position(0, None), 1);
+        assert_eq!(queue_position(41, None), 42);
+        // Everything up to offset 9 is done: offset 10 is next
+        assert_eq!(queue_position(10, Some(9)), 1);
+        assert_eq!(queue_position(15, Some(9)), 6);
+        // The progress reached (or, stale, passed) the ticket: being processed
+        assert_eq!(queue_position(10, Some(10)), 0);
+        assert_eq!(queue_position(10, Some(25)), 0);
+    }
 }

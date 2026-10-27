@@ -341,3 +341,48 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
     assert_eq!(body, json!({ "status": "AWAITING_PAYMENT" }));
     cleanup(&env, sale).await;
 }
+
+#[actix_web::test]
+async fn the_position_follows_processor_progress() {
+    let mut env = common::env().await;
+    // A topic of its own, so the progress key is not shared with other tests
+    env.config.checkout_topic = format!("test.position.{}", uuid::Uuid::new_v4().simple());
+    let topic = env.config.checkout_topic.clone();
+    let (_fake, queue) = common::fake_queue();
+    let app = test_app!(env, queue);
+    let sale = sale(&env, 5, 60).await;
+    let owner = guest(&env);
+
+    // The fake queue stores partition 3, offsets 0, 1, ...; make this offset 7
+    let ticket = {
+        let body: Value = test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
+        body["queue_ticket_id"].as_str().unwrap().to_string()
+    };
+    let mut status = cache::StatusUpdate::new(OrderStatus::Pending, owner.id);
+    status.partition = Some(3);
+    status.offset = Some(7);
+    let mut read_cache = env.read_cache.clone();
+    cache::set_status(&mut read_cache, &ticket, &status).await.unwrap();
+
+    macro_rules! position {
+        () => {{
+            let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            test::read_body_json::<Value, _>(resp).await["position"].clone()
+        }};
+    }
+
+    // No progress recorded: offset + 1
+    assert_eq!(position!(), json!(8));
+    cache::raise_to(&mut read_cache.0, &cache::progress_key(&topic, 3), 4).await.unwrap();
+    // Cached for ~500 ms per replica: still the old answer
+    assert_eq!(position!(), json!(8));
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(position!(), json!(3));
+    // Progress past the ticket (stale reads): clamped to 0, not negative
+    cache::raise_to(&mut read_cache.0, &cache::progress_key(&topic, 3), 9).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(position!(), json!(0));
+    let _: () = read_cache.0.del(cache::progress_key(&topic, 3)).await.unwrap();
+    cleanup(&env, sale).await;
+}
