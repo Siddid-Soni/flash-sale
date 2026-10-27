@@ -50,6 +50,16 @@ pub struct Config {
     /// Cap on checkout messages one order processor starts per second
     /// (0 = unlimited); the Stage 9 backlog test throttles with it
     pub processor_max_per_sec: u32,
+    /// Holds the expiration worker releases per sale and pass; a full batch is
+    /// followed at once by another
+    pub expiry_batch: usize,
+    /// How long the expiration worker sleeps when a pass found nothing more to do
+    pub expiry_interval_ms: u64,
+    /// How often the expiration worker checks for leaked holds (it reads the
+    /// consumer group's offsets from Kafka each time)
+    pub expiry_leaked_every_ms: u64,
+    /// How often the expiration worker sweeps for orders left behind by a crash
+    pub expiry_sweep_secs: u64,
 }
 
 impl Config {
@@ -84,6 +94,10 @@ impl Config {
             public_base_url,
             processor_concurrency: or_default("PROCESSOR_CONCURRENCY", 32),
             processor_max_per_sec: or_default("PROCESSOR_MAX_PER_SEC", 0),
+            expiry_batch: or_default("EXPIRY_BATCH", 200),
+            expiry_interval_ms: or_default("EXPIRY_INTERVAL_MS", 250),
+            expiry_leaked_every_ms: or_default("EXPIRY_LEAKED_EVERY_MS", 1000),
+            expiry_sweep_secs: or_default("EXPIRY_SWEEP_SECS", 60),
         }
     }
 }

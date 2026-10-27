@@ -63,7 +63,6 @@ fn base_config(config: &Config) -> ClientConfig {
 pub struct KafkaQueue {
     producer: FutureProducer,
     topic: String,
-    delivery_timeout: Duration,
 }
 
 impl KafkaQueue {
@@ -88,7 +87,6 @@ impl KafkaQueue {
         Ok(Self {
             producer,
             topic: config.checkout_topic.clone(),
-            delivery_timeout: Duration::from_millis(config.kafka_delivery_timeout_ms as u64),
         })
     }
 }
@@ -98,9 +96,11 @@ impl CheckoutQueue for KafkaQueue {
     async fn publish(&self, event: &CheckoutEvent) -> QueueResult<Published> {
         let payload = serde_json::to_vec(event).map_err(|e| QueueError(format!("encode event: {e}")))?;
         let record = FutureRecord::to(&self.topic).key(event.ticket.as_str()).payload(&payload);
-        // The timeout bounds waiting for room in the producer's queue; the
-        // delivery itself is bounded by `delivery.timeout.ms`
-        match self.producer.send(record, Timeout::After(self.delivery_timeout)).await {
+        // No waiting for room in the producer's queue: a full queue fails at
+        // once (the caller compensates and answers 503). Waiting here would
+        // add to `delivery.timeout.ms`, which counts from the enqueue, and the
+        // expiration worker's leaked-hold margin is that timeout alone
+        match self.producer.send(record, Timeout::After(Duration::ZERO)).await {
             Ok(delivery) => Ok(Published { partition: delivery.partition, offset: delivery.offset }),
             Err((e, _message)) => Err(QueueError(format!("publish to {}: {e}", self.topic))),
         }

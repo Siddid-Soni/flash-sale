@@ -126,3 +126,55 @@ pub fn mark_refunded(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool>
     .execute(conn)?;
     Ok(updated == 1)
 }
+
+/// Marks an order whose hold the unpaid-hold loop released `EXPIRED`, only
+/// from `AWAITING_PAYMENT`: a `REFUNDED` the payment inbox wrote for a payment
+/// that slipped in after the release must never be overwritten. Returns
+/// whether the order was changed.
+pub fn mark_expired(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
+    let updated = diesel::update(
+        orders::table
+            .filter(orders::queue_ticket_id.eq(ticket))
+            .filter(orders::status.eq(OrderStatus::AwaitingPayment)),
+    )
+    .set(orders::status.eq(OrderStatus::Expired))
+    .execute(conn)?;
+    Ok(updated == 1)
+}
+
+/// `AWAITING_PAYMENT` orders whose deadline passed before `expired_before`, in
+/// id order after `after_id`: the stale-order sweep checks each against its
+/// hold. A page at a time, so rows that stay (their hold is still live) cannot
+/// hide the ones behind them.
+pub fn stale_awaiting_payment(
+    conn: &mut PgConnection,
+    expired_before: DateTime<Utc>,
+    after_id: i64,
+    limit: i64,
+) -> QueryResult<Vec<Order>> {
+    orders::table
+        .filter(orders::status.eq(OrderStatus::AwaitingPayment))
+        .filter(orders::expires_at.lt(expired_before))
+        .filter(orders::id.gt(after_id))
+        .order(orders::id.asc())
+        .limit(limit)
+        .select(Order::as_select())
+        .load(conn)
+}
+
+/// `PENDING` orders created before `created_before`, in id order after `after_id`
+pub fn stale_pending(
+    conn: &mut PgConnection,
+    created_before: DateTime<Utc>,
+    after_id: i64,
+    limit: i64,
+) -> QueryResult<Vec<Order>> {
+    orders::table
+        .filter(orders::status.eq(OrderStatus::Pending))
+        .filter(orders::created_at.lt(created_before))
+        .filter(orders::id.gt(after_id))
+        .order(orders::id.asc())
+        .limit(limit)
+        .select(Order::as_select())
+        .load(conn)
+}
