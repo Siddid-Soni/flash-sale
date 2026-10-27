@@ -122,7 +122,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 
 | `status` | Extra fields | Meaning |
 |---|---|---|
-| `PENDING` | `position` | In the queue. `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition (a fallback answer) |
+| `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache or the hold). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition (a fallback answer) |
 | `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds). If the cache entry is gone and the order row does not exist yet, the answer from the hold alone has neither |
 | `CONFIRMED` | | Paid in time (PostgreSQL decided) and counted. Final. Answered from PostgreSQL while the hold is still waiting for the expiration worker |
 | `EXPIRED` | | The payment window ran out and the unit was returned. Final |
@@ -230,7 +230,7 @@ Not reachable through the gateway: the order processor and the expiration worker
 
 ## Order and hold states
 
-An order has one of six statuses (`orders.status`, `status:<ticket>`, API). The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker settles the hold.
+A ticket has one of six statuses (`status:<ticket>`, API). `PENDING` is the sixth: it exists only in the hold and the read cache, while the checkout event waits in Kafka. The order row is created later, directly as `AWAITING_PAYMENT`, so `orders.status` has the other five. The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker settles the hold.
 
 ```
 checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_at)--> CONFIRMED
@@ -242,7 +242,7 @@ checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_a
 
 | Status | Hold state | Waiting for | Leaves by |
 |---|---|---|---|
-| `PENDING` | `PENDING` | An order processor (no clock runs) | Link ready; or release: publish failed (at once), or leaked (expiration worker) |
+| `PENDING` (never in PostgreSQL) | `PENDING` | An order processor (no clock runs; no order row yet) | Link ready (the order is inserted as `AWAITING_PAYMENT` first); or release: publish failed (at once), or leaked (expiration worker) |
 | `AWAITING_PAYMENT` | `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment: the order becomes `CONFIRMED` in PostgreSQL (the hold stays `AWAITING_PAYMENT` and in `holds:expiry`); or, at `expires_at`, the expiration worker expires the order and releases the hold |
 | `CONFIRMED` | `AWAITING_PAYMENT`, then `CONFIRMED` | The expiration worker, at the deadline | The worker closes the hold and counts it in `sold:{sale}` (no stock returned). Final |
 | `EXPIRED` | `EXPIRED` | | Final (a late payment still turns it into `REFUNDED`) |

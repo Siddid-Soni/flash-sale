@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 
-use crate::models::{NewOrder, Order, OrderStatus};
+use crate::models::{NewOrder, Order, OrderState};
 use crate::schema::{orders, products};
 
 /// The order for a queue ticket, if the processor has created it. The last
@@ -14,50 +14,26 @@ pub fn find_by_ticket(conn: &mut PgConnection, ticket: &str) -> QueryResult<Opti
         .optional()
 }
 
-/// Inserts the order for a checkout event, then returns the row stored for its
-/// ticket. The insert is `ON CONFLICT DO NOTHING` (no target), so a redelivered
+/// Inserts the order for a checkout event (born `AWAITING_PAYMENT`, with its
+/// session, link and deadline), then returns the row stored for its ticket.
+/// The insert is `ON CONFLICT DO NOTHING` (no target), so a redelivered
 /// message finds its order, and any other unique constraint that fires (the
 /// user already has a live order) inserts nothing: then there is no row for the
 /// ticket and the result is `None`.
-pub fn insert_pending(conn: &mut PgConnection, new_order: &NewOrder) -> QueryResult<Option<Order>> {
+pub fn insert_awaiting_payment(conn: &mut PgConnection, new_order: &NewOrder) -> QueryResult<Option<Order>> {
     diesel::insert_into(orders::table).values(new_order).on_conflict_do_nothing().execute(conn)?;
     find_by_ticket(conn, new_order.queue_ticket_id).map(|order| order.filter(|o| o.user_id == new_order.user_id))
 }
 
-/// Records the payment session on the order and moves it to `AWAITING_PAYMENT`.
-/// Only from `PENDING` or `AWAITING_PAYMENT` (a redelivery repeats this step);
-/// returns false if the order is in any other state and was left alone.
-pub fn mark_awaiting_payment(
-    conn: &mut PgConnection,
-    ticket: &str,
-    session_id: &str,
-    checkout_url: &str,
-    expires_at: DateTime<Utc>,
-) -> QueryResult<bool> {
-    let updated = diesel::update(
-        orders::table
-            .filter(orders::queue_ticket_id.eq(ticket))
-            .filter(orders::status.eq_any([OrderStatus::Pending, OrderStatus::AwaitingPayment])),
-    )
-    .set((
-        orders::status.eq(OrderStatus::AwaitingPayment),
-        orders::payment_session_id.eq(session_id),
-        orders::checkout_url.eq(checkout_url),
-        orders::expires_at.eq(expires_at),
-    ))
-    .execute(conn)?;
-    Ok(updated == 1)
-}
-
-/// Marks an order that never got its payment link `FAILED` (only from
-/// `PENDING` or `AWAITING_PAYMENT`, so a final state is never overwritten).
+/// Marks an order whose hold was released before its link was ready `FAILED`
+/// (only from `AWAITING_PAYMENT`, so a final state is never overwritten).
 pub fn mark_failed(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
     let updated = diesel::update(
         orders::table
             .filter(orders::queue_ticket_id.eq(ticket))
-            .filter(orders::status.eq_any([OrderStatus::Pending, OrderStatus::AwaitingPayment])),
+            .filter(orders::status.eq(OrderState::AwaitingPayment)),
     )
-    .set(orders::status.eq(OrderStatus::Failed))
+    .set(orders::status.eq(OrderState::Failed))
     .execute(conn)?;
     Ok(updated == 1)
 }
@@ -80,8 +56,8 @@ pub enum Settlement {
     /// The order was already `REFUNDED` by an earlier run: only the provider
     /// refund and the status write may be missing
     AlreadyRefunded,
-    /// The order is in a state a payment cannot belong to (`PENDING`)
-    Unexpected(OrderStatus),
+    /// The order is in a state that should be impossible for this payment
+    Unexpected(OrderState),
     /// There is no order for the ticket
     Missing,
 }
@@ -111,11 +87,11 @@ pub fn settle_payment(conn: &mut PgConnection, ticket: &str, session_id: &str, p
             let moved = diesel::update(
                 orders::table
                     .filter(orders::queue_ticket_id.eq(ticket))
-                    .filter(orders::status.eq(OrderStatus::AwaitingPayment))
+                    .filter(orders::status.eq(OrderState::AwaitingPayment))
                     .filter(orders::payment_session_id.eq(session_id))
                     .filter(orders::expires_at.gt(diesel::dsl::now)),
             )
-            .set(orders::status.eq(OrderStatus::Confirmed))
+            .set(orders::status.eq(OrderState::Confirmed))
             .execute(conn)?;
             if moved == 0 {
                 return Ok(None);
@@ -142,21 +118,21 @@ pub fn settle_payment(conn: &mut PgConnection, ticket: &str, session_id: &str, p
             orders::table
                 .filter(orders::queue_ticket_id.eq(ticket))
                 .filter(orders::payment_session_id.eq(session_id))
-                .filter(orders::status.eq_any([OrderStatus::AwaitingPayment, OrderStatus::Expired, OrderStatus::Failed])),
+                .filter(orders::status.eq_any([OrderState::AwaitingPayment, OrderState::Expired, OrderState::Failed])),
         )
-        .set(orders::status.eq(OrderStatus::Refunded))
+        .set(orders::status.eq(OrderState::Refunded))
         .execute(conn)?;
         if refunded == 1 {
             return Ok(if sold_out { Settlement::SoldOut } else { Settlement::Refund });
         }
-        let status: Option<OrderStatus> = orders::table
+        let status: Option<OrderState> = orders::table
             .filter(orders::queue_ticket_id.eq(ticket))
             .select(orders::status)
             .first(conn)
             .optional()?;
         Ok(match status {
-            Some(OrderStatus::Confirmed) => Settlement::AlreadyConfirmed,
-            Some(OrderStatus::Refunded) => Settlement::AlreadyRefunded,
+            Some(OrderState::Confirmed) => Settlement::AlreadyConfirmed,
+            Some(OrderState::Refunded) => Settlement::AlreadyRefunded,
             Some(other) => Settlement::Unexpected(other),
             None => Settlement::Missing,
         })
@@ -175,10 +151,10 @@ pub fn expire_due(conn: &mut PgConnection, tickets: &[String]) -> QueryResult<Ve
     diesel::update(
         orders::table
             .filter(orders::queue_ticket_id.eq_any(tickets))
-            .filter(orders::status.eq(OrderStatus::AwaitingPayment))
+            .filter(orders::status.eq(OrderState::AwaitingPayment))
             .filter(orders::expires_at.le(diesel::dsl::now)),
     )
-    .set(orders::status.eq(OrderStatus::Expired))
+    .set(orders::status.eq(OrderState::Expired))
     .returning(orders::queue_ticket_id)
     .get_results(conn)
 }
@@ -211,12 +187,12 @@ pub fn has_free_unit(conn: &mut PgConnection, product_id: i32) -> QueryResult<bo
 pub fn mark_refunded(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
     let updated = diesel::update(
         orders::table.filter(orders::queue_ticket_id.eq(ticket)).filter(orders::status.eq_any([
-            OrderStatus::AwaitingPayment,
-            OrderStatus::Expired,
-            OrderStatus::Failed,
+            OrderState::AwaitingPayment,
+            OrderState::Expired,
+            OrderState::Failed,
         ])),
     )
-    .set(orders::status.eq(OrderStatus::Refunded))
+    .set(orders::status.eq(OrderState::Refunded))
     .execute(conn)?;
     Ok(updated == 1)
 }
@@ -229,9 +205,9 @@ pub fn mark_expired(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> 
     let updated = diesel::update(
         orders::table
             .filter(orders::queue_ticket_id.eq(ticket))
-            .filter(orders::status.eq(OrderStatus::AwaitingPayment)),
+            .filter(orders::status.eq(OrderState::AwaitingPayment)),
     )
-    .set(orders::status.eq(OrderStatus::Expired))
+    .set(orders::status.eq(OrderState::Expired))
     .execute(conn)?;
     Ok(updated == 1)
 }
@@ -247,25 +223,8 @@ pub fn stale_awaiting_payment(
     limit: i64,
 ) -> QueryResult<Vec<Order>> {
     orders::table
-        .filter(orders::status.eq(OrderStatus::AwaitingPayment))
+        .filter(orders::status.eq(OrderState::AwaitingPayment))
         .filter(orders::expires_at.lt(expired_before))
-        .filter(orders::id.gt(after_id))
-        .order(orders::id.asc())
-        .limit(limit)
-        .select(Order::as_select())
-        .load(conn)
-}
-
-/// `PENDING` orders created before `created_before`, in id order after `after_id`
-pub fn stale_pending(
-    conn: &mut PgConnection,
-    created_before: DateTime<Utc>,
-    after_id: i64,
-    limit: i64,
-) -> QueryResult<Vec<Order>> {
-    orders::table
-        .filter(orders::status.eq(OrderStatus::Pending))
-        .filter(orders::created_at.lt(created_before))
         .filter(orders::id.gt(after_id))
         .order(orders::id.asc())
         .limit(limit)
@@ -285,7 +244,7 @@ pub fn recently_expired(
     limit: i64,
 ) -> QueryResult<Vec<Order>> {
     orders::table
-        .filter(orders::status.eq(OrderStatus::Expired))
+        .filter(orders::status.eq(OrderState::Expired))
         .filter(orders::updated_at.ge(since))
         .filter(orders::updated_at.lt(before))
         .filter(orders::id.gt(after_id))

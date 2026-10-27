@@ -20,7 +20,7 @@ use flash_sale::{
     api,
     cache,
     expiry::{Expirer, ExpiryError, LagSource, PartitionLag, Settings},
-    models::OrderStatus,
+    models::{OrderState, OrderStatus},
     payment::{
         dispatcher::{Dispatcher, DispatcherSettings},
         SharedProvider,
@@ -81,7 +81,7 @@ async fn paying_at_the_page_ends_with_a_confirmed_order_and_a_counted_sale() {
     assert_eq!(dispatcher.sweep().await.unwrap(), 1);
     assert_eq!(fx.fake().outbox_len().await.unwrap(), 0, "the endpoint answered 200");
     let ticket = &a.event.ticket;
-    assert_eq!(fx.order(ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.order(ticket).unwrap().status, OrderState::Confirmed);
     assert_eq!(fx.status(ticket).await.unwrap().status, OrderStatus::Confirmed);
     assert_eq!(fx.product().sold, 1);
     let unprocessed: i64 = flash_sale::schema::payment_inbox::table

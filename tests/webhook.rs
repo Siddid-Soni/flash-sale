@@ -17,7 +17,7 @@ use diesel::prelude::*;
 use common::sale::{clear_inbox, SaleFixture};
 use flash_sale::{
     inbox::InboxWorker,
-    models::OrderStatus,
+    models::{OrderState, OrderStatus},
     payment::{
         webhook::{self, SIGNATURE_HEADER},
         PaymentError, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider,
@@ -45,7 +45,7 @@ fn stored(fx: &SaleFixture, event_id: &str) -> i64 {
 }
 
 async fn assert_not_decided(fx: &SaleFixture, ticket: &str) {
-    assert_eq!(fx.order(ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(ticket).await, "AWAITING_PAYMENT");
 }
 
@@ -64,7 +64,7 @@ async fn a_signed_success_is_stored_and_confirms_the_order_at_once() {
     assert_eq!(row.payload["data"]["object"]["ticket"], a.event.ticket.as_str());
     // Decided by PostgreSQL, not by a claim in Redis
     let order = fx.order(&a.event.ticket).unwrap();
-    assert_eq!(order.status, OrderStatus::Confirmed);
+    assert_eq!(order.status, OrderState::Confirmed);
     assert_eq!(fx.product().sold, 1);
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Confirmed);
     // The payment path writes no inventory key: the worker settles the hold
@@ -85,7 +85,7 @@ async fn a_duplicate_event_is_answered_200_and_stored_once() {
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
     assert_eq!(post!(app, &wire.body, Some(wire.signature())), StatusCode::OK);
     assert_eq!(stored(&fx, &wire.event.id), 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Confirmed);
     assert_eq!(fx.product().sold, 1, "counted once");
     fx.cleanup().await;
 }
@@ -137,7 +137,7 @@ async fn a_late_payment_is_refunded_on_receipt() {
 
     assert_eq!(stored(&fx, &wire.event.id), 1);
     assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "REFUNDED");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
     assert_eq!(fx.product().sold, 0);
@@ -219,7 +219,7 @@ async fn a_handling_error_after_the_insert_still_answers_200_and_the_loop_retrie
     assert!(row.processed_at.is_none());
     assert!(row.last_error.unwrap().contains("provider is down"));
     // The decision was made and recorded before the refund was tried
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment, "not told before the refund");
 
     // The provider's redelivery meanwhile is answered 200 too; then the loop gets there

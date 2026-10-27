@@ -22,7 +22,8 @@
 //! - `leaked_pass` (step 23): `PENDING` holds that no message can still reach,
 //!   because the processors' progress is past them by more than the producer's
 //!   delivery timeout (see `release_cutoff`). Release, then the order
-//!   `FAILED` (if the processor made one), the read cache and the session.
+//!   `FAILED` (if the processor made one: then it is `AWAITING_PAYMENT`, the
+//!   processor having died before linking the hold), the read cache and the session.
 //! - `sweep` (the baseline's `expire_stale`): orders a worker left behind when
 //!   it crashed between a release and the order update, and `EXPIRED` orders
 //!   whose status or session step never happened.
@@ -60,7 +61,7 @@ use crate::{
     cache::{self, HoldState, MaxScore, ReadCache, RedisConn, ReleaseOutcome, ReleasedAs, SettleAs, StatusUpdate},
     config::Config,
     db::DbPool,
-    models::{Order, OrderStatus},
+    models::{Order, OrderState, OrderStatus},
     payment::{PaymentError, SharedProvider},
     processor::GROUP_ID,
 };
@@ -359,14 +360,15 @@ impl Expirer {
         }
         // Only for an order this worker (or an earlier attempt) expired: a
         // REFUNDED order's session is paid, and there is nothing to stop
-        if let Some(Order { status: OrderStatus::Expired, payment_session_id: Some(session), .. }) = order {
+        if let Some(Order { status: OrderState::Expired, payment_session_id: Some(session), .. }) = order {
             self.provider.expire_session(&session).await?;
         }
         Ok(changed)
     }
 
     /// A leaked hold was released: the order `FAILED` if the processor made
-    /// one (from `PENDING` or `AWAITING_PAYMENT`), the status, the session.
+    /// one (it can only be `AWAITING_PAYMENT`: the processor crashed between
+    /// inserting it and linking the hold), the status, the session.
     /// Safe to repeat. Returns whether this call changed the order.
     pub async fn finish_failed(&self, sale: i32, ticket: &str) -> Result<bool, ExpiryError> {
         let lookup = ticket.to_string();
@@ -379,7 +381,7 @@ impl Expirer {
         if let Some(user) = self.user_of(sale, ticket, order.as_ref()).await? {
             self.write_status(sale, ticket, user, OrderStatus::Failed).await?;
         }
-        if let Some(Order { status: OrderStatus::Failed, payment_session_id: Some(session), .. }) = order {
+        if let Some(Order { status: OrderState::Failed, payment_session_id: Some(session), .. }) = order {
             self.provider.expire_session(&session).await?;
         }
         Ok(changed)
@@ -491,12 +493,12 @@ impl Expirer {
             };
             match order.status {
                 // Expired by an earlier pass or another worker that did not finish the release
-                OrderStatus::Expired => pass.released += usize::from(self.release_unpaid(sale, ticket).await?),
-                OrderStatus::Confirmed => {
+                OrderState::Expired => pass.released += usize::from(self.release_unpaid(sale, ticket).await?),
+                OrderState::Confirmed => {
                     let mut con = self.inventory.clone();
                     pass.confirmed += usize::from(cache::settle_hold(&mut con, sale, ticket, SettleAs::Confirmed).await?);
                 }
-                OrderStatus::Refunded => {
+                OrderState::Refunded => {
                     let product = order.product_id;
                     if self.db(move |conn| actions::orders::has_free_unit(conn, product)).await? {
                         // The payment came after the deadline: the hold is unpaid, the unit comes back
@@ -511,8 +513,8 @@ impl Expirer {
                     }
                 }
                 // PostgreSQL's clock says the deadline is not here yet: try again later
-                OrderStatus::AwaitingPayment => log::debug!("The hold {ticket} is due by Redis' clock but not by PostgreSQL's"),
-                other => log::warn!("The hold {ticket} is due but its order is {other:?}; left alone"),
+                OrderState::AwaitingPayment => log::debug!("The hold {ticket} is due by Redis' clock but not by PostgreSQL's"),
+                OrderState::Failed => log::warn!("The hold {ticket} is due but its order is FAILED; left alone"),
             }
         }
         Ok(())
@@ -594,9 +596,8 @@ impl Expirer {
     /// Stale-order sweep. Orders whose worker died between a release and the
     /// order update, or after the order update:
     /// - `AWAITING_PAYMENT` more than `stale_after` past their deadline, whose
-    ///   hold is gone or `EXPIRED`, become `EXPIRED`;
-    /// - `PENDING` more than `stale_after` old, whose hold is `FAILED` or gone,
-    ///   become `FAILED`;
+    ///   hold is gone or `EXPIRED`, become `EXPIRED`; whose hold is `FAILED`
+    ///   (a leaked hold released before the order was updated), become `FAILED`;
     /// - `EXPIRED` orders (changed between `stale_after` and `stale_after +
     ///   expired_recheck` ago) whose read-cache status is not `EXPIRED` get their
     ///   status and session finished.
@@ -612,26 +613,20 @@ impl Expirer {
         loop {
             let page = self.db(move |conn| actions::orders::stale_awaiting_payment(conn, before, after, limit)).await?;
             for order in &page {
-                if self.hold_state(order).await?.is_none_or(|state| state == "EXPIRED")
-                    && self.finish_expired(order.product_id, &order.queue_ticket_id).await?
-                {
-                    swept.expired += 1;
-                }
-            }
-            match page.last() {
-                Some(last) if page.len() as i64 == limit => after = last.id,
-                _ => break,
-            }
-        }
-
-        let mut after = 0;
-        loop {
-            let page = self.db(move |conn| actions::orders::stale_pending(conn, before, after, limit)).await?;
-            for order in &page {
-                if self.hold_state(order).await?.is_none_or(|state| state == "FAILED")
-                    && self.finish_failed(order.product_id, &order.queue_ticket_id).await?
-                {
-                    swept.failed += 1;
+                match self.hold_state(order).await?.as_deref() {
+                    // Released as unpaid, or gone
+                    None | Some("EXPIRED") => {
+                        if self.finish_expired(order.product_id, &order.queue_ticket_id).await? {
+                            swept.expired += 1;
+                        }
+                    }
+                    // Released as leaked: the worker died before the order update
+                    Some("FAILED") => {
+                        if self.finish_failed(order.product_id, &order.queue_ticket_id).await? {
+                            swept.failed += 1;
+                        }
+                    }
+                    Some(_) => {}
                 }
             }
             match page.last() {

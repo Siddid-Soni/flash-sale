@@ -136,7 +136,7 @@ async fn main() {
                     outages.worked("The stale-order sweep");
                     if swept.expired + swept.failed + swept.repaired > 0 {
                         log::warn!(
-                            "Swept {} orders left AWAITING_PAYMENT and {} left PENDING after their hold ended; repaired {} EXPIRED orders",
+                            "Swept {} orders left AWAITING_PAYMENT after their hold expired and {} after it was released as leaked; repaired {} EXPIRED orders",
                             swept.expired,
                             swept.failed,
                             swept.repaired

@@ -23,7 +23,7 @@ use flash_sale::{
     actions::{self, orders::Settlement},
     cache::{self, HoldState, MaxScore, ReleaseOutcome, ReleasedAs},
     inbox::{Handled, InboxWorker},
-    models::OrderStatus,
+    models::{OrderState, OrderStatus},
     payment::{
         fake_payment_id,
         webhook::{self, CHECKOUT_COMPLETED},
@@ -44,14 +44,14 @@ async fn setup(stock: i32) -> (tokio::sync::MutexGuard<'static, ()>, SaleFixture
 /// What must agree once every event is processed: the payment path counts a
 /// sale in PostgreSQL only; `sold:{sale}` is the worker's, still 0
 async fn assert_consistent(fx: &SaleFixture) {
-    let confirmed = fx.count_orders(OrderStatus::Confirmed);
+    let confirmed = fx.count_orders(OrderState::Confirmed);
     assert_eq!(fx.product().sold as i64, confirmed, "products.sold == CONFIRMED orders");
     assert_eq!(fx.sold_counter().await, 0, "sold:{{sale}} is counted by the expiration worker");
 }
 
 async fn assert_confirmed(fx: &SaleFixture, a: &Awaiting, event_id: &str) {
     let order = fx.order(&a.event.ticket).unwrap();
-    assert_eq!(order.status, OrderStatus::Confirmed);
+    assert_eq!(order.status, OrderState::Confirmed);
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT", "the worker settles the hold");
     let status = fx.status(&a.event.ticket).await.unwrap();
     assert_eq!((status.status, status.user), (OrderStatus::Confirmed, a.event.user));
@@ -59,7 +59,7 @@ async fn assert_confirmed(fx: &SaleFixture, a: &Awaiting, event_id: &str) {
 }
 
 async fn assert_refunded(fx: &SaleFixture, a: &Awaiting, event_id: &str) {
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "REFUNDED");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
     assert!(fx.inbox_row(event_id).unwrap().processed_at.is_some());
@@ -183,7 +183,7 @@ async fn a_cancelled_payment_needs_no_action() {
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
 
     assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT", "the hold runs out by itself");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment);
     fx.cleanup().await;
@@ -230,7 +230,7 @@ async fn a_payment_without_an_order_or_on_a_foreign_session_is_refunded() {
     let event = paid_event("evt_foreign", &stray.id, &a.event.ticket);
     assert_eq!(worker.handle_event(&event).await.unwrap(), Handled::Refunded);
     assert_eq!(fx.fake().session(&stray.id).await.unwrap().unwrap().state, "REFUNDED");
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::AwaitingPayment, "the order keeps its own session");
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::AwaitingPayment, "the order keeps its own session");
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "OPEN");
     fx.cleanup().await;
 }
@@ -246,7 +246,7 @@ async fn a_crash_after_the_decision_before_the_refund_converges() {
     fx.store(&wire);
 
     assert_eq!(settle_by_hand(&fx, &a), Settlement::Refund);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "PAID", "not refunded yet");
     assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_none());
 
@@ -315,7 +315,7 @@ async fn a_crash_after_a_guard_failure_converges() {
     fx.store(&wire);
 
     assert_eq!(settle_by_hand(&fx, &a), Settlement::SoldOut);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(settle_by_hand(&fx, &a), Settlement::AlreadyRefunded);
 
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
@@ -343,7 +343,7 @@ async fn a_failing_event_is_recorded_backed_off_and_retried() {
     assert!(row.processed_at.is_none());
     assert_eq!(row.attempts, 1);
     assert!(row.last_error.unwrap().contains("provider is down"));
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded, "the decision stands");
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded, "the decision stands");
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "PAID");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment, "not told before the refund");
 
@@ -378,7 +378,7 @@ async fn several_workers_share_the_inbox() {
         assert_confirmed(&fx, a, &wire.event.id).await;
     }
     assert_eq!(fx.product().sold, 12);
-    assert_eq!(fx.count_orders(OrderStatus::Confirmed), 12);
+    assert_eq!(fx.count_orders(OrderState::Confirmed), 12);
     assert_consistent(&fx).await;
     fx.cleanup().await;
 }
@@ -401,7 +401,7 @@ async fn concurrent_handlers_of_one_event_decide_once() {
     for task in tasks {
         assert_eq!(task.await.unwrap(), Handled::Confirmed);
     }
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Confirmed);
     assert_eq!(fx.product().sold, 1);
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Confirmed);
     fx.cleanup().await;
@@ -421,7 +421,7 @@ async fn a_second_success_event_for_a_confirmed_order_changes_nothing() {
     let again = fx.wire(&a, CHECKOUT_COMPLETED);
     assert_eq!(worker.handle_event(&again.event).await.unwrap(), Handled::Confirmed);
     assert_eq!(fx.product().sold, 1);
-    assert_eq!(fx.count_orders(OrderStatus::Confirmed), 1);
+    assert_eq!(fx.count_orders(OrderState::Confirmed), 1);
     fx.cleanup().await;
 }
 

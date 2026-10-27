@@ -9,7 +9,7 @@
 # N=UNITS=100000 and RATE=1000.
 #
 # Asserts (PASS/FAIL per check, non-zero exit on a FAIL, report appended to load/RESULTS.md):
-#   - no PENDING hold was released: no FAILED orders, no EXPIRED order without a payment
+#   - no PENDING hold (waiting in Kafka) was released: no FAILED orders, no EXPIRED order without a payment
 #     link, the expiration worker logged no leaked-hold release, every user got an order;
 #   - every user who got a link got the full payment window (the time left to pay when the
 #     generator first saw the link is the window minus at most one polling interval), and
@@ -65,12 +65,12 @@ CONFIRMED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND stat
 ORDERS=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE")
 FAILED_ORDERS=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'FAILED'")
 UNLINKED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status IN ('EXPIRED','FAILED') AND checkout_url IS NULL")
-LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status IN ('PENDING','AWAITING_PAYMENT')")
+LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'AWAITING_PAYMENT'")
 BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none') FROM (SELECT status::text, count(*) AS n FROM orders WHERE product_id = $SALE GROUP BY status ORDER BY status) s")
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
 R_SOLD=$(rcli GET "sold:{$SALE}"); R_STOCK=$(rcli GET "stock:{$SALE}")
 HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
-DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('PENDING','AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
+DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
 LEAKED_LOG=$(docker compose --profile app logs --no-log-prefix --since "$T0" expiration-worker 2>&1 </dev/null | grep -c 'leaked holds' || true)
 MAX_LINK=$(j .checkout_to_link_ms.max); MIN_LEFT=$(j .min_window_left_ms)
 WINDOW_MS=$((PAYMENT_WINDOW_SECS * 1000))
@@ -91,7 +91,7 @@ check "CONFIRMED orders equal payments accepted in time (the generator pays only
 check "products.sold equals sold:{sale}" "$P_SOLD" "$R_SOLD"
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
-check "orders still PENDING or AWAITING_PAYMENT" "$LIVE" 0
+check "orders still AWAITING_PAYMENT" "$LIVE" 0
 check "stock:{sale} equals $UNITS minus sold (every abandoned hold released)" "$R_STOCK" "$((UNITS - P_SOLD))"
 check "holds left in holds:pending and holds:expiry" "$HP + $HE" "0 + 0"
 check "server errors (5xx) in the generator's samples" "$(j .server_errors_5xx)" 0

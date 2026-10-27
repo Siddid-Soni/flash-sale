@@ -4,10 +4,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{orders, payment_inbox, products, users};
 
-/// Where an order is in its life; mirrors the hold states in Redis (see ROADMAP.md, Holds).
+/// The states an order row can be in; the PostgreSQL enum `order_status`.
+/// There is no `PENDING` here: the processor inserts the order only once its
+/// payment session exists, so a row is born `AWAITING_PAYMENT`. See
+/// `OrderStatus` for what clients see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "crate::schema::sql_types::OrderStatus"]
 #[DbValueStyle = "SCREAMING_SNAKE_CASE"]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderState {
+    AwaitingPayment,
+    Confirmed,
+    Expired,
+    Failed,
+    Refunded,
+}
+
+/// What a client is told about a ticket; mirrors the hold states in Redis (see
+/// ROADMAP.md, Holds). It is `OrderState` plus `Pending` (waiting in Kafka, no
+/// order yet): `PENDING` lives only in the read cache and in the hold, never in
+/// PostgreSQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
     Pending,
@@ -42,6 +59,18 @@ impl OrderStatus {
             "REFUNDED" => OrderStatus::Refunded,
             _ => return None,
         })
+    }
+}
+
+impl From<OrderState> for OrderStatus {
+    fn from(state: OrderState) -> Self {
+        match state {
+            OrderState::AwaitingPayment => OrderStatus::AwaitingPayment,
+            OrderState::Confirmed => OrderStatus::Confirmed,
+            OrderState::Expired => OrderStatus::Expired,
+            OrderState::Failed => OrderStatus::Failed,
+            OrderState::Refunded => OrderStatus::Refunded,
+        }
     }
 }
 
@@ -92,17 +121,18 @@ pub struct Order {
     /// `<sale>.<uuid>`
     pub queue_ticket_id: String,
     pub idempotency_key: String,
-    pub status: OrderStatus,
+    pub status: OrderState,
     pub amount_cents: i32,
     pub payment_session_id: Option<String>,
-    /// With `expires_at`, set when the order becomes `AWAITING_PAYMENT`
+    /// With `expires_at`, set when the order is created
     pub checkout_url: Option<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-/// Inserted `PENDING` by an order processor when it consumes a checkout event.
+/// Inserted by an order processor when it consumes a checkout event, once the
+/// payment session exists: the order is born with its link and deadline.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = orders)]
 pub struct NewOrder<'a> {
@@ -110,8 +140,11 @@ pub struct NewOrder<'a> {
     pub product_id: i32,
     pub queue_ticket_id: &'a str,
     pub idempotency_key: &'a str,
-    pub status: OrderStatus,
+    pub status: OrderState,
     pub amount_cents: i32,
+    pub payment_session_id: Option<&'a str>,
+    pub checkout_url: Option<&'a str>,
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Queryable, Selectable, Identifiable)]

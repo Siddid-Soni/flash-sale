@@ -18,7 +18,7 @@ use flash_sale::{
     api::checkout::SoldOutFlags,
     auth,
     cache,
-    models::{NewOrder, NewProduct, OrderStatus},
+    models::{NewOrder, NewProduct, OrderState, OrderStatus},
     schema::orders,
 };
 
@@ -297,6 +297,8 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
     let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no order yet");
 
+    // The order is born AWAITING_PAYMENT, with its link and deadline
+    let expires = Utc::now() + Duration::minutes(5);
     let mut conn = env.pool.get().unwrap();
     diesel::insert_into(orders::table)
         .values(&NewOrder {
@@ -304,21 +306,12 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
             product_id: sale,
             queue_ticket_id: &ticket,
             idempotency_key: "k",
-            status: OrderStatus::Pending,
+            status: OrderState::AwaitingPayment,
             amount_cents: 59_900,
+            payment_session_id: Some("xyz"),
+            checkout_url: Some("http://localhost/fake-pay/xyz"),
+            expires_at: Some(expires),
         })
-        .execute(&mut conn)
-        .unwrap();
-    let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "PENDING" }));
-
-    let expires = Utc::now() + Duration::minutes(5);
-    diesel::update(orders::table.filter(orders::queue_ticket_id.eq(&ticket)))
-        .set((
-            orders::status.eq(OrderStatus::AwaitingPayment),
-            orders::checkout_url.eq("http://localhost/fake-pay/xyz"),
-            orders::expires_at.eq(expires),
-        ))
         .execute(&mut conn)
         .unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
@@ -364,8 +357,11 @@ async fn a_paid_hold_the_worker_has_not_settled_reports_confirmed_from_postgres(
             product_id: sale,
             queue_ticket_id: &ticket,
             idempotency_key: "k",
-            status: OrderStatus::Confirmed,
+            status: OrderState::Confirmed,
             amount_cents: 59_900,
+            payment_session_id: None,
+            checkout_url: None,
+            expires_at: None,
         })
         .execute(&mut conn)
         .unwrap();

@@ -2,9 +2,20 @@
 //! into an order and a payment link, and report how far each Kafka partition
 //! has been processed.
 //!
-//! - `Processor::handle` is the per-message work. Every step is idempotent,
-//!   because a message is redelivered after a crash or a rebalance, so the
-//!   whole thing can simply run again.
+//! - `Processor::handle` is the per-message work, in this order: (a) the hold
+//!   must still be `PENDING`; (b) the price; (c) the payment session (the
+//!   provider's idempotency key is the ticket); (d) the order, inserted
+//!   directly as `AWAITING_PAYMENT` with the session, link and deadline in one
+//!   INSERT (`ON CONFLICT DO NOTHING`, then read back by ticket); (e)
+//!   `link_ready.lua` moves the hold to `AWAITING_PAYMENT`, and the status
+//!   entry gets the link. If the hold was released meanwhile (`gone`) the
+//!   order becomes `FAILED` and the session expires. If another constraint
+//!   refuses the order (the user already has a live one) there is no row: the
+//!   session is expired and the hold is left to the leaked-hold loop. Every
+//!   step is idempotent, because a message is redelivered after a crash or a
+//!   rebalance, so the whole thing can simply run again. `PENDING` is never
+//!   stored in PostgreSQL: it exists only in the hold and the read cache,
+//!   while the message waits in Kafka.
 //! - `PartitionProgress` tracks which offsets of one partition are done and
 //!   which prefix is complete; only that prefix may be committed or reported.
 //! - `run` is the Kafka consumer loop around both (see its docs).
@@ -29,7 +40,7 @@ use crate::{
     cache::{self, LinkOutcome, ReadCache, RedisConn, StatusUpdate},
     config::Config,
     db::DbPool,
-    models::{NewOrder, Order, OrderStatus},
+    models::{NewOrder, Order, OrderState, OrderStatus},
     payment::{PaymentError, SharedProvider},
     queue::CheckoutEvent,
 };
@@ -168,7 +179,7 @@ impl Processor {
                 let lookup = ticket.to_string();
                 let order = self.db(move |conn| actions::orders::find_by_ticket(conn, &lookup)).await?;
                 match order {
-                    Some(Order { status: OrderStatus::AwaitingPayment, checkout_url: Some(url), expires_at: Some(at), .. }) => {
+                    Some(Order { status: OrderState::AwaitingPayment, checkout_url: Some(url), expires_at: Some(at), .. }) => {
                         self.publish_link(ticket, hold.user, &url, at).await?;
                     }
                     other => log::info!("{ticket} is already {}; its order is {:?}", hold.state, other.map(|o| o.status)),
@@ -179,29 +190,49 @@ impl Processor {
             _ => return Ok(Outcome::Skipped),
         };
 
-        // b. The order, PENDING. A repeated ticket finds its row
+        // b. The price
         let Some(amount_cents) = self.price(sale).await? else {
             log::error!("{ticket}: no product {sale}; dropped");
             return Ok(Outcome::Dropped);
         };
-        let new_order = (ticket.to_string(), hold.idem.clone());
+
+        // c. The payment session, idempotent per ticket
+        //
+        // The payment deadline ("now + 5 min" in the roadmap) is computed once,
+        // in whole milliseconds, and used for the session, the order row, the
+        // hold's score in `holds:expiry` and the status entry, so the four
+        // agree. A rerun after a crash asks for a new one, but the provider
+        // returns the first session and the insert below keeps the first row,
+        // so the first deadline stays the one in force (see step e).
+        let expires_ms = Utc::now().timestamp_millis() + self.payment_window.num_milliseconds();
+        let expires_at = DateTime::from_timestamp_millis(expires_ms).expect("a deadline in range");
+        let session = self.provider.create_session(ticket, amount_cents, expires_at, ticket).await?;
+
+        // d. The order, born AWAITING_PAYMENT with its session, link and
+        // deadline in one INSERT. A repeated ticket finds its row
+        let (idem, session_id, url) = (hold.idem.clone(), session.id.clone(), session.url.clone());
+        let (ticket_owned, user) = (ticket.to_string(), hold.user);
         let inserted = self
             .db(move |conn| {
                 let order = NewOrder {
-                    user_id: hold.user,
+                    user_id: user,
                     product_id: sale,
-                    queue_ticket_id: &new_order.0,
-                    idempotency_key: &new_order.1,
-                    status: OrderStatus::Pending,
+                    queue_ticket_id: &ticket_owned,
+                    idempotency_key: &idem,
+                    status: OrderState::AwaitingPayment,
                     amount_cents,
+                    payment_session_id: Some(&session_id),
+                    checkout_url: Some(&url),
+                    expires_at: Some(expires_at),
                 };
-                actions::orders::insert_pending(conn, &order)
+                actions::orders::insert_awaiting_payment(conn, &order)
             })
             .await;
         let order = match inserted {
             Ok(Some(order)) => order,
             Ok(None) => {
                 log::warn!("{ticket}: another constraint refused the order (user {} has a live order?); hold left for the leaked-hold loop", hold.user);
+                self.provider.expire_session(&session.id).await?;
                 return Ok(Outcome::Dropped);
             }
             // A row that can never be inserted (unknown user...) is not retried forever
@@ -212,46 +243,35 @@ impl Processor {
                 info,
             ))) => {
                 log::error!("{ticket}: order refused ({kind:?}: {}); hold left for the leaked-hold loop", info.message());
+                self.provider.expire_session(&session.id).await?;
                 return Ok(Outcome::Dropped);
             }
             Err(e) => return Err(e),
         };
-        if !matches!(order.status, OrderStatus::Pending | OrderStatus::AwaitingPayment) {
+        // On a redelivery this is the first attempt's row: its session and
+        // deadline are the ones in force (PostgreSQL decides on `expires_at`)
+        let (Some(session_id), Some(url), Some(expires_at)) =
+            (order.payment_session_id.as_deref(), order.checkout_url.as_deref(), order.expires_at)
+        else {
+            log::error!("{ticket}: its order has no session, link or deadline; dropped");
+            return Ok(Outcome::Dropped);
+        };
+        if order.status != OrderState::AwaitingPayment {
             log::error!("{ticket}: the hold is PENDING but its order is {:?}; dropped", order.status);
             return Ok(Outcome::Dropped);
         }
 
-        // c. The payment session, idempotent per ticket
-        //
-        // The payment deadline ("now + 5 min" in the roadmap) is computed once,
-        // in whole milliseconds, and used for the order row, the hold's score
-        // in `holds:expiry` and the status entry, so the three agree. A rerun
-        // after a crash computes a new one and moves all three to it.
-        let expires_ms = Utc::now().timestamp_millis() + self.payment_window.num_milliseconds();
-        let expires_at = DateTime::from_timestamp_millis(expires_ms).expect("a deadline in range");
-        let session = self.provider.create_session(ticket, order.amount_cents, expires_at, ticket).await?;
-
-        // d. The order to AWAITING_PAYMENT
-        let (lookup, session_id, url) = (ticket.to_string(), session.id.clone(), session.url.clone());
-        let updated = self
-            .db(move |conn| actions::orders::mark_awaiting_payment(conn, &lookup, &session_id, &url, expires_at))
-            .await?;
-        if !updated {
-            log::error!("{ticket}: its order left PENDING/AWAITING_PAYMENT meanwhile; dropped");
-            return Ok(Outcome::Dropped);
-        }
-
         // e. Link the hold, unless it was released in the meantime
-        match cache::link_ready(&mut inventory, sale, ticket, &session.id, expires_ms).await? {
+        match cache::link_ready(&mut inventory, sale, ticket, session_id, expires_at.timestamp_millis()).await? {
             LinkOutcome::Ready | LinkOutcome::Already => {
-                self.publish_link(ticket, hold.user, &session.url, expires_at).await?;
+                self.publish_link(ticket, hold.user, url, expires_at).await?;
                 Ok(Outcome::Linked)
             }
             LinkOutcome::Gone => {
                 log::info!("{ticket}: the hold was released before its link was ready; failing the order");
                 let lookup = ticket.to_string();
                 self.db(move |conn| actions::orders::mark_failed(conn, &lookup)).await?;
-                self.provider.expire_session(&session.id).await?;
+                self.provider.expire_session(session_id).await?;
                 self.write_status(ticket, &StatusUpdate::new(OrderStatus::Failed, hold.user)).await?;
                 Ok(Outcome::Failed)
             }

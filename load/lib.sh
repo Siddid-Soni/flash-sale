@@ -72,14 +72,14 @@ create_sale() {
   jq -er '.id' <<<"$resp" || { echo "could not create the sale: $resp" >&2; return 1; }
 }
 
-# wait_converged SALE TIMEOUT_SECS: no PENDING / AWAITING_PAYMENT orders, no holds queued, the
+# wait_converged SALE TIMEOUT_SECS: no AWAITING_PAYMENT orders, no holds queued, the
 # sale's payment inbox events and the provider's webhook outbox drained. Waiting for
 # holds:expiry to be empty includes the paid holds: the expiration worker counts a sale in
 # sold:{sale} only when it settles the hold at its deadline, so sold:{sale} is final after this.
 wait_converged() {
   local sale=$1 limit=$2 t=0 live pend exp inbox outbox
   while [ "$t" -lt "$limit" ]; do
-    live=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $sale AND status IN ('PENDING','AWAITING_PAYMENT')")
+    live=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $sale AND status = 'AWAITING_PAYMENT'")
     pend=$(rcli ZCARD "holds:pending:{$sale}"); exp=$(rcli ZCARD "holds:expiry:{$sale}")
     inbox=$(psql_ "SELECT count(*) FROM payment_inbox WHERE processed_at IS NULL AND payload->'data'->'object'->>'ticket' LIKE '$sale.%'")
     outbox=$(rcli ZCARD fakepay:outbox)

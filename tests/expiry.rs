@@ -28,7 +28,7 @@ use flash_sale::{
     actions,
     cache::{self, CheckoutOutcome, HoldState, MaxScore, ReleaseOutcome, ReleasedAs},
     expiry::{Expirer, ExpiryError, KafkaLag, LagSource, PartitionLag, Settings},
-    models::{NewOrder, Order, OrderStatus},
+    models::{NewOrder, OrderState, OrderStatus},
     payment::{PaymentError, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider},
     processor::GROUP_ID,
     queue::{ensure_topic, CheckoutEvent, CheckoutQueue, KafkaQueue},
@@ -113,16 +113,25 @@ async fn zcard(fx: &SaleFixture, key: String) -> i64 {
     fx.env.redis.clone().zcard(key).await.unwrap()
 }
 
-fn pending_order(fx: &SaleFixture, event: &CheckoutEvent) -> Order {
+/// What a processor leaves when it dies after inserting the order but before
+/// linking the hold: an `AWAITING_PAYMENT` order with its session, the hold
+/// still `PENDING`
+async fn unlinked_order(fx: &SaleFixture, event: &CheckoutEvent) -> Session {
+    let expires_at = Utc::now() + Duration::minutes(5);
+    let session = fx.fake().create_session(&event.ticket, PRICE_CENTS, expires_at, &event.ticket).await.unwrap();
     let order = NewOrder {
         user_id: event.user,
         product_id: fx.sale,
         queue_ticket_id: &event.ticket,
         idempotency_key: &format!("key-{}", event.user),
-        status: OrderStatus::Pending,
+        status: OrderState::AwaitingPayment,
         amount_cents: PRICE_CENTS,
+        payment_session_id: Some(&session.id),
+        checkout_url: Some(&session.url),
+        expires_at: Some(expires_at),
     };
-    actions::orders::insert_pending(&mut fx.env.pool.get().unwrap(), &order).unwrap().unwrap()
+    actions::orders::insert_awaiting_payment(&mut fx.env.pool.get().unwrap(), &order).unwrap().unwrap();
+    session
 }
 
 /// Backdates an order, as if it had been left alone for `minutes`
@@ -170,7 +179,7 @@ async fn an_unpaid_hold_past_its_deadline_is_released_and_its_order_expired() {
     assert_eq!((pass.released, pass.more), (1, false));
 
     let ticket = &late.event.ticket;
-    assert_eq!(fx.order(ticket).unwrap().status, OrderStatus::Expired);
+    assert_eq!(fx.order(ticket).unwrap().status, OrderState::Expired);
     assert_eq!(fx.hold_state(ticket).await, "EXPIRED");
     let status = fx.status(ticket).await.unwrap();
     assert_eq!((status.status, status.user), (OrderStatus::Expired, late.event.user));
@@ -180,7 +189,7 @@ async fn an_unpaid_hold_past_its_deadline_is_released_and_its_order_expired() {
 
     // The hold whose deadline is ahead is untouched
     let ticket = &early.event.ticket;
-    assert_eq!(fx.order(ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(ticket).await, "AWAITING_PAYMENT");
     assert_eq!(session_state(&fx, &early.session.id).await, "OPEN");
 
@@ -234,13 +243,13 @@ async fn a_refunded_order_is_never_overwritten_with_expired() {
     let wire = fx.pay(&a).await;
     fx.store(&wire);
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
-    assert_eq!(fx.order(&ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::Refunded);
 
     // Only now the worker gets to the order
     let changed = quiet(&fx).finish_expired(fx.sale, &ticket).await.unwrap();
     assert!(!changed);
-    assert_eq!(fx.order(&ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.status(&ticket).await.unwrap().status, OrderStatus::Refunded);
     assert_eq!(session_state(&fx, &a.session.id).await, "REFUNDED", "a paid session is not expired");
     assert_eq!(fx.stock().await, 5, "released once, refunded without returning stock again");
@@ -294,12 +303,12 @@ async fn a_paid_hold_is_counted_as_sold_when_it_is_due_and_returns_no_stock() {
     assert_eq!(fx.hold_state(&paid.event.ticket).await, "CONFIRMED");
     assert_eq!(fx.sold_counter().await, 1);
     assert_eq!(fx.stock().await, 3, "the unit is sold, not returned");
-    assert_eq!(fx.order(&paid.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.order(&paid.event.ticket).unwrap().status, OrderState::Confirmed);
     assert_eq!(fx.status(&paid.event.ticket).await.unwrap().status, OrderStatus::Confirmed);
     assert_eq!(session_state(&fx, &paid.session.id).await, "PAID", "a paid session is left alone");
     assert_eq!(user_live(&fx, paid.event.user).await.as_deref(), Some(paid.event.ticket.as_str()), "the user bought one");
     // The unpaid one is untouched
-    assert_eq!(fx.order(&unpaid.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(&unpaid.event.ticket).unwrap().status, OrderState::AwaitingPayment);
 
     // Counted once, however often the worker looks
     for _ in 0..3 {
@@ -320,14 +329,14 @@ async fn a_hold_whose_late_payment_was_refunded_is_released() {
     let wire = fx.pay(&a).await;
     fx.store(&wire);
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.stock().await, 2);
 
     let pass = quiet(&fx).unpaid_pass(&[fx.sale]).await.unwrap();
     assert_eq!((pass.released, pass.confirmed, pass.dropped), (1, 0, 0));
     assert_eq!(fx.stock().await, 3, "the unit is back");
     assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded, "REFUNDED is not overwritten");
     assert_eq!(session_state(&fx, &a.session.id).await, "REFUNDED", "a paid session is not expired");
     assert_eq!(fx.sold_counter().await, 0);
@@ -348,7 +357,7 @@ async fn a_hold_whose_payment_failed_the_guard_is_dropped_without_stock_or_count
     let wire = fx.pay(&a).await;
     fx.store(&wire);
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Refunded);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded);
     make_due(&fx, &a.event.ticket).await;
 
     let worker = quiet(&fx);
@@ -379,7 +388,7 @@ async fn a_hold_due_by_redis_but_not_by_postgres_is_left_for_a_later_pass() {
         let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
         assert_eq!((pass.released, pass.confirmed, pass.dropped, pass.more), (0, 0, 0, false));
     }
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
     assert_eq!(fx.expiry_len().await, 1);
     assert_eq!(fx.stock().await, 2);
@@ -388,7 +397,7 @@ async fn a_hold_due_by_redis_but_not_by_postgres_is_left_for_a_later_pass() {
     // PostgreSQL's clock catches up
     fx.set_pg_deadline(&a.event.ticket, Utc::now().timestamp_millis() - 1_000);
     assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().released, 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Expired);
     assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
     assert_eq!(fx.stock().await, 3);
     fx.cleanup().await;
@@ -405,7 +414,7 @@ async fn a_payment_in_the_clock_skew_window_wins_and_is_counted() {
     let wire = fx.pay(&a).await;
     fx.store(&wire);
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Confirmed);
 
     let worker = quiet(&fx);
     assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().confirmed, 1);
@@ -453,7 +462,7 @@ async fn a_failed_follow_up_is_retried_by_the_next_pass() {
     // The unit is back and the order and status are done; only the session is not
     assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
     assert_eq!(fx.stock().await, 3);
-    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Expired);
     assert_eq!(session_state(&fx, &a.session.id).await, "OPEN");
 
     provider.fail.store(false, Ordering::SeqCst);
@@ -535,25 +544,14 @@ async fn with_no_lag_time_alone_releases_a_leaked_hold() {
 async fn a_leaked_hold_fails_the_order_the_processor_left_behind() {
     let (_guard, fx) = setup(3).await;
     let event = fx.winner().await;
-    pending_order(&fx, &event);
-    let expires_at = Utc::now() + Duration::minutes(5);
-    let session = fx.fake().create_session(&event.ticket, PRICE_CENTS, expires_at, &event.ticket).await.unwrap();
-    let marked = actions::orders::mark_awaiting_payment(
-        &mut fx.env.pool.get().unwrap(),
-        &event.ticket,
-        &session.id,
-        &session.url,
-        expires_at,
-    )
-    .unwrap();
-    assert!(marked);
+    let session = unlinked_order(&fx, &event).await;
 
     let lag = StubLag::new(&[(0, false)]);
     let worker = expirer(&fx, lag, 100, 50);
     tokio::time::sleep(StdDuration::from_millis(120)).await;
     assert_eq!(worker.leaked_pass(&[fx.sale]).await.unwrap().released, 1);
 
-    assert_eq!(fx.order(&event.ticket).unwrap().status, OrderStatus::Failed);
+    assert_eq!(fx.order(&event.ticket).unwrap().status, OrderState::Failed);
     assert_eq!(session_state(&fx, &session.id).await, "EXPIRED");
     assert_eq!(fx.status(&event.ticket).await.unwrap().status, OrderStatus::Failed);
     assert_eq!(fx.hold_state(&event.ticket).await, "FAILED");
@@ -768,17 +766,17 @@ async fn payment_and_expiry_racing_leave_exactly_one_winner_per_order() {
         let session = session_state(&fx, &a.session.id).await;
         match (pays, order.status) {
             // The payment beat PostgreSQL's deadline: the worker counted the sale
-            (true, OrderStatus::Confirmed) => {
+            (true, OrderState::Confirmed) => {
                 assert_eq!((status, hold.as_str(), session.as_str()), (OrderStatus::Confirmed, "CONFIRMED", "PAID"));
                 confirmed += 1;
             }
             // The deadline won; the payment was refunded and the worker returned the unit
-            (true, OrderStatus::Refunded) => {
+            (true, OrderState::Refunded) => {
                 assert_eq!((status, hold.as_str(), session.as_str()), (OrderStatus::Refunded, "EXPIRED", "REFUNDED"));
                 refunded += 1;
             }
             // Nobody paid
-            (false, OrderStatus::Expired) => {
+            (false, OrderState::Expired) => {
                 assert_eq!((status, hold.as_str(), session.as_str()), (OrderStatus::Expired, "EXPIRED", "EXPIRED"));
                 expired += 1;
             }
@@ -867,11 +865,11 @@ async fn several_workers_release_each_hold_once() {
     assert_eq!(fx.expiry_len().await, 0);
     for a in &paid {
         assert_eq!(fx.hold_state(&a.event.ticket).await, "CONFIRMED");
-        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Confirmed);
+        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Confirmed);
     }
 
     for a in &unpaid {
-        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
+        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Expired);
         assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED");
         assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Expired);
         assert_eq!(session_state(&fx, &a.session.id).await, "EXPIRED");
@@ -880,7 +878,7 @@ async fn several_workers_release_each_hold_once() {
         assert_eq!(fx.hold_state(&hold.ticket).await, "FAILED");
         assert_eq!(fx.status(&hold.ticket).await.unwrap().status, OrderStatus::Failed);
     }
-    assert_eq!(fx.count_orders(OrderStatus::Expired), UNPAID as i64);
+    assert_eq!(fx.count_orders(OrderState::Expired), UNPAID as i64);
     fx.cleanup().await;
 }
 
@@ -905,38 +903,40 @@ async fn the_sweep_finishes_orders_whose_hold_ended_and_leaves_live_ones() {
     }
     age_order(&fx, &recent.event.ticket, 5);
 
-    // PENDING orders, long after creation
+    // Orders whose processor died before linking the hold, long past their deadline
     let failed = fx.winner().await;
-    pending_order(&fx, &failed);
+    unlinked_order(&fx, &failed).await;
     release_by_hand(&fx, &failed.ticket, HoldState::Pending, ReleasedAs::Failed).await;
-    let vanished = fx.winner().await;
-    pending_order(&fx, &vanished);
+    let vanished = fx.winner().await; // hold gone: no way to tell whether it was leaked
+    unlinked_order(&fx, &vanished).await;
     release_by_hand(&fx, &vanished.ticket, HoldState::Pending, ReleasedAs::Failed).await;
     let _: () = fx.env.redis.clone().del(cache::hold_key(fx.sale, &vanished.ticket)).await.unwrap();
     let waiting = fx.winner().await; // PENDING hold still live: the leaked loop's business
-    pending_order(&fx, &waiting);
+    unlinked_order(&fx, &waiting).await;
     for event in [&failed, &vanished, &waiting] {
         age_order(&fx, &event.ticket, 20);
     }
 
     let swept = worker.sweep(Utc::now()).await.unwrap();
-    assert!(swept.expired >= 2 && swept.failed >= 2, "{swept:?}");
+    assert!(swept.expired >= 3 && swept.failed >= 1, "{swept:?}");
 
     for a in [&crashed, &gone] {
-        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderStatus::Expired);
+        assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Expired);
         assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Expired);
         assert_eq!(session_state(&fx, &a.session.id).await, "EXPIRED");
     }
-    for event in [&failed, &vanished] {
-        assert_eq!(fx.order(&event.ticket).unwrap().status, OrderStatus::Failed);
-        assert_eq!(fx.status(&event.ticket).await.unwrap().status, OrderStatus::Failed);
-    }
+    // The hold was released as leaked: FAILED. One that vanished cannot be told
+    // from an unpaid one: EXPIRED
+    assert_eq!(fx.order(&failed.ticket).unwrap().status, OrderState::Failed);
+    assert_eq!(fx.status(&failed.ticket).await.unwrap().status, OrderStatus::Failed);
+    assert_eq!(fx.order(&vanished.ticket).unwrap().status, OrderState::Expired);
+    assert_eq!(fx.status(&vanished.ticket).await.unwrap().status, OrderStatus::Expired);
     // Live holds and fresh orders are left alone
-    assert_eq!(fx.order(&live.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(&live.event.ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(&live.event.ticket).await, "AWAITING_PAYMENT");
     assert_eq!(session_state(&fx, &live.session.id).await, "OPEN");
-    assert_eq!(fx.order(&recent.event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
-    assert_eq!(fx.order(&waiting.ticket).unwrap().status, OrderStatus::Pending);
+    assert_eq!(fx.order(&recent.event.ticket).unwrap().status, OrderState::AwaitingPayment);
+    assert_eq!(fx.order(&waiting.ticket).unwrap().status, OrderState::AwaitingPayment);
     assert_eq!(fx.hold_state(&waiting.ticket).await, "PENDING");
 
     // Idempotent

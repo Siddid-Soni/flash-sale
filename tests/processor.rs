@@ -23,7 +23,7 @@ use tokio::sync::watch;
 use flash_sale::{
     actions,
     cache::{self, CheckoutOutcome, HoldState, MaxScore, ReleasedAs},
-    models::{NewOrder, NewProduct, Order, OrderStatus},
+    models::{NewOrder, NewProduct, Order, OrderState, OrderStatus},
     payment::{FakeProvider, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider},
     processor::{self, Outcome, Processor},
     queue::{ensure_topic, CheckoutEvent, CheckoutQueue, KafkaQueue},
@@ -138,7 +138,7 @@ async fn a_checkout_event_becomes_an_order_with_a_payment_link() {
 
     // The order: AWAITING_PAYMENT with the session, URL and deadline, the price of the product
     let order = fx.order(&event.ticket).unwrap();
-    assert_eq!((order.status, order.user_id, order.product_id), (OrderStatus::AwaitingPayment, event.user, fx.sale));
+    assert_eq!((order.status, order.user_id, order.product_id), (OrderState::AwaitingPayment, event.user, fx.sale));
     assert_eq!(order.amount_cents, 59_900);
     assert_eq!(order.idempotency_key, format!("key-{}", event.user), "the key comes from the hold");
     let session_id = order.payment_session_id.clone().unwrap();
@@ -265,7 +265,7 @@ async fn a_hold_released_before_the_link_fails_the_order_and_expires_the_session
     assert_eq!(fx.processor_with(provider).handle(&event).await.unwrap(), Outcome::Failed);
 
     let order = fx.order(&event.ticket).unwrap();
-    assert_eq!(order.status, OrderStatus::Failed);
+    assert_eq!(order.status, OrderState::Failed);
     let session = fx.fake.session(&order.payment_session_id.unwrap()).await.unwrap().unwrap();
     assert_eq!(session.state, "EXPIRED");
     let status = fx.status(&event.ticket).await.unwrap();
@@ -288,8 +288,11 @@ async fn an_order_another_constraint_refuses_leaves_the_hold_alone() {
             product_id: fx.sale,
             queue_ticket_id: &format!("{}.{}", fx.sale, uuid::Uuid::new_v4()),
             idempotency_key: "older",
-            status: OrderStatus::AwaitingPayment,
+            status: OrderState::AwaitingPayment,
             amount_cents: 59_900,
+            payment_session_id: None,
+            checkout_url: None,
+            expires_at: None,
         })
         .execute(&mut fx.env.pool.get().unwrap())
         .unwrap();
@@ -297,7 +300,52 @@ async fn an_order_another_constraint_refuses_leaves_the_hold_alone() {
     assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Dropped);
     assert!(fx.order(&event.ticket).is_none());
     assert_eq!(fx.hold_state(&event.ticket).await, "PENDING", "the leaked-hold loop releases it later");
-    assert!(fx.fake.session_id_for_ticket(&event.ticket).await.unwrap().is_none());
+    assert!(fx.status(&event.ticket).await.is_none(), "no status was written");
+    // The session made for it is stopped: nobody can pay a link that is never shown
+    let session_id = fx.fake.session_id_for_ticket(&event.ticket).await.unwrap().unwrap();
+    assert_eq!(fx.fake.session(&session_id).await.unwrap().unwrap().state, "EXPIRED");
+    fx.cleanup().await;
+}
+
+/// The processor died after the INSERT but before `link_ready.lua`: the hold is
+/// still `PENDING` and the order exists with its first session and deadline.
+/// The redelivery keeps that row and links the hold with its deadline.
+#[tokio::test]
+async fn a_redelivery_after_the_insert_links_the_hold_with_the_orders_deadline() {
+    let fx = fixture(5).await;
+    let event = fx.winner().await;
+    let first_deadline_ms = Utc::now().timestamp_millis() + 120_000;
+    let first_deadline = DateTime::from_timestamp_millis(first_deadline_ms).unwrap();
+    let session = fx.env.shared_provider().create_session(&event.ticket, 59_900, first_deadline, &event.ticket).await.unwrap();
+    diesel::insert_into(orders::table)
+        .values(&NewOrder {
+            user_id: event.user,
+            product_id: fx.sale,
+            queue_ticket_id: &event.ticket,
+            idempotency_key: &format!("key-{}", event.user),
+            status: OrderState::AwaitingPayment,
+            amount_cents: 59_900,
+            payment_session_id: Some(&session.id),
+            checkout_url: Some(&session.url),
+            expires_at: Some(first_deadline),
+        })
+        .execute(&mut fx.env.pool.get().unwrap())
+        .unwrap();
+    assert_eq!(fx.hold_state(&event.ticket).await, "PENDING");
+
+    assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Linked);
+
+    let order = fx.order(&event.ticket).unwrap();
+    assert_eq!(
+        (order.payment_session_id.as_deref(), order.expires_at),
+        (Some(session.id.as_str()), Some(first_deadline)),
+        "the row of the first attempt stays"
+    );
+    assert_eq!(fx.hold_state(&event.ticket).await, "AWAITING_PAYMENT");
+    assert_eq!(fx.expiry_score(&event.ticket).await, Some(first_deadline_ms));
+    let status = fx.status(&event.ticket).await.unwrap();
+    assert_eq!((status.status, status.payment_url), (OrderStatus::AwaitingPayment, Some(session.url.clone())));
+    assert_eq!(status.expires_at, Some(millis(first_deadline)));
     fx.cleanup().await;
 }
 
@@ -346,7 +394,7 @@ async fn a_transient_error_is_retried_not_skipped() {
     let outcome = processor.handle_with_retry(&event, &shutdown).await;
     assert_eq!(outcome, Some(Outcome::Linked));
     assert_eq!(flaky.calls.load(Ordering::SeqCst), 3);
-    assert_eq!(fx.order(&event.ticket).unwrap().status, OrderStatus::AwaitingPayment);
+    assert_eq!(fx.order(&event.ticket).unwrap().status, OrderState::AwaitingPayment);
 
     // At shutdown a failing message is given up on (left undone), not retried forever
     let event = fx.winner().await;
@@ -397,7 +445,7 @@ async fn the_consumer_loop_processes_commits_and_reports_progress() {
     loop {
         let mut all_done = true;
         for (event, _) in &published {
-            all_done &= fx.order(&event.ticket).is_some_and(|o| o.status == OrderStatus::AwaitingPayment);
+            all_done &= fx.order(&event.ticket).is_some_and(|o| o.status == OrderState::AwaitingPayment);
         }
         for (&partition, &(offset, _)) in &last {
             let progress = cache::read_progress(&mut read_cache, &config.checkout_topic, partition).await.unwrap();

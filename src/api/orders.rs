@@ -3,7 +3,9 @@
 //! The answer comes from the read cache. If that entry is missing (the write
 //! after a transition was lost, or the entry expired) it falls back to the
 //! hold in the inventory Redis, then to the order in PostgreSQL, so a lost
-//! cache write never shows a winner the wrong thing.
+//! cache write never shows a winner the wrong thing. `PENDING` (waiting in
+//! Kafka) comes only from the cache or the hold: the order row does not exist
+//! yet, and it is never stored in PostgreSQL.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -20,7 +22,7 @@ use crate::{
     config::Config,
     db::DbPool,
     error::ApiError,
-    models::{Order, OrderStatus},
+    models::{Order, OrderState, OrderStatus},
 };
 
 /// How long a replica reuses a partition's processor progress before reading
@@ -101,9 +103,9 @@ fn queue_position(offset: i64, processed_offset: Option<i64>) -> i64 {
 }
 
 fn order_response(order: Order) -> StatusResponse {
-    let awaiting = order.status == OrderStatus::AwaitingPayment;
+    let awaiting = order.status == OrderState::AwaitingPayment;
     StatusResponse {
-        status: order.status,
+        status: order.status.into(),
         position: None,
         payment_url: order.checkout_url.filter(|_| awaiting),
         expires_at: order.expires_at.filter(|_| awaiting).map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)),

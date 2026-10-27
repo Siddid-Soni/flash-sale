@@ -55,11 +55,11 @@ BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none')
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
 R_SOLD=$(rcli GET "sold:{$SALE}"); R_STOCK=$(rcli GET "stock:{$SALE}")
 HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
-DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('PENDING','AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
-LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status IN ('PENDING','AWAITING_PAYMENT')")
+DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
+LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'AWAITING_PAYMENT'")
 IN_TIME=$(j .payments.in_time); BOUNDARY=$(j .payments.boundary); LATE=$(j .payments.late)
 
-check_cond "the system settled (no PENDING/AWAITING_PAYMENT orders, no queued holds, inbox and outbox drained)" "converged=$CONVERGED, orders: $BY_STATUS" $((1 - CONVERGED))
+check_cond "the system settled (no AWAITING_PAYMENT orders, no queued holds, inbox and outbox drained)" "converged=$CONVERGED, orders: $BY_STATUS" $((1 - CONVERGED))
 check_cond "CONFIRMED orders equal the payments that arrived in time, and are at most $UNITS" \
   "CONFIRMED $CONFIRMED; payments surely in time $IN_TIME, at the boundary $BOUNDARY" \
   $([ "$CONFIRMED" -ge "$IN_TIME" ] && [ "$CONFIRMED" -le $((IN_TIME + BOUNDARY)) ] && [ "$CONFIRMED" -le "$UNITS" ] && echo 0 || echo 1)
@@ -70,7 +70,7 @@ check "CONFIRMED orders equal users the generator saw CONFIRMED" "$CONFIRMED" "$
 check "products.sold equals sold:{sale}" "$P_SOLD" "$R_SOLD"
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
-check "orders still PENDING or AWAITING_PAYMENT" "$LIVE" 0
+check "orders still AWAITING_PAYMENT" "$LIVE" 0
 check "stock:{sale} equals $UNITS minus sold (every abandoned hold released)" "$R_STOCK" "$((UNITS - P_SOLD))"
 check "holds left in holds:pending and holds:expiry" "$HP + $HE" "0 + 0"
 check "server errors (5xx) in the generator's samples" "$(j .server_errors_5xx)" 0

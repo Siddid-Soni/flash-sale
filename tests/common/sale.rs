@@ -181,7 +181,7 @@ impl SaleFixture {
     }
 
     /// Orders of this sale in the given status
-    pub fn count_orders(&self, status: flash_sale::models::OrderStatus) -> i64 {
+    pub fn count_orders(&self, status: flash_sale::models::OrderState) -> i64 {
         use flash_sale::schema::orders;
         orders::table
             .filter(orders::product_id.eq(self.sale))
