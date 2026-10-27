@@ -60,6 +60,21 @@ pub struct Config {
     pub expiry_leaked_every_ms: u64,
     /// How often the expiration worker sweeps for orders left behind by a crash
     pub expiry_sweep_secs: u64,
+    /// Names this Order Service replica; when set, every response carries
+    /// `X-Replica: <id>` so balancing and failover can be observed at the gateway
+    pub replica_id: Option<String>,
+    /// Challenge required on `POST /v1/session`: `off` (default) accepts everyone;
+    /// the hook for a proof of work or CAPTCHA (see `crate::challenge`)
+    pub session_challenge: String,
+    /// Connections the server accepts per worker thread before it stops
+    /// accepting (the kernel queue then holds the rest)
+    pub http_max_connections: usize,
+    /// Length of the listen queue: connections the kernel completes while all
+    /// workers are busy, so a burst waits instead of being refused
+    pub http_backlog: u32,
+    /// How long an idle keep-alive connection stays open. Must exceed the
+    /// gateway's upstream `keepalive_timeout`, so NGINX is the side that closes
+    pub http_keep_alive_secs: u64,
 }
 
 impl Config {
@@ -98,6 +113,11 @@ impl Config {
             expiry_interval_ms: or_default("EXPIRY_INTERVAL_MS", 250),
             expiry_leaked_every_ms: or_default("EXPIRY_LEAKED_EVERY_MS", 1000),
             expiry_sweep_secs: or_default("EXPIRY_SWEEP_SECS", 60),
+            replica_id: env::var("REPLICA_ID").ok().filter(|id| !id.trim().is_empty()),
+            session_challenge: or_default("SESSION_CHALLENGE", "off".to_string()),
+            http_max_connections: or_default("HTTP_MAX_CONNECTIONS", 25_000),
+            http_backlog: or_default("HTTP_BACKLOG", 4096),
+            http_keep_alive_secs: or_default("HTTP_KEEP_ALIVE_SECS", 75),
         }
     }
 }

@@ -8,12 +8,13 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::{middleware, web, App, HttpServer};
 
 use flash_sale::{
     api::{self, checkout::SoldOutFlags, orders::ProgressCache, sales::SaleCache},
-    cache,
+    cache, challenge,
     config::Config,
     db,
     payment::{self, dispatcher::{Dispatcher, DispatcherSettings}, SharedProvider},
@@ -68,10 +69,14 @@ async fn main() -> std::io::Result<()> {
         let dispatcher = Dispatcher::new(fake.clone(), config.payment_webhook_url.clone(), DispatcherSettings::default());
         actix_web::rt::spawn(dispatcher.run());
     }
+    let challenge = web::Data::new(challenge::from_config(&config));
     let config = web::Data::new(config);
 
     let bind_addr = config.bind_addr.clone();
-    log::info!("starting HTTP server at http://{bind_addr}");
+    let replica_id = config.replica_id.clone();
+    let (max_connections, backlog) = (config.http_max_connections, config.http_backlog);
+    let keep_alive = Duration::from_secs(config.http_keep_alive_secs);
+    log::info!("starting HTTP server at http://{bind_addr} (replica {})", replica_id.as_deref().unwrap_or("-"));
 
     HttpServer::new(move || {
         let i = next_connection.fetch_add(1, Ordering::Relaxed) % connections;
@@ -90,11 +95,21 @@ async fn main() -> std::io::Result<()> {
             .app_data(progress_cache.clone())
             .app_data(sold_out.clone())
             .app_data(config.clone())
+            .app_data(challenge.clone())
             .app_data(api::json_config())
             .app_data(api::query_config())
             .wrap(middleware::Logger::default())
+            // `X-Replica: <id>` on every response, only when REPLICA_ID is set
+            .wrap(middleware::Condition::new(
+                replica_id.is_some(),
+                middleware::DefaultHeaders::new().add(("X-Replica", replica_id.clone().unwrap_or_default())),
+            ))
             .configure(api::configure)
     })
+    // Sized so a burst queues in the kernel instead of being refused (see gateway/nginx.conf)
+    .max_connections(max_connections)
+    .backlog(backlog)
+    .keep_alive(keep_alive)
     .bind(bind_addr)?
     .run()
     .await

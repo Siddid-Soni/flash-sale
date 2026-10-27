@@ -1,8 +1,8 @@
-use actix_web::{post, web, HttpResponse};
+use actix_web::{post, web, HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::{actions, auth, config::Config, db::DbPool, error::ApiError};
+use crate::{actions, auth, challenge::SharedChallenge, config::Config, db::DbPool, error::ApiError};
 
 #[derive(Debug, Serialize)]
 struct SessionResponse {
@@ -14,9 +14,18 @@ struct SessionResponse {
 /// A guest session: a user row with no username or email, and a token for it.
 /// Clients create it when the sale page loads, before the sale opens, so the
 /// spike at the start does not hit this insert; the gateway rate-limits it
-/// per IP (Stage 7).
+/// per IP (Stage 7). The optional `X-Challenge` header goes to the configured
+/// `Challenge` (a no-op unless `SESSION_CHALLENGE` selects a real one).
 #[post("/session")]
-async fn create_session(pool: web::Data<DbPool>, config: web::Data<Config>) -> Result<HttpResponse, ApiError> {
+async fn create_session(
+    req: HttpRequest,
+    pool: web::Data<DbPool>,
+    config: web::Data<Config>,
+    challenge: web::Data<SharedChallenge>,
+) -> Result<HttpResponse, ApiError> {
+    let solved = req.headers().get("X-Challenge").and_then(|value| value.to_str().ok());
+    challenge.verify(solved).await?;
+
     let user = web::block(move || {
         let mut conn = pool.get()?;
         Ok::<_, ApiError>(actions::users::create_guest(&mut conn)?)

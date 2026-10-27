@@ -4,6 +4,7 @@ pub mod actions;
 pub mod api;
 pub mod auth;
 pub mod cache;
+pub mod challenge;
 pub mod config;
 pub mod db;
 pub mod error;

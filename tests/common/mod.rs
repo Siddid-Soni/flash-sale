@@ -116,6 +116,7 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new(flash_sale::api::orders::ProgressCache::default()))
                 .app_data($flags.clone())
                 .app_data(actix_web::web::Data::new($env.config.clone()))
+                .app_data(actix_web::web::Data::new(flash_sale::challenge::from_config(&$env.config)))
                 .app_data(flash_sale::api::json_config())
                 .app_data(flash_sale::api::query_config())
                 .configure(flash_sale::api::configure),

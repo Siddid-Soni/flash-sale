@@ -1,3 +1,42 @@
+# Fixed subnet: the gateway tells the internal network (the containers, where
+# ops scripts run) from outside by address. Requests from the host arrive
+# from the bridge's own address, 172.28.0.1, and are treated as outside.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+# Shared by the Order Service replicas, the order processor and the expiration worker
+x-app-env: &app_env
+  DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
+  REDIS_URL: redis://redis:6379
+  READ_CACHE_URL: redis://redis:6379
+  KAFKA_BROKERS: kafka:29092
+  BIND_ADDR: 0.0.0.0:8080
+  # Clients (and the fake payment page's links) use the gateway's host port
+  PUBLIC_BASE_URL: http://localhost:8000
+  FRONTEND_URL: http://localhost:8000
+  # The fake provider delivers webhooks through the gateway, as a real provider would
+  # (PAYMENT_WEBHOOK_SECRET comes from .env)
+  PAYMENT_WEBHOOK_URL: http://gateway/v1/payments/webhook
+
+x-order-service: &order_service
+  profiles: [app]
+  build: .
+  image: flash_sale
+  command: ["order_service"]
+  restart: unless-stopped
+  env_file: .env
+  # No host port: clients reach the replicas through the gateway only.
+  # The image has no curl or wget; bash can open a TCP connection
+  healthcheck:
+    test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8080'"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -46,25 +85,73 @@ services:
 
   # The application: `docker compose --profile app up -d --build`. Without the
   # profile only the services above start, for running the app with cargo.
-  order-service:
+
+  # Three identical Order Service replicas behind the gateway. Their DB pool is
+  # small: checkout and status never touch PostgreSQL (only sessions, admin and
+  # the webhook do), and Postgres allows 100 connections in all. Replica 1 starts
+  # first because it runs the migrations and creates the topic; 2 and 3 wait
+  # for it to be healthy so the three do not race on them.
+  order-service-1:
+    <<: *order_service
+    environment:
+      <<: *app_env
+      REPLICA_ID: "1"
+      DB_POOL_SIZE: "5"
+    depends_on:
+      postgres: {condition: service_started}
+      redis: {condition: service_started}
+      kafka: {condition: service_started}
+
+  order-service-2:
+    <<: *order_service
+    environment:
+      <<: *app_env
+      REPLICA_ID: "2"
+      DB_POOL_SIZE: "5"
+    depends_on:
+      order-service-1: {condition: service_healthy}
+
+  order-service-3:
+    <<: *order_service
+    environment:
+      <<: *app_env
+      REPLICA_ID: "3"
+      DB_POOL_SIZE: "5"
+    depends_on:
+      order-service-1: {condition: service_healthy}
+
+  # NGINX: the one public entrance (http://localhost:8000). Serves the frontend,
+  # balances the API over the replicas, rate-limits, filters bots. See gateway/README.md.
+  gateway:
     profiles: [app]
-    build: .
-    image: flash_sale
-    command: ["order_service"]
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    image: flash_sale_gateway
     restart: unless-stopped
-    env_file: .env
-    environment: &app_env
-      DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
-      REDIS_URL: redis://redis:6379
-      READ_CACHE_URL: redis://redis:6379
-      KAFKA_BROKERS: kafka:29092
-      BIND_ADDR: 0.0.0.0:8080
-      # The fake provider (inside the Order Service) delivers webhooks to the
-      # service by name; PAYMENT_WEBHOOK_SECRET and FRONTEND_URL come from .env
-      PAYMENT_WEBHOOK_URL: http://order-service:8080/v1/payments/webhook
+    environment:
+      # 1 = take the client address from X-Forwarded-For when it comes from the
+      # bridge address (load tests only; never in production)
+      GATEWAY_TRUST_XFF: ${GATEWAY_TRUST_XFF:-0}
     ports:
-      - 8080:8080
-    depends_on: [postgres, redis, kafka]
+      - 8000:80
+    # Open files: two connections per proxied request, plus the listeners
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    sysctls:
+      # The listen backlog (4096 in nginx.conf) is capped by this
+      net.core.somaxconn: 4096
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/gateway-health >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    depends_on:
+      order-service-1: {condition: service_healthy}
+      order-service-2: {condition: service_healthy}
+      order-service-3: {condition: service_healthy}
 
   # Consumes orders.checkout and the payment inbox; run as many as partitions
   order-processor:
@@ -76,7 +163,8 @@ services:
     env_file: .env
     environment: *app_env
     # Tables and the topic come from the Order Service's startup
-    depends_on: [order-service]
+    depends_on:
+      order-service-1: {condition: service_healthy}
 
   # Releases unpaid and leaked holds; several can run at once
   expiration-worker:
@@ -87,7 +175,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment: *app_env
-    depends_on: [order-service]
+    depends_on:
+      order-service-1: {condition: service_healthy}
 
 volumes:
   redis_data:
