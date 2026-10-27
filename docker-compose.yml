@@ -21,6 +21,10 @@ x-app-env: &app_env
   # The fake provider delivers webhooks through the gateway, as a real provider would
   # (PAYMENT_WEBHOOK_SECRET comes from .env)
   PAYMENT_WEBHOOK_URL: http://gateway/v1/payments/webhook
+  # Overridable from the shell for the Stage 9 load tests (load/flash.sh and
+  # load/backlog.sh set them); the defaults are the values in .env
+  PAYMENT_WINDOW_SECS: ${PAYMENT_WINDOW_SECS:-300}
+  PROCESSOR_MAX_PER_SEC: ${PROCESSOR_MAX_PER_SEC:-0}
 
 x-order-service: &order_service
   profiles: [app]

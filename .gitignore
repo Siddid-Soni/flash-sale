@@ -1,4 +1,4 @@
 /target
 __pycache__/
 migrations/.diesel_lock
-load/final/target
+load/*/target

@@ -1,0 +1,17 @@
+# Step 40: the overselling demonstration. A separate crate (like load/flash), run by
+# load/oversell_demo.sh. It uses its own PostgreSQL schema and Redis database, never the
+# application's tables or keys.
+[package]
+name = "oversell-demo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
+redis = { version = "1.7.1", features = ["tokio-comp", "connection-manager", "script"] }
+fastrand = "2"
+
+[workspace]

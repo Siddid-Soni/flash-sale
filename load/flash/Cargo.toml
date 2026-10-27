@@ -1,0 +1,23 @@
+# Load generator for the Stage 9 flash-sale tests (load/flash.sh and
+# load/backlog.sh run it). A separate crate, outside the main workspace, so the
+# application does not carry an HTTP client dependency. It talks HTTP only; the
+# one thing it shares with the application is the JWT format (HS256, `sub`,
+# `iat`, `exp`), signed here with the same secret.
+[package]
+name = "flash-load"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
+chrono = "0.4"
+fastrand = "2"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+
+[workspace]
