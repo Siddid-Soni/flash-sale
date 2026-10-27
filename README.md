@@ -19,16 +19,9 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 | Fake payment provider | A service of its own (`fake_payment_provider`, fixed address `172.28.0.50`), Stripe-like: the payment page `/fake-pay/{id}`, an HTTP API to create a session (idempotent), expire and refund, and signed webhooks with retries. Owns the `fakepay:*` Redis keys | `src/bin/fake_payment_provider.rs`, `src/payment/` |
 | PostgreSQL 16 | Durable record: `users`, `products`, `orders`, `payment_inbox` | `migrations/` |
 
-```
-Browser --> NGINX :8000 --> Order Service 1..3 --> Redis (checkout.lua)  -- 202 / 410 --> Browser
-                |                  |
-                |                  +--> Kafka orders.checkout --> Order Processor --> PostgreSQL
-                |                                                      |  ^   \--> HTTP API --> fake provider
-                |                                                      |  |                         |
-                +--> /fake-pay/ ------------------------------------------------------------------>|
-                +--> /v1/payments/webhook (provider's address only) --> Order Processor <-- webhook-+
-Expiration Worker --> PostgreSQL (decides), Redis (release.lua, settle_hold.lua), Kafka offsets (read only)
-```
+![Architecture: the hot path](docs/architecture.svg)
+
+The diagram shows only the hot path: checkout, status polling, the order pipeline, payment and expiry. Guest sessions, admin and the Order Service's PostgreSQL reads for sale details are left out.
 
 ### Request flow
 
@@ -137,17 +130,60 @@ cargo clippy --all-targets
 
 The integration tests use Redis database 15 and create a unique Kafka topic per run (it stays on the local broker). Do not run `cargo test` while the application containers are up: they share PostgreSQL's connections, the payment inbox and the Kafka consumer group (an order processor would handle the tests' payment events, a worker would settle their holds), and the expiry lag test fails. The frontend has its own checks: `cd web && npm test && npm run budgets`. The tests start the fake provider's API and payment page on a free port of their own, so nothing but PostgreSQL, Redis and Kafka needs to run. `gateway/smoke.sh` checks the gateway end to end against the running stack (including that the webhook is refused from the host and a full purchase through the provider and the order processor); it creates a 5-unit sale and briefly stops `order-service-2` to test failover.
 
-## Load tests
+## Benchmarks
 
-[load/README.md](load/README.md) describes the scripts; every run appends its settings, latency table and checks to [load/RESULTS.md](load/RESULTS.md).
+Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Full output, settings and checks: [load/RESULTS.md](load/RESULTS.md); how to run them: [load/README.md](load/README.md).
 
-| Script | What it shows | Result (one machine, 20 cores) |
-|---|---|---|
-| `load/flash.sh 100000` | 100,000 users arrive within 10 s for 500 units, through NGINX and three replicas | Checkout: 500 `202`, 99,500 `410`; peak 10,153 req/s, p50 1.1 ms, p95 13.4 ms, p99 78.6 ms; 0 rate-limit answers, 0 5xx, 0 network failures; every invariant check passed (`products.sold` = `sold:{sale}` = `CONFIRMED` orders, never more than 500, no user with two orders, all abandoned stock returned) |
-| `load/backlog.sh` | A throttled processor builds a real queue; no `PENDING` hold is released and everyone gets the full payment window | 10,000 users and units at 200/s: slowest checkout-to-link 43 s against a 30 s window, 0 `FAILED` orders, least time left to pay when a link appeared 27.8 s of 30 s |
-| `load/oversell_demo.sh` | Five ways to decrement stock, 5,000 buyers for 500 units | Naive `SELECT` then `UPDATE` told all 5,000 yes; the other four sold exactly 500; Lua took 0.02 s, the conditional `UPDATE` 0.57 s, `FOR UPDATE` 4.61 s, optimistic 10.26 s |
+> These runs were made at commit `c973ece`. Since then the payment path changed (PostgreSQL decides payment versus expiry, the webhook goes to the order processor); checkout and status polling, the parts these numbers stress, are unchanged.
 
-These runs have limits (one machine, the 100,000 run measured once successfully, the backlog test at a tenth of its design point); [CASE_STUDY.md](CASE_STUDY.md) lists them.
+### Flash sale: 100,000 users within 10 s, 500 units (`load/flash.sh 100000`)
+
+| Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms | Responses |
+|---|---|---|---|---|---|---|---|
+| `GET /v1/sales/{id}` | 100,000 | 10,147 | 0.8 | 9.6 | 58.7 | 120.2 | 200: 100,000 |
+| `POST /v1/sales/{id}/checkout` | 100,000 | 10,153 | 1.1 | 13.4 | 78.6 | 140.8 | 202: 500, 410: 99,500 |
+| `GET /v1/orders/status/{ticket}` | 4,776 | 266 | 0.9 | 6.4 | 24.2 | 109.2 | 200: 4,776 |
+| `POST /fake-pay/{session}/pay` | 280 | 47 | 1.3 | 5.4 | 12.2 | 17.5 | 303: 276, 410: 4 |
+
+- Exactly 500 units reserved; outcome 265 `CONFIRMED`, 224 `EXPIRED` (stock returned), 11 `REFUNDED` (paid at the deadline and lost the race to expiry, by design).
+- 0 rate-limit answers, 0 server errors, 0 network failures.
+- Checkout to payment link: p50 1.3 s, p95 2.4 s, max 2.8 s.
+- Checks passed: `products.sold` = `sold:{sale}` = `CONFIRMED` orders, never above 500; no user with two live orders; every abandoned hold released and its stock returned.
+
+### Flash sale: 10,000 users within 10 s, 500 units (`load/flash.sh 10000`)
+
+| Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms |
+|---|---|---|---|---|---|---|
+| `GET /v1/sales/{id}` | 10,000 | 1,041 | 0.2 | 0.5 | 0.8 | 7.2 |
+| `POST /v1/sales/{id}/checkout` | 10,000 | 1,041 | 0.3 | 2.3 | 4.3 | 9.3 |
+| `GET /v1/orders/status/{ticket}` | 4,522 | 255 | 0.7 | 1.3 | 1.5 | 4.1 |
+
+Outcome 283 `CONFIRMED`, 210 `EXPIRED`, 7 `REFUNDED`; 0 errors; all checks passed.
+
+### Backlog: processors throttled to 200 messages/s, 10,000 users and units (`load/backlog.sh`)
+
+The queue takes about 50 s to drain while the payment window is 30 s, so the test shows that a backlog never costs anyone their window.
+
+| Measure | Result |
+|---|---|
+| Slowest checkout to payment link | 43.1 s (longer than the 30 s window) |
+| Least time left to pay when a link appeared | 27.8 s of 30 s |
+| `PENDING` holds released while queued | 0 (0 `FAILED` orders) |
+| Status polls | 237,456 at up to 5,072 req/s, p99 2.7 ms |
+| Outcome | 4,942 `CONFIRMED` (every payer), 5,058 `EXPIRED` |
+
+### Oversell demo: five ways to sell 500 units to 5,000 concurrent buyers (`load/oversell_demo.sh`)
+
+PostgreSQL strategies share a pool of 50 connections (latency includes waiting for one); default isolation (`READ COMMITTED`).
+
+| Strategy | Told yes | Oversold | Seconds | Buyers/s | p99 ms | Notes |
+|---|---|---|---|---|---|---|
+| Naive `SELECT` then `UPDATE` | 5,000 | **4,500** | 4.24 | 1,179 | 4,201 | lost updates: the store recorded only 116 decrements |
+| `SELECT ... FOR UPDATE` | 500 | no | 4.61 | 1,086 | 4,566 | row-lock waits up to 528 ms |
+| `FOR UPDATE`, `lock_timeout` 20 ms | 500 | no | 2.53 | 1,976 | 2,505 | 2,313 buyers gave up on lock timeouts |
+| Optimistic `version` column | 500 | no | 10.26 | 487 | 10,257 | 12,800 retries |
+| `UPDATE ... WHERE stock > 0` | 500 | no | 0.57 | 8,787 | 565 | one statement, one hot row |
+| Redis Lua script | 500 | no | 0.02 | 208,225 | 19.8 | what checkout uses |
 
 ## Repository layout
 
