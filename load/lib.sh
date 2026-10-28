@@ -12,7 +12,7 @@ rcli() { docker compose exec -T redis redis-cli "$@" </dev/null; }
 # Start the stack. Extra settings come from the environment of the caller
 # (PAYMENT_WINDOW_SECS, PROCESSOR_MAX_PER_SEC, GATEWAY_TRUST_XFF, ...).
 start_stack() {
-  docker compose up -d postgres redis kafka >/dev/null
+  docker compose up -d postgres redis redis-cache kafka >/dev/null
   docker compose --profile app up -d --build >/dev/null
   echo "Waiting for the gateway"
   local i

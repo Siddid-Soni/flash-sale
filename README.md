@@ -13,7 +13,7 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 | Order Service x3 | Stateless HTTP API of the case study and nothing else: `POST /v1/sales/{id}/checkout` and `GET /v1/orders/status/{ticket}`. Status is answered from the read cache only; its one PostgreSQL use is the `FAILED` claim when a Kafka publish fails | `src/bin/order_service.rs`, `src/api/checkout.rs`, `src/api/orders.rs` |
 | Site service | Everything else the storefront needs, so it can never take capacity, connections or database time from checkout: guest sessions, sale details, the sale list, search by name, admin sale creation. One replica with its own small PostgreSQL pool; reads Redis only for `sold_out`, writes it only when a sale is created | `src/bin/site.rs`, `src/api/` |
 | Redis (inventory) | Admission only: `stock:{sale}`, `user_live:{sale}:{user}`, the idempotency key and `sale_start:{sale}`; no per-ticket state, and it does not count sales, PostgreSQL is the record of those. Append-only file on | `scripts/*.lua`, `src/cache.rs` |
-| Redis (read cache) | `status:<ticket>`, what clients poll. The same instance locally (`READ_CACHE_URL`) | `src/cache.rs` |
+| Redis (read cache) | `status:<ticket>` and queue progress, what clients poll. Its own instance (`redis-cache`, host port 6380; `READ_CACHE_URL`), with AOF and `noeviction`: the status endpoint reads only this | `src/cache.rs` |
 | Kafka | Topic `orders.checkout` (6 partitions): checkout events from the Order Service to the processors | `src/queue.rs` |
 | Order Processor | Turns each checkout event into an order and a payment link; serves the provider's webhook (`POST /v1/payments/webhook` on `:8081`) and confirms or refunds a paid order at once; retries unprocessed payment events from the inbox | `src/bin/order_processor.rs`, `src/processor.rs`, `src/inbox.rs` |
 | Expiration Worker | Driven by PostgreSQL: expires the unpaid orders whose `expires_at` has passed in one batch `UPDATE`, then returns each order's unit to stock (`INCR stock`, clear `user_live`) once, and writes `EXPIRED` to the read cache and expires the payment session. The only place stock is returned (besides the Order Service's compensation for a failed publish) | `src/expiry.rs` |
@@ -38,7 +38,7 @@ The Order Service serves only checkout and status, on Redis and Kafka; it reache
 Needs Docker with compose v2. The first build compiles the Rust binaries and the frontend, so it takes a while.
 
 ```bash
-docker compose up -d                          # PostgreSQL 16, Redis 7, Kafka
+docker compose up -d                          # PostgreSQL 16, two Redis 7 (inventory, read cache), Kafka
 docker compose --profile app up -d --build    # + 3 Order Services, site service, order processor, expiration worker, fake payment provider (:8090), NGINX (:8000)
 ```
 
@@ -89,7 +89,7 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `BIND_ADDR` | `127.0.0.1:8080` | Where the Order Service listens (`0.0.0.0:8080` in containers) |
 | `SITE_BIND_ADDR` | `127.0.0.1:8082` | Where the site service listens (`0.0.0.0:8082` in containers) |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Inventory Redis: stock, `user_live`, idempotency keys, sale start times. The fake provider keeps its `fakepay:*` keys in it too (and nothing else touches them) |
-| `READ_CACHE_URL` | `REDIS_URL` | Read cache Redis: `status:<ticket>` and queue progress. Separate cluster in production |
+| `READ_CACHE_URL` | `REDIS_URL` | Read cache Redis: `status:<ticket>` and queue progress. Its own instance in compose (`redis-cache`, `redis://127.0.0.1:6380` from the host); must not evict |
 | `REDIS_CONNECTIONS` | `8` | Redis connections per Order Service (each multiplexes many requests) |
 | `KAFKA_BROKERS` | `localhost:9092` | Bootstrap servers |
 | `CHECKOUT_TOPIC` | `orders.checkout` | Topic for checkout events |

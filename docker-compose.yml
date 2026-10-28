@@ -12,8 +12,11 @@ networks:
 # the expiration worker and the fake payment provider
 x-app-env: &app_env
   DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
+  # Two Redis instances with different jobs: inventory (checkout's Lua scripts)
+  # and the read cache (status entries, polled by every winner), so a storm of
+  # status polls never slows the stock decrement
   REDIS_URL: redis://redis:6379
-  READ_CACHE_URL: redis://redis:6379
+  READ_CACHE_URL: redis://redis-cache:6379
   KAFKA_BROKERS: kafka:29092
   BIND_ADDR: 0.0.0.0:8080
   SITE_BIND_ADDR: 0.0.0.0:8082
@@ -62,6 +65,8 @@ services:
     ports:
       - 5432:5432
 
+  # Inventory: stock, user_live, idempotency keys, sale_start (and the fake
+  # provider's own keys)
   redis:
     image: redis:7-alpine
     restart: always
@@ -70,6 +75,18 @@ services:
       - 6379:6379
     volumes:
       - redis_data:/data
+
+  # Read cache: status:<ticket> and processor progress. The status endpoint
+  # reads only this, never PostgreSQL, so it must not drop entries: AOF and
+  # noeviction (every entry expires by its own TTL)
+  redis-cache:
+    image: redis:7-alpine
+    restart: always
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - 6380:6379
+    volumes:
+      - redis_cache_data:/data
 
   kafka:
     image: apache/kafka:4.2.0
@@ -102,7 +119,7 @@ services:
 
   # Three identical Order Service replicas behind the gateway: checkout and
   # order status only. Their DB pool is small: those never touch PostgreSQL
-  # except on rare paths (the status fallback, the FAILED claim), and Postgres
+  # except on one rare path (the FAILED claim when a publish fails), and Postgres
   # allows 100 connections in all. Replica 1 starts
   # first because it runs the migrations and creates the topic; 2 and 3 wait
   # for it to be healthy so the three do not race on them.
@@ -115,6 +132,7 @@ services:
     depends_on:
       postgres: {condition: service_started}
       redis: {condition: service_started}
+      redis-cache: {condition: service_started}
       kafka: {condition: service_started}
 
   order-service-2:
@@ -239,8 +257,8 @@ services:
       order-service-1: {condition: service_healthy}
       fake-payment-provider: {condition: service_healthy}
 
-  # Settles holds at their payment deadline (releases the unpaid, counts the
-  # paid) and releases leaked ones; several can run at once
+  # Expires unpaid orders past their deadline in PostgreSQL and returns their
+  # stock, once; several can run at once
   expiration-worker:
     profiles: [app]
     build: .
@@ -255,4 +273,5 @@ services:
 
 volumes:
   redis_data:
+  redis_cache_data:
   kafka_data:
