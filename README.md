@@ -9,23 +9,24 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 | Component | What it does | Code |
 |---|---|---|
 | Client | Preact app: countdown, buy button (locks on the first click), queue and payment states, status polling every 2 s | `web/` |
-| Gateway | NGINX on `:8000`: serves the frontend, balances `/v1/` over three replicas, rate limits, bot filter, hides `/v1/admin/`, caches sale details for 1 s, sends `/fake-pay/` to the provider and the webhook (from the provider's address only) to the order processors | `gateway/` |
-| Order Service x3 | Stateless HTTP API: guest sessions, sale details, checkout, order status, admin | `src/bin/order_service.rs`, `src/api/` |
+| Gateway | NGINX on `:8000`: serves the frontend, sends checkout and status to three Order Service replicas (least connections, failover) and sessions, sale details, the list, search and admin to the site service, rate limits, bot filter, hides `/v1/admin/`, caches the site's sale routes at the edge (details 1 s, list and search 5 s), sends the webhook (from the provider's address only) to the order processors. The payment page is not behind it | `gateway/` |
+| Order Service x3 | Stateless HTTP API of the case study and nothing else: `POST /v1/sales/{id}/checkout` and `GET /v1/orders/status/{ticket}`. Its PostgreSQL use is the rare paths (status fallback, the `FAILED` claim) | `src/bin/order_service.rs`, `src/api/checkout.rs`, `src/api/orders.rs` |
+| Site service | Everything else the storefront needs, so it can never take capacity, connections or database time from checkout: guest sessions, sale details, the sale list, search by name, admin sale creation. One replica with its own small PostgreSQL pool; reads Redis only for `sold_out`, writes it only when a sale is created | `src/bin/site.rs`, `src/api/` |
 | Redis (inventory) | Admission only: `stock:{sale}`, `user_live:{sale}:{user}`, the idempotency key and `sale_start:{sale}`; no per-ticket state, and it does not count sales, PostgreSQL is the record of those. Append-only file on | `scripts/*.lua`, `src/cache.rs` |
 | Redis (read cache) | `status:<ticket>`, what clients poll. The same instance locally (`READ_CACHE_URL`) | `src/cache.rs` |
 | Kafka | Topic `orders.checkout` (6 partitions): checkout events from the Order Service to the processors | `src/queue.rs` |
 | Order Processor | Turns each checkout event into an order and a payment link; serves the provider's webhook (`POST /v1/payments/webhook` on `:8081`) and confirms or refunds a paid order at once; retries unprocessed payment events from the inbox | `src/bin/order_processor.rs`, `src/processor.rs`, `src/inbox.rs` |
 | Expiration Worker | Driven by PostgreSQL: expires the unpaid orders whose `expires_at` has passed in one batch `UPDATE`, then returns each order's unit to stock (`INCR stock`, clear `user_live`) once, and writes `EXPIRED` to the read cache and expires the payment session. The only place stock is returned (besides the Order Service's compensation for a failed publish) | `src/expiry.rs` |
-| Fake payment provider | A service of its own (`fake_payment_provider`, fixed address `172.28.0.50`), Stripe-like: the payment page `/fake-pay/{id}`, an HTTP API to create a session (idempotent), expire and refund, and signed webhooks with retries. Owns the `fakepay:*` Redis keys | `src/bin/fake_payment_provider.rs`, `src/payment/` |
+| Fake payment provider | A service of its own (`fake_payment_provider`, fixed address `172.28.0.50`), Stripe-like: the payment page `/fake-pay/{id}`, published on its own port `localhost:8090` and outside the gateway (as a real provider is), an HTTP API to create a session (idempotent), expire and refund, and signed webhooks with retries. Owns the `fakepay:*` Redis keys | `src/bin/fake_payment_provider.rs`, `src/payment/` |
 | PostgreSQL 16 | Durable record, and the only place sales are counted (`products.sold`): `users`, `products`, `orders`, `payment_inbox` | `migrations/` |
 
 ![Architecture: the hot path](docs/architecture.svg)
 
-The diagram shows only the hot path: checkout, status polling, the order pipeline, payment and expiry. Guest sessions, admin and the Order Service's PostgreSQL reads for sale details are left out.
+The diagram shows only the hot path: checkout, status polling, the order pipeline, payment and expiry. The site service (sessions, sale details, list, search, admin) is left out.
 
 ### Request flow
 
-1. The client loads the app and `GET /v1/sales/{id}` (cached 1 s at the gateway), creates a guest session with `POST /v1/session`, and waits for the start time.
+1. The client loads the app and `GET /v1/sales/{id}` (the site service, cached 1 s at the gateway), creates a guest session with `POST /v1/session`, and waits for the start time.
 2. `POST /v1/sales/{id}/checkout` with an `Idempotency-Key`. `checkout.lua` runs once in Redis: it checks the start time, the key, one-per-user and stock, then takes one unit and sets `user_live` (with a TTL that outlives the sale) and the idempotency key. Nothing else is stored in Redis for the ticket. No unit means `409` or `410`.
 3. The Order Service publishes the checkout event to Kafka (`acks=all`, idempotent producer; the event carries the ticket, sale, user, checkout time and idempotency key), stores `status:<ticket>` as `PENDING` and answers `202 {queue_ticket_id, status_url}`. If the publish fails, PostgreSQL decides: the ticket is inserted as a `FAILED` order (`ON CONFLICT DO NOTHING`), and only if that insert created the row does the Order Service return the unit and forget the key, then answer `503`. If a row already existed (the message reached Kafka after all) the answer is the normal `202`.
 4. An order processor creates the payment session and inserts the order directly as `AWAITING_PAYMENT` (with the session, link and deadline in one `INSERT`; the 5-minute payment window starts here, not at checkout). It touches no Redis inventory key. If the ticket's row is already `FAILED` it expires the session and stops. `PENDING`, the state while the message waits in Kafka, exists only in the read cache, never in PostgreSQL. The client, polling the status endpoint, gets `payment_url` and goes to pay.
@@ -38,7 +39,7 @@ Needs Docker with compose v2. The first build compiles the Rust binaries and the
 
 ```bash
 docker compose up -d                          # PostgreSQL 16, Redis 7, Kafka
-docker compose --profile app up -d --build    # + 3 Order Services, order processor, expiration worker, fake payment provider, NGINX
+docker compose --profile app up -d --build    # + 3 Order Services, site service, order processor, expiration worker, fake payment provider (:8090), NGINX (:8000)
 ```
 
 Open <http://localhost:8000>. There is no sale yet; create one from inside the gateway container (the host is refused with `403` on purpose). This opens in one minute:
@@ -50,29 +51,30 @@ docker compose exec -T gateway wget -qO- \
   http://127.0.0.1/v1/admin/sales
 ```
 
-The answer contains the sale `id`. `http://localhost:8000/` lists the sales; each links to its page, `http://localhost:8000/?sale=<id>`. `dev-admin-token` is `ADMIN_TOKEN` in `.env`. Pay on the fake payment page (served by the provider container through the gateway); the webhook arrives within a second or so and the order becomes `CONFIRMED`.
+The answer contains the sale `id`. `http://localhost:8000/` lists the sales; each links to its page, `http://localhost:8000/?sale=<id>`. `dev-admin-token` is `ADMIN_TOKEN` in `.env`. `http://localhost:8000/` also has a search box (`GET /v1/sales/search?q=`). Pay on the fake payment page: the link in the order status is the provider's own address, `http://localhost:8090/fake-pay/...`, outside the gateway; its "Back to the sale" link returns to the frontend (`FRONTEND_URL`). The webhook arrives within a second or so and the order becomes `CONFIRMED`.
 
-Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
+Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
 
 ## Running locally with cargo
 
 ```bash
 docker compose up -d                  # infrastructure only
 cargo run --bin order_service         # :8080; runs the migrations and creates the topic, so start it first
+cargo run --bin site                  # :8082; sessions, sales, search, admin
 cargo run --bin fake_payment_provider # :8090; the payment page and the provider API, delivers webhooks
 cargo run --bin order_processor       # :8081 serves the webhook (the provider posts to it directly)
 cargo run --bin expiration_worker
 ```
 
-`.env` holds the development values and is loaded by every binary (`PUBLIC_BASE_URL=http://localhost:8080`, the payment page at `PAYMENT_PAGE_BASE_URL=http://localhost:8090`, the provider's API at `PAYMENT_PROVIDER_URL=http://127.0.0.1:8090`, webhooks to `PAYMENT_WEBHOOK_URL=http://127.0.0.1:8081/v1/payments/webhook`). Without the gateway, call the API on `:8080` directly, including the admin route:
+`.env` holds the development values and is loaded by every binary (`PUBLIC_BASE_URL=http://localhost:8080`, the payment page at `PAYMENT_PAGE_BASE_URL=http://localhost:8090`, the provider's API at `PAYMENT_PROVIDER_URL=http://127.0.0.1:8090`, webhooks to `PAYMENT_WEBHOOK_URL=http://127.0.0.1:8081/v1/payments/webhook`). Without the gateway, call the services directly: checkout and status on `:8080`, everything else, including the admin route, on `:8082`:
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/admin/sales -H 'X-Admin-Token: dev-admin-token' \
+curl -s -X POST http://localhost:8082/v1/admin/sales -H 'X-Admin-Token: dev-admin-token' \
   -H 'Content-Type: application/json' \
   -d "{\"name\":\"Phone\",\"price_cents\":49900,\"total_inventory\":500,\"sale_start_time\":\"$(date -u -d '+60 seconds' +%FT%TZ)\"}"
 ```
 
-Frontend with hot reload: `cd web && npm install && npm run dev` (<http://localhost:5173>, proxies `/v1` to `:8080`; `/fake-pay` is proxied to `:8080` too, but locally the provider serves it on `:8090`, so open payment links as given, `http://localhost:8090/fake-pay/...`). Set `FRONTEND_URL=http://localhost:5173` in `.env` so the payment page sends the browser back to the Vite server. More in [web/README.md](web/README.md).
+Frontend with hot reload: `cd web && npm install && npm run dev` (<http://localhost:5173>, proxies the site routes to `:8082` and the rest of `/v1` to `:8080`, as the gateway does; payment links point at the provider, `http://localhost:8090/fake-pay/...`, and are opened directly). Set `FRONTEND_URL=http://localhost:5173` in `.env` so the payment page sends the browser back to the Vite server. More in [web/README.md](web/README.md).
 
 ## Configuration
 
@@ -85,6 +87,7 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `ADMIN_TOKEN` | required | Value of `X-Admin-Token` for `/v1/admin/*` (compared in constant time; empty never matches) |
 | `PAYMENT_WEBHOOK_SECRET` | required | HMAC-SHA256 key that signs webhooks (the provider) and verifies them (the order processor) |
 | `BIND_ADDR` | `127.0.0.1:8080` | Where the Order Service listens (`0.0.0.0:8080` in containers) |
+| `SITE_BIND_ADDR` | `127.0.0.1:8082` | Where the site service listens (`0.0.0.0:8082` in containers) |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Inventory Redis: stock, `user_live`, idempotency keys, sale start times. The fake provider keeps its `fakepay:*` keys in it too (and nothing else touches them) |
 | `READ_CACHE_URL` | `REDIS_URL` | Read cache Redis: `status:<ticket>` and queue progress. Separate cluster in production |
 | `REDIS_CONNECTIONS` | `8` | Redis connections per Order Service (each multiplexes many requests) |
@@ -92,7 +95,7 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `CHECKOUT_TOPIC` | `orders.checkout` | Topic for checkout events |
 | `CHECKOUT_PARTITIONS` | `6` | Partitions the topic is created with (an existing topic is left alone); the most processors that can share the work |
 | `KAFKA_DELIVERY_TIMEOUT_MS` | `30000` | How long the producer retries a publish before it reports failure (then the Order Service compensates and answers `503`) |
-| `DB_POOL_SIZE` | `10` | PostgreSQL connections per process (compose gives each Order Service 5). The order processor needs at least 2 |
+| `DB_POOL_SIZE` | `10` | PostgreSQL connections per process (compose gives each Order Service and the site service 5). The order processor needs at least 2 |
 | `JWT_TTL_SECS` | `3600` | Lifetime of a guest token |
 | `PAYMENT_WINDOW_SECS` | `300` | Time a user has to pay once the link is ready |
 | `PAYMENT_PROVIDER` | `fake` | Only `fake` is implemented; any other value stops the process at startup |
@@ -100,7 +103,7 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `PROVIDER_BIND_ADDR` | `127.0.0.1:8090` | Where `fake_payment_provider` listens (`0.0.0.0:8090` in compose) |
 | `FAKE_PAYMENT_DELAY_MS` | `2000` | Read but not used by any code; the fake provider's webhooks go out within about 250 ms |
 | `PUBLIC_BASE_URL` | `http://localhost:8080` | Where clients reach the API; the default of `PAYMENT_PAGE_BASE_URL` and `FRONTEND_URL` |
-| `PAYMENT_PAGE_BASE_URL` | `PUBLIC_BASE_URL` | Where users reach the provider's payment page; the page URL is `{PAYMENT_PAGE_BASE_URL}/fake-pay/{session}` (`.env` points it at the provider's own port, compose at the gateway) |
+| `PAYMENT_PAGE_BASE_URL` | `PUBLIC_BASE_URL` | Where users reach the provider's payment page; the page URL is `{PAYMENT_PAGE_BASE_URL}/fake-pay/{session}` (the provider's own port, `http://localhost:8090`, in `.env` and in compose: the provider is outside the gateway) |
 | `PAYMENT_WEBHOOK_URL` | `http://127.0.0.1:8081/v1/payments/webhook` | Where the fake provider delivers webhooks, plain `http://` only (compose: `http://gateway/v1/payments/webhook`, through the gateway to the order processors) |
 | `PROCESSOR_HTTP_ADDR` | `0.0.0.0:8081` | Where the order processor serves the webhook, `POST /v1/payments/webhook` (nothing else) |
 | `FRONTEND_URL` | `PUBLIC_BASE_URL` | Where the payment page returns the browser to (`/?sale=<id>`) |
@@ -131,7 +134,7 @@ The integration tests use Redis database 15 and create a unique Kafka topic per 
 
 ## Benchmarks
 
-Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Full output, settings and checks: [load/RESULTS.md](load/RESULTS.md); how to run them: [load/README.md](load/README.md).
+Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, the site service, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Full output, settings and checks: [load/RESULTS.md](load/RESULTS.md); how to run them: [load/README.md](load/README.md).
 
 > These runs were made at commit `c973ece`, before PostgreSQL took over the payment decision and before Redis stopped keeping holds (Stage 11). Checkout and status polling, the parts these numbers stress, only got lighter since (`checkout.lua` writes fewer keys); the load tests have not been rerun on the new design.
 
@@ -188,8 +191,8 @@ PostgreSQL strategies share a pool of 50 connections (latency includes waiting f
 
 | Path | Contents |
 |---|---|
-| `src/bin/` | The four binaries: `order_service`, `order_processor`, `expiration_worker`, `fake_payment_provider` |
-| `src/api/` | HTTP routes (`session`, `sales`, `checkout`, `orders`, `admin` for the Order Service; `payments`, the webhook, for the order processor) |
+| `src/bin/` | The five binaries: `order_service`, `site`, `order_processor`, `expiration_worker`, `fake_payment_provider` |
+| `src/api/` | HTTP routes (`checkout`, `orders` for the Order Service; `session`, `sales`, `admin` for the site service; `payments`, the webhook, for the order processor) |
 | `src/cache.rs` | Redis keys and the Rust wrappers around the Lua scripts |
 | `src/processor.rs`, `src/inbox.rs` | Checkout event handling with progress tracking; payment events: the decision between payment and deadline, confirm or refund, on receipt and on retry |
 | `src/expiry.rs` | Expiration worker logic: expire pass (PostgreSQL decides, Redis follows) and sweep |
@@ -202,7 +205,7 @@ PostgreSQL strategies share a pool of 50 connections (latency includes waiting f
 | `gateway/` | NGINX configuration, bot list, njs JWT reader, `smoke.sh` ([README](gateway/README.md)) |
 | `web/` | Preact + Vite storefront ([README](web/README.md)) |
 | `load/` | Load generator, backlog test, oversell demo, `RESULTS.md` ([README](load/README.md)) |
-| `docker-compose.yml`, `Dockerfile` | Infrastructure and the application image (all four binaries) |
+| `docker-compose.yml`, `Dockerfile` | Infrastructure and the application image (all five binaries) |
 
 ## More documents
 

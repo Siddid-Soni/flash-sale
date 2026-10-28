@@ -1,6 +1,6 @@
 # API Reference
 
-All examples go through the gateway at `http://localhost:8000` (see [README.md](README.md) to start the stack). Every route is under `/v1` except the fake provider's payment page. The Order Service replicas serve the routes under `/v1` except the webhook, which the order processors serve; the payment page is served by the fake provider's container. The gateway sends each to the right place. Bodies are JSON. Money is integer cents. Times are ISO 8601 in UTC.
+All examples go through the gateway at `http://localhost:8000` (see [README.md](README.md) to start the stack). Every route is under `/v1` except the fake provider's payment page. Four services answer: the **Order Service** replicas serve checkout and order status only (the case study's two endpoints); the **site service** serves sessions, sale details, the sale list, search and admin; the order processors serve the webhook; the fake provider's container serves the payment page, on its own address `http://localhost:8090`, outside the gateway. The gateway sends each `/v1` route to the right place. Bodies are JSON. Money is integer cents. Times are ISO 8601 in UTC.
 
 ## Conventions
 
@@ -31,24 +31,25 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 |---|---|---|
 | `Location` | checkout `200`/`202`, fake payment page `303` | Status URL / where the browser goes back to |
 | `Retry-After` | `503` from checkout, every `429`, gateway `503` | Seconds to wait (always `1`) |
-| `Cache-Control` | sale list and details `public, max-age=1, stale-while-revalidate=5`; status `no-store`; gateway errors `no-store` | |
-| `X-Replica` | every Order Service response when `REPLICA_ID` is set (compose sets `1`..`3`); not on the webhook or the payment page | Which replica answered |
-| `X-Cache-Status` | `GET /v1/sales/{id}` | NGINX cache result: `MISS`, `HIT`, `UPDATING`, `STALE` |
+| `Cache-Control` | sale details `public, max-age=1, stale-while-revalidate=5`; sale list and search `public, max-age=5, stale-while-revalidate=30`; status `no-store`; gateway errors `no-store` | |
+| `X-Replica` | every Order Service response when `REPLICA_ID` is set (compose sets `1`..`3`); not on the site service, the webhook or the payment page | Which replica answered |
+| `X-Cache-Status` | `GET /v1/sales`, `/v1/sales/{id}`, `/v1/sales/search` | NGINX cache result: `MISS`, `HIT`, `EXPIRED`, `UPDATING`, `STALE` |
 
 ## Routes
 
-| Method and path | Auth | Purpose |
-|---|---|---|
-| `POST /v1/session` | none | Create a guest session |
-| `GET /v1/sales` | none | The latest sales (home page) |
-| `GET /v1/sales/{sale_id}` | none | Sale details |
-| `POST /v1/sales/{sale_id}/checkout` | user | Reserve one unit |
-| `GET /v1/orders/status/{queue_ticket_id}` | user | Poll an order |
-| `POST /v1/payments/webhook` | provider's address and signature | Payment provider events (served by the order processors) |
-| `POST /v1/admin/sales` | `X-Admin-Token` | Create a sale |
-| `GET /fake-pay/{session_id}` | none | The fake provider's payment page (served by the provider) |
-| `POST /fake-pay/{session_id}/pay` | none | Pay |
-| `POST /fake-pay/{session_id}/cancel` | none | Cancel |
+| Method and path | Served by | Auth | Purpose |
+|---|---|---|---|
+| `POST /v1/session` | site | none | Create a guest session |
+| `GET /v1/sales` | site | none | The latest sales (home page) |
+| `GET /v1/sales/search?q=` | site | none | Search sales by name |
+| `GET /v1/sales/{sale_id}` | site | none | Sale details |
+| `POST /v1/admin/sales` | site | `X-Admin-Token` | Create a sale |
+| `POST /v1/sales/{sale_id}/checkout` | Order Service | user | Reserve one unit |
+| `GET /v1/orders/status/{queue_ticket_id}` | Order Service | user | Poll an order |
+| `POST /v1/payments/webhook` | order processors | provider's address and signature | Payment provider events |
+| `GET /fake-pay/{session_id}` | fake provider, `:8090` | none | The fake provider's payment page |
+| `POST /fake-pay/{session_id}/pay` | fake provider, `:8090` | none | Pay |
+| `POST /fake-pay/{session_id}/cancel` | fake provider, `:8090` | none | Cancel |
 
 ### `POST /v1/session`
 
@@ -66,7 +67,7 @@ curl -s -X POST http://localhost:8000/v1/session
 
 ### `GET /v1/sales`
 
-Public. The latest 50 sales, latest start time first, each with the same fields as `GET /v1/sales/{sale_id}`. Cached by the gateway like the details; read from PostgreSQL (one query) and Redis (one `MGET` for `sold_out`) on a miss.
+Public, served by the site service. The latest 50 sales, latest start time first, each with the same fields as `GET /v1/sales/{sale_id}`. Cached by the gateway for 5 s (a new sale shows within about 5 s, nothing is purged; the query string is ignored); read from PostgreSQL (one query) and Redis (one `MGET` for `sold_out`) on a miss.
 
 ```bash
 curl -s http://localhost:8000/v1/sales
@@ -74,11 +75,23 @@ curl -s http://localhost:8000/v1/sales
 
 | Status | Body and headers |
 |---|---|
-| `200` | `[{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}, ...]` (`[]` when there are none); `Cache-Control: public, max-age=1, stale-while-revalidate=5`, `X-Cache-Status` |
+| `200` | `[{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}, ...]` (`[]` when there are none); `Cache-Control: public, max-age=5, stale-while-revalidate=30`, `X-Cache-Status` |
+
+### `GET /v1/sales/search?q=`
+
+Public, served by the site service. The sales whose name contains `q`, any case, in the shape and order of the list, at most 50. The server trims `q`, lowercases it and uses its first 64 characters; `%`, `_` and `\` in it match themselves, not as wildcards. An empty or missing `q` answers like `GET /v1/sales`. Cached by the gateway for 5 s per `q` (other query parameters are ignored); a per-IP limit of 5 r/s (burst 20) applies, over which the gateway answers `429`.
+
+```bash
+curl -s 'http://localhost:8000/v1/sales/search?q=phone'
+```
+
+| Status | Body and headers |
+|---|---|
+| `200` | The same array as the list (`[]` when nothing matches); `Cache-Control: public, max-age=5, stale-while-revalidate=30`, `X-Cache-Status` |
 
 ### `GET /v1/sales/{sale_id}`
 
-Public. Cached by the gateway for 1 to 2 seconds (NGINX counts whole seconds) and by each replica for 1 second; the query string is ignored.
+Public, served by the site service. Cached by the gateway for 1 to 2 seconds (NGINX counts whole seconds) and by the site process for 1 second; the query string is ignored.
 
 ```bash
 curl -si http://localhost:8000/v1/sales/1
@@ -145,7 +158,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 
 ```json
 {"status": "PENDING", "position": 42}
-{"status": "AWAITING_PAYMENT", "payment_url": "http://localhost:8000/fake-pay/fake_cs_3f2a...", "expires_at": "2026-10-28T20:05:01.234Z"}
+{"status": "AWAITING_PAYMENT", "payment_url": "http://localhost:8090/fake-pay/fake_cs_3f2a...", "expires_at": "2026-10-28T20:05:01.234Z"}
 {"status": "CONFIRMED"}
 ```
 
@@ -201,7 +214,7 @@ That event is made up, but it is stored and a processor keeps retrying it becaus
 
 ### `POST /v1/admin/sales`
 
-Creates a product (the sale) and loads `stock:{id}` and `sale_start:{id}` into Redis (Redis does not count sales; `products.sold` in PostgreSQL does). From outside the compose network the gateway answers `403`; run it inside the gateway container.
+Served by the site service. Creates a product (the sale) and loads `stock:{id}` and `sale_start:{id}` into Redis (Redis does not count sales; `products.sold` in PostgreSQL does). From outside the compose network the gateway answers `403`; run it inside the gateway container.
 
 ```bash
 docker compose exec -T gateway wget -qO- \
@@ -220,7 +233,7 @@ Body: `name` (1-255 characters), `price_cents` (positive), `total_inventory` (1 
 
 ### Fake payment page
 
-`GET /fake-pay/{session_id}` is the page the user is sent to (`payment_url`): amount, ticket, deadline, a Pay and a Cancel button. It is served by the `fake_payment_provider` container (the gateway proxies `/fake-pay/` to it), is HTML with `Cache-Control: no-store`. `POST /fake-pay/{session_id}/pay` and `/cancel` settle the session and queue the webhook event.
+`GET /fake-pay/{session_id}` is the page the user is sent to (`payment_url`): amount, ticket, deadline, a Pay and a Cancel button. It is served by the `fake_payment_provider` container on its own address (`http://localhost:8090`, `PAYMENT_PAGE_BASE_URL`), not through the gateway, as a real provider's hosted page would be; it is HTML with `Cache-Control: no-store`. `POST /fake-pay/{session_id}/pay` and `/cancel` settle the session and queue the webhook event.
 
 | Status | Meaning |
 |---|---|
@@ -234,7 +247,7 @@ The provider does not know our deadline. It accepts a payment on any `OPEN` sess
 
 ### Fake provider API (internal)
 
-Not reachable through the gateway: the order processor and the expiration worker call it on the compose network (`PAYMENT_PROVIDER_URL`, `http://fake-payment-provider:8090`). It is shaped like Stripe's and every call is idempotent. Errors have the usual `{"message": ...}` body.
+Not routed by the gateway: only the order processor and the expiration worker call it, on the compose network (`PAYMENT_PROVIDER_URL`, `http://fake-payment-provider:8090`; the stand-in publishes one port, 8090, for the payment page, so this API is on the host too, which a real provider's would not be). It is shaped like Stripe's and every call is idempotent. Errors have the usual `{"message": ...}` body.
 
 | Call | Meaning |
 |---|---|
@@ -273,7 +286,7 @@ What a client sees from NGINX before the app answers (details in [gateway/README
 
 | Case | Answer |
 |---|---|
-| Over a rate limit | `429 {"message": "too many requests, retry after a moment"}` with `Retry-After: 1`. Limits: `POST /v1/session` 1 r/s per IP (burst 5); checkout 2 r/s per user (burst 5) and 20 r/s per IP (burst 40); status 2 r/s per user (burst 10); 100 concurrent connections per IP on `/v1/*` and `/fake-pay/*`. The webhook and static files are not limited |
+| Over a rate limit | `429 {"message": "too many requests, retry after a moment"}` with `Retry-After: 1`. Limits: `POST /v1/session` 1 r/s per IP (burst 5); `GET /v1/sales/search` 5 r/s per IP (burst 20); checkout 2 r/s per user (burst 5) and 20 r/s per IP (burst 40); status 2 r/s per user (burst 10); 100 concurrent connections per IP on `/v1/*`. The webhook and static files are not limited |
 | Empty `User-Agent`, or one containing `bot`, `crawler`, `spider`, or matching `python-requests`, `python-urllib`, `go-http-client`, `scrapy`, `headlesschrome`, `phantomjs` | `403 {"message": "automated clients are not allowed"}` on `/v1/` (not the webhook). `curl` and `wget` pass |
 | `/v1/admin/*` from outside the compose network (the host included, also with a forged `X-Forwarded-For`) | `403 {"message": "admin routes are only reachable from the internal network"}` |
 | `/v1/payments/webhook` from any address but the payment provider's (the host included, also with a forged `X-Forwarded-For`) | `403 {"message": "the payment webhook is only reachable from the payment provider"}` |

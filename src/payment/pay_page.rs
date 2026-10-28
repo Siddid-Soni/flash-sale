@@ -2,8 +2,9 @@
 //! 19), served by the `fake_payment_provider` binary. It stands in for the
 //! page Stripe hosts: the user sees the amount and pays or cancels with a
 //! plain HTML form, and the browser is sent back to the sale
-//! (`{FRONTEND_URL}/?sale=<id>`, where the frontend resumes). The gateway
-//! proxies `/fake-pay/` to the provider.
+//! (`{FRONTEND_URL}/?sale=<id>`, where the frontend resumes). The browser
+//! opens it on the provider's own port (`PAYMENT_PAGE_BASE_URL`); the gateway
+//! does not proxy it.
 //!
 //! The page reads and writes sessions only through `FakeProvider`. It does
 //! not call the backend: pressing a button settles the session and queues a

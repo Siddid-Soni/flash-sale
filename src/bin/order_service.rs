@@ -1,8 +1,9 @@
-//! The Order Service: the stateless HTTP API (guest sessions, sale details,
-//! checkout and order status, admin). Any number of replicas can run. It owns
-//! the database migrations and the checkout topic, so it starts before the
-//! other binaries. The payment webhook is served by the order processor and the
-//! payment page by the fake provider, each in its own container.
+//! The Order Service: the stateless HTTP API of the case study, checkout and
+//! order status, nothing else. Any number of replicas can run. It owns the
+//! database migrations and the checkout topic, so it starts before the other
+//! binaries. Sessions, sales and admin are the `site` service's; the payment
+//! webhook is served by the order processor and the payment page by the fake
+//! provider, each in its own container.
 //!
 //! Usage: `cargo run --bin order_service`
 
@@ -13,8 +14,8 @@ use std::time::Duration;
 use actix_web::{middleware, web, App, HttpServer};
 
 use flash_sale::{
-    api::{self, checkout::SoldOutFlags, orders::ProgressCache, sales::SaleCache},
-    cache, challenge,
+    api::{self, checkout::SoldOutFlags, orders::ProgressCache},
+    cache,
     config::Config,
     db,
     queue,
@@ -47,14 +48,12 @@ async fn main() -> std::io::Result<()> {
     log::info!("Connected to Redis ({connections} connections each to inventory and read cache)");
     let next_connection = Arc::new(AtomicUsize::new(0));
 
-    let sale_cache = web::Data::new(SaleCache::default());
     let progress_cache = web::Data::new(ProgressCache::default());
 
     // One flag set and one refresher task per replica, shared by all workers
     let sold_out = web::Data::new(SoldOutFlags::default());
     actix_web::rt::spawn(api::checkout::run_refresher(sold_out.clone(), redis[0].clone()));
 
-    let challenge = web::Data::new(challenge::from_config(&config));
     let config = web::Data::new(config);
 
     let bind_addr = config.bind_addr.clone();
@@ -70,11 +69,9 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(redis[i].clone()))
             .app_data(web::Data::new(read_cache[i].clone()))
             .app_data(checkout_queue.clone())
-            .app_data(sale_cache.clone())
             .app_data(progress_cache.clone())
             .app_data(sold_out.clone())
             .app_data(config.clone())
-            .app_data(challenge.clone())
             .app_data(api::json_config())
             .app_data(api::query_config())
             .wrap(middleware::Logger::default())
@@ -83,7 +80,7 @@ async fn main() -> std::io::Result<()> {
                 replica_id.is_some(),
                 middleware::DefaultHeaders::new().add(("X-Replica", replica_id.clone().unwrap_or_default())),
             ))
-            .configure(api::configure)
+            .configure(api::configure_order_service)
     })
     // Sized so a burst queues in the kernel instead of being refused (see gateway/nginx.conf)
     .max_connections(max_connections)

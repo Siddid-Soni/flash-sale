@@ -150,8 +150,8 @@ pub fn fake_queue() -> (Arc<FakeQueue>, SharedQueue) {
     (fake, shared)
 }
 
-/// The app as `order_service` builds it, minus the logger and the sold-out
-/// refresher task (tests call `SoldOutFlags::refresh` themselves). Kafka is a
+/// The app as `order_service` builds it (checkout and status only), minus the
+/// logger and the sold-out refresher task (tests call `SoldOutFlags::refresh` themselves). Kafka is a
 /// `FakeQueue` unless a `SharedQueue` is passed as the second argument; a third, a
 /// `web::Data<SoldOutFlags>`, lets the test keep a handle to the flags. A
 /// macro because the service type returned by `init_service` cannot be named.
@@ -170,14 +170,32 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new($env.redis.clone()))
                 .app_data(actix_web::web::Data::new($env.read_cache.clone()))
                 .app_data(actix_web::web::Data::new($queue))
-                .app_data(actix_web::web::Data::new(flash_sale::api::sales::SaleCache::default()))
                 .app_data(actix_web::web::Data::new(flash_sale::api::orders::ProgressCache::default()))
                 .app_data($flags.clone())
+                .app_data(actix_web::web::Data::new($env.config.clone()))
+                .app_data(flash_sale::api::json_config())
+                .app_data(flash_sale::api::query_config())
+                .configure(flash_sale::api::configure_order_service),
+        )
+        .await
+    };
+}
+
+/// The app as the `site` binary builds it (sessions, sales, search, admin),
+/// minus the logger.
+#[macro_export]
+macro_rules! site_app {
+    ($env:expr) => {
+        actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(actix_web::web::Data::new($env.pool.clone()))
+                .app_data(actix_web::web::Data::new($env.redis.clone()))
+                .app_data(actix_web::web::Data::new(flash_sale::api::sales::SaleCache::default()))
                 .app_data(actix_web::web::Data::new($env.config.clone()))
                 .app_data(actix_web::web::Data::new(flash_sale::challenge::from_config(&$env.config)))
                 .app_data(flash_sale::api::json_config())
                 .app_data(flash_sale::api::query_config())
-                .configure(flash_sale::api::configure),
+                .configure(flash_sale::api::configure_site),
         )
         .await
     };

@@ -1,6 +1,6 @@
-# One image with every binary: the Order Service (`order_service`), the order
-# processor, the expiration worker and the fake payment provider
-# (`fake_payment_provider`). docker-compose.yml picks the command.
+# One image with every binary: the Order Service (`order_service`), the site
+# service (`site`), the order processor, the expiration worker and the fake
+# payment provider (`fake_payment_provider`). docker-compose.yml picks the command.
 
 FROM rust:1-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev && rm -rf /var/lib/apt/lists/*
@@ -12,7 +12,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bins && \
     mkdir -p /out && \
     cp target/release/order_service target/release/order_processor \
-       target/release/expiration_worker target/release/fake_payment_provider /out/
+       target/release/expiration_worker target/release/fake_payment_provider target/release/site /out/
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends libpq5 ca-certificates && rm -rf /var/lib/apt/lists/*

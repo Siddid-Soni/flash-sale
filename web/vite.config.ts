@@ -21,10 +21,12 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
-    // The Rust API and the fake payment page run on :8080.
+    // Two Rust services, as behind the gateway: the site service (:8082) takes sessions, sale
+    // details, the list, search and admin; checkout and order status stay on the Order Service
+    // (:8080). The payment page is the provider's own (:8090) and is opened directly.
     proxy: {
+      '^/v1/(session|admin/.*|sales(/search|/[0-9]+)?)(\\?.*)?$': { target: 'http://localhost:8082' },
       '/v1': { target: 'http://localhost:8080' },
-      '/fake-pay': { target: 'http://localhost:8080' },
     },
   },
   preview: {

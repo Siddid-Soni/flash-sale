@@ -11,9 +11,12 @@ npm install
 npm run dev
 ```
 
-Vite serves on <http://localhost:5173> and proxies `/v1` and `/fake-pay` to the
-Rust API at <http://localhost:8080>. `/` lists the latest sales
-(`GET /v1/sales`); `/?sale=<id>` is that sale's page.
+Vite serves on <http://localhost:5173> and proxies like the gateway: the site service's routes
+(`/v1/session`, `/v1/sales`, `/v1/sales/search`, `/v1/sales/<id>`, `/v1/admin/`) to <http://localhost:8082>, the rest of
+`/v1` (checkout, status) to the Order Service at <http://localhost:8080>. The payment page is the provider's own
+(`http://localhost:8090/fake-pay/...`), opened directly, so there is no `/fake-pay` proxy. `/` lists the latest sales
+(`GET /v1/sales`) with a search box (`GET /v1/sales/search?q=`, typed text trimmed and lowercased, sent 300 ms after the
+last key; empty shows the list); `/?sale=<id>` is that sale's page.
 
 ## Build
 
@@ -27,7 +30,7 @@ asset names and `/` as the base path (NGINX serves it, Stage 7).
 ## Tests and budgets
 
 ```bash
-npm test        # Vitest: response mapping, state, backoff, Retry-After, storage
+npm test        # Vitest: response mapping, state, search text, backoff, Retry-After, storage
 npm run budgets # raw + gzip size gate, then Lighthouse TTI when available
 ```
 

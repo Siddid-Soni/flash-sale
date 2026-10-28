@@ -4,8 +4,11 @@ use std::str::FromStr;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
-    /// Where the API listens; `0.0.0.0:8080` in a container
+    /// Where the Order Service listens; `0.0.0.0:8080` in a container
     pub bind_addr: String,
+    /// Where the `site` binary listens (sessions, sale details, list, search,
+    /// admin); `0.0.0.0:8082` in a container
+    pub site_bind_addr: String,
     /// Inventory Redis: stock, one-per-user markers, idempotency keys, sale
     /// start times. All inventory scripts run here and touch
     /// only inventory keys
@@ -21,6 +24,7 @@ pub struct Config {
     /// How long the producer retries a publish before reporting failure (after
     /// which the Order Service compensates and answers 503)
     pub kafka_delivery_timeout_ms: u32,
+    /// Connections in the PostgreSQL pool (the site service sets its own, small, value)
     pub db_pool_size: u32,
     /// Redis connections the API spreads its worker threads over. Each one
     /// multiplexes many requests, but a single one becomes the bottleneck
@@ -44,8 +48,9 @@ pub struct Config {
     pub public_base_url: String,
     /// Where users reach the provider's payment page: the fake provider builds
     /// the session URL `{PAYMENT_PAGE_BASE_URL}/fake-pay/{session}` from it.
-    /// Default `PUBLIC_BASE_URL` (the gateway proxies `/fake-pay/` to the
-    /// provider); a local run without the gateway uses the provider's own port
+    /// The provider sits outside the gateway, so this is the provider's own
+    /// address (`http://localhost:8090`). Default `PUBLIC_BASE_URL`, which fits
+    /// only a setup that proxies `/fake-pay/` to the provider
     pub payment_page_base_url: String,
     /// Where the fake provider sends its webhooks: an order processor, through
     /// the gateway in compose (`http://gateway/v1/payments/webhook`). Default
@@ -98,6 +103,7 @@ impl Config {
         Self {
             database_url: required("DATABASE_URL"),
             bind_addr: or_default("BIND_ADDR", "127.0.0.1:8080".to_string()),
+            site_bind_addr: or_default("SITE_BIND_ADDR", "127.0.0.1:8082".to_string()),
             redis_url: redis_url.clone(),
             read_cache_url: or_default("READ_CACHE_URL", redis_url),
             kafka_brokers: or_default("KAFKA_BROKERS", "localhost:9092".to_string()),

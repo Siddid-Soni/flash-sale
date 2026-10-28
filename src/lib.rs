@@ -1,4 +1,4 @@
-//! Shared code for the Order Service and the background workers in `src/bin/`.
+//! Shared code for the Order Service, the site service and the background workers in `src/bin/`.
 
 pub mod actions;
 pub mod api;

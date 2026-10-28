@@ -13,8 +13,9 @@
 //! - `POST /v1/refunds`: body `{session_id}`. `200` for a paid session, and
 //!   again for one already refunded; `409` for a session that was not paid.
 //!
-//! These routes are on the provider's own port, reached over the compose
-//! network; the gateway proxies only the payment page (`/fake-pay/`).
+//! These routes are on the provider's own port, which also serves the payment
+//! page. The gateway proxies none of it (the provider sits outside the
+//! gateway); the backend reaches them over the compose network.
 
 use actix_web::{post, web, HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};

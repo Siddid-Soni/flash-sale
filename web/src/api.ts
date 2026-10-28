@@ -47,6 +47,24 @@ export async function fetchSales(): Promise<SaleResult> {
   }
 }
 
+/** `GET /v1/sales/search?q=`: sales whose name contains `q` (already normalised, see `normalizeQuery`). */
+export async function fetchSearch(q: string): Promise<SaleResult> {
+  try {
+    const response = await fetch(`/v1/sales/search?q=${encodeURIComponent(q)}`, {
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    const body = await readJsonResponse(response);
+    if (!response.ok) {
+      return { ok: false, message: errorMessage(body, `Could not search the sales (${response.status}).`) };
+    }
+    return { ok: true, body };
+  } catch {
+    return { ok: false, message: 'Could not reach the server. Check your connection.' };
+  }
+}
+
 /** `POST /v1/session`; throws with a readable message on failure. */
 export async function createGuestSession(): Promise<unknown> {
   let response: Response;

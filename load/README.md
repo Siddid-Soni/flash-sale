@@ -20,14 +20,16 @@ before the sale; `SESSION_SAMPLE` (default 50) users call `POST /v1/session` for
   generator sends a distinct `X-Forwarded-For` (`10.x.y.z` from the user's index) and a browser-like `User-Agent`;
   otherwise every request would come from the bridge address and meet the per-IP limits by design.
 - The sale is created from inside the gateway container (`docker compose exec -T gateway wget ...`), because
-  `/v1/admin/` is refused from the host.
+  `/v1/admin/` is refused from the host; the gateway routes it to the `site` service, as it does sessions and sale details.
+- Payers follow the `payment_url` they were given: the fake provider's own address, `http://localhost:8090`, outside the
+  gateway (`PROVIDER_URL` overrides the host the generator posts to).
 - The generator honours `429` + `Retry-After`, and retries `503`, other 5xx and network errors with jittered backoff
   and the same `Idempotency-Key`.
 - Test settings are environment variables that `docker-compose.yml` passes on (`PAYMENT_WINDOW_SECS` default 300,
   `PROCESSOR_MAX_PER_SEC` default 0 = unlimited). The scripts set `PAYMENT_WINDOW_SECS=30` and restore the defaults
   (and the gateway without X-Forwarded-For trust) when they end.
 - Do not run `cargo test` while the app containers are up. Stop only the app with
-  `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 order-processor expiration-worker`
+  `docker compose --profile app stop gateway site order-service-1 order-service-2 order-service-3 order-processor expiration-worker fake-payment-provider`
   (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka).
 
 ## Running at 100,000

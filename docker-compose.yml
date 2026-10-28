@@ -8,18 +8,21 @@ networks:
         - subnet: 172.28.0.0/16
           gateway: 172.28.0.1
 
-# Shared by the Order Service replicas, the order processor, the expiration
-# worker and the fake payment provider
+# Shared by the Order Service replicas, the site service, the order processor,
+# the expiration worker and the fake payment provider
 x-app-env: &app_env
   DATABASE_URL: postgresql://actix:actix@postgres:5432/flash_sale
   REDIS_URL: redis://redis:6379
   READ_CACHE_URL: redis://redis:6379
   KAFKA_BROKERS: kafka:29092
   BIND_ADDR: 0.0.0.0:8080
-  # Clients (and the fake payment page's links) use the gateway's host port
+  SITE_BIND_ADDR: 0.0.0.0:8082
+  # Clients use the gateway's host port; the payment page's "back" link returns to it
   PUBLIC_BASE_URL: http://localhost:8000
   FRONTEND_URL: http://localhost:8000
-  PAYMENT_PAGE_BASE_URL: http://localhost:8000
+  # The payment provider sits outside the gateway, as a real one would: the browser opens
+  # the payment page at the provider's own published port (8090 below)
+  PAYMENT_PAGE_BASE_URL: http://localhost:8090
   # The processor and the worker call the provider's API on the compose network
   PAYMENT_PROVIDER_URL: http://fake-payment-provider:8090
   PROVIDER_BIND_ADDR: 0.0.0.0:8090
@@ -97,9 +100,10 @@ services:
   # The application: `docker compose --profile app up -d --build`. Without the
   # profile only the services above start, for running the app with cargo.
 
-  # Three identical Order Service replicas behind the gateway. Their DB pool is
-  # small: checkout and status never touch PostgreSQL (only sessions and admin
-  # do), and Postgres allows 100 connections in all. Replica 1 starts
+  # Three identical Order Service replicas behind the gateway: checkout and
+  # order status only. Their DB pool is small: those never touch PostgreSQL
+  # except on rare paths (the status fallback, the FAILED claim), and Postgres
+  # allows 100 connections in all. Replica 1 starts
   # first because it runs the migrations and creates the topic; 2 and 3 wait
   # for it to be healthy so the three do not race on them.
   order-service-1:
@@ -131,8 +135,32 @@ services:
     depends_on:
       order-service-1: {condition: service_healthy}
 
+  # The site service: sessions, sale details, the sale list, search and admin,
+  # so none of it can take capacity from checkout. One replica with its own
+  # small database pool; the gateway reaches it as site:8082 (no host port).
+  # It starts after replica 1, which runs the migrations.
+  site:
+    profiles: [app]
+    build: .
+    image: flash_sale
+    command: ["site"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      <<: *app_env
+      DB_POOL_SIZE: "5"
+    depends_on:
+      order-service-1: {condition: service_healthy}
+      redis: {condition: service_started}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8082'"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
   # NGINX: the one public entrance (http://localhost:8000). Serves the frontend,
-  # balances the API over the replicas, rate-limits, filters bots. See gateway/README.md.
+  # sends checkout and status to the replicas and the rest of the API to the site
+  # service, rate-limits, filters bots. See gateway/README.md.
   gateway:
     profiles: [app]
     build:
@@ -163,13 +191,15 @@ services:
       order-service-1: {condition: service_healthy}
       order-service-2: {condition: service_healthy}
       order-service-3: {condition: service_healthy}
-      fake-payment-provider: {condition: service_healthy}
+      site: {condition: service_healthy}
 
-  # The stand-in for Stripe, a service of its own: the payment page (the gateway
-  # proxies /fake-pay/ to it), the HTTP API the processor and the worker call
-  # (create session, expire, refund), and the delivery of its signed webhooks.
-  # It owns the fakepay:* keys in Redis. Its address is fixed because the
-  # gateway admits the webhook only from it (gateway/payment_provider_ips.conf).
+  # The stand-in for Stripe, a service of its own and outside the gateway: the
+  # payment page, published on the host at localhost:8090 (the browser opens it
+  # directly), the HTTP API the processor and the worker call on the compose
+  # network (create session, expire, refund), and the delivery of its signed
+  # webhooks, which come back in through the gateway. It owns the fakepay:* keys
+  # in Redis. Its address is fixed because the gateway admits the webhook only
+  # from it (gateway/payment_provider_ips.conf).
   fake-payment-provider:
     profiles: [app]
     build: .
@@ -178,6 +208,8 @@ services:
     restart: unless-stopped
     env_file: .env
     environment: *app_env
+    ports:
+      - 8090:8090
     networks:
       default:
         ipv4_address: 172.28.0.50

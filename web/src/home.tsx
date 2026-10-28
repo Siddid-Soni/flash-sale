@@ -1,10 +1,15 @@
 //! The home page (`/`): the latest sales, each linking to its sale page
-//! (`/?sale=<id>`). Read-only; no session is created here.
+//! (`/?sale=<id>`), with a search box (debounced, `GET /v1/sales/search`).
+//! Read-only; no session is created here.
 
 import { useEffect, useState } from 'preact/hooks';
-import { fetchSales } from './api';
+import { fetchSales, fetchSearch } from './api';
 import { formatCountdown, formatMoney, secondsLeft } from './logic/format';
+import { normalizeQuery } from './logic/search';
 import { parseSales, type Sale } from './logic/state';
+
+/** How long typing must pause before the search runs. */
+const SEARCH_DEBOUNCE_MS = 300;
 
 type List =
   | { kind: 'loading' }
@@ -21,6 +26,14 @@ export function Home() {
   const [list, setList] = useState<List>({ kind: 'loading' });
   const [now, setNow] = useState(() => Date.now());
   const [reloadNonce, setReloadNonce] = useState(0);
+  // What is typed, and the normalised text last settled on (empty = the normal list)
+  const [typed, setTyped] = useState('');
+  const [term, setTerm] = useState('');
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setTerm(normalizeQuery(typed)), SEARCH_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [typed]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -29,8 +42,9 @@ export function Home() {
 
   useEffect(() => {
     let cancelled = false;
-    setList({ kind: 'loading' });
-    void fetchSales().then((result) => {
+    // Keep showing the previous answer while a new search is on its way
+    setList((current) => (current.kind === 'ready' ? current : { kind: 'loading' }));
+    void (term === '' ? fetchSales() : fetchSearch(term)).then((result) => {
       if (cancelled) return;
       if (!result.ok) {
         setList({ kind: 'error', message: result.message });
@@ -46,7 +60,7 @@ export function Home() {
     return () => {
       cancelled = true;
     };
-  }, [reloadNonce]);
+  }, [term, reloadNonce]);
 
   return (
     <main class="page">
@@ -60,6 +74,22 @@ export function Home() {
         <p>ONE PER PERSON</p>
       </div>
       <h1 class="display display--small">Sales</h1>
+
+      <div class="search">
+        <label class="micro" for="sale-search">
+          Search sales
+        </label>
+        <input
+          id="sale-search"
+          class="search__input"
+          type="search"
+          value={typed}
+          maxLength={200}
+          autoComplete="off"
+          placeholder="Name of a sale"
+          onInput={(event) => setTyped(event.currentTarget.value)}
+        />
+      </div>
 
       {list.kind === 'loading' && <p class="micro sales__msg">Loading sales_</p>}
 
@@ -75,8 +105,17 @@ export function Home() {
 
       {list.kind === 'ready' && list.sales.length === 0 && (
         <div class="panel sales__msg">
-          <p class="panel__title">No sales yet</p>
-          <p class="note">Check back soon.</p>
+          {term === '' ? (
+            <>
+              <p class="panel__title">No sales yet</p>
+              <p class="note">Check back soon.</p>
+            </>
+          ) : (
+            <>
+              <p class="panel__title">No sales match</p>
+              <p class="note">Nothing is called “{term}”. Try a shorter or different name.</p>
+            </>
+          )}
         </div>
       )}
 
@@ -104,7 +143,7 @@ export function Home() {
 
       <footer class="footer">
         <p>VOLT STORE — FLASH SALES</p>
-        <p>THE LATEST 50 SALES</p>
+        <p>{term === '' ? 'THE LATEST 50 SALES' : 'UP TO 50 MATCHES'}</p>
       </footer>
     </main>
   );

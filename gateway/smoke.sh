@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Smoke test for the gateway (Stage 7). Needs the whole stack, including the fake
-# payment provider and the order processor behind it:
+# Smoke test for the gateway (Stage 7, routes of the site service Stage 12). Needs the
+# whole stack, including the site service, the fake payment provider (published on
+# localhost:8090, outside the gateway) and the order processor:
 #     docker compose --profile app up -d --build
 # Run from anywhere:  gateway/smoke.sh
 # Prints PASS or FAIL per check and exits non-zero if any check failed.
@@ -11,6 +12,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 BASE="${BASE:-http://localhost:8000}"
+PROVIDER="${PROVIDER:-http://localhost:8090}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-$(sed -n 's/^ADMIN_TOKEN=//p' .env 2>/dev/null | head -1)}"
 ADMIN_TOKEN="${ADMIN_TOKEN:-dev-admin-token}"
 BROWSER_UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
@@ -119,6 +121,26 @@ wait
 misses=$(cat "$TMP"/c* | grep -cE '^(MISS|EXPIRED)$'); stats=$(cat "$TMP"/c* | sort | uniq -c | awk '{printf "%s x%s ", $2, $1}'); rm -f "$TMP"/c*
 [ "$misses" = 1 ] && pass "cache: 40 concurrent requests on an expired entry reached the app once ($stats)" || fail "cache: 40 concurrent requests on an expired entry reach the app once" "$stats"
 
+# --- 4b. the sale list and search (site service, edge cache) ----------------------
+code1=$(call "$BASE/v1/sales"); s1=$(header x-cache-status); cc=$(header cache-control)
+code2=$(call "$BASE/v1/sales?x=$RANDOM"); s2=$(header x-cache-status)
+if [ "$code1" = 200 ] && [ "$code2" = 200 ] && [ -n "$s1" ] && [ "$s2" = HIT ] \
+    && [[ "$cc" == *max-age=5* && "$cc" == *stale-while-revalidate=30* ]]; then
+    pass "cache: GET /v1/sales is cached for 5 s and ignores other query parameters (${s1} then ${s2})"
+else
+    fail "cache: GET /v1/sales is cached for 5 s and ignores other query parameters" "got $code1/$s1 then $code2/$s2 ($cc)"
+fi
+Q="smoke%20phone"
+code1=$(call "$BASE/v1/sales/search?q=$Q"); s1=$(header x-cache-status); cc=$(header cache-control)
+found=$(jq -r --argjson id "$SALE" '[.[] | select(.id == $id)] | length' "$TMP/b" 2>/dev/null)
+code2=$(call "$BASE/v1/sales/search?q=$Q&x=$RANDOM"); s2=$(header x-cache-status)
+code3=$(call "$BASE/v1/sales/search?q=smoke%20tablet-$RANDOM"); s3=$(header x-cache-status)
+if [ "$code1" = 200 ] && [ "$found" = 1 ] && [[ "$cc" == *max-age=5* ]] && [ "$code2" = 200 ] && [ "$s2" = HIT ] && [ "$code3" = 200 ] && [ "$s3" = MISS ]; then
+    pass "search: finds the sale, caches per q (same q HIT with another parameter, new q MISS)"
+else
+    fail "search: finds the sale, caches per q" "status $code1/$code2/$code3, found $found, cache $s1/$s2/$s3, cache-control: $cc"
+fi
+
 # --- 5. load balancing ------------------------------------------------------
 # /v1/nothing is a 404 from the app: cheap, unlimited, and it carries X-Replica
 replicas_of() { # replicas_of N: prints the X-Replica of N parallel requests
@@ -163,9 +185,12 @@ code=$(call -X POST -H 'X-Forwarded-For: 172.28.0.50' -H 'Content-Type: applicat
 out=$(docker compose exec -T gateway wget -qO- --post-data '{}' --header 'Content-Type: application/json' \
     http://127.0.0.1/v1/payments/webhook 2>&1 </dev/null)
 [[ "$out" == *"403"* ]] && pass "webhook: from the gateway container (not the provider's address) it is 403" || fail "webhook: from the gateway container it is 403" "$out"
-# The payment page is the provider's, behind the gateway
+# The payment page is the provider's own, outside the gateway: published on its own port, and
+# not proxied by the gateway any more (there the path is just a frontend deep link)
+code=$(call "$PROVIDER/fake-pay/fake_cs_nothing")
+[ "$code" = 404 ] && grep -q 'does not exist' "$TMP/b" && pass "provider: $PROVIDER/fake-pay/ answers (unknown session: 404 page)" || fail "provider: $PROVIDER/fake-pay/ answers" "status $code"
 code=$(call "$BASE/fake-pay/fake_cs_nothing")
-[ "$code" = 404 ] && grep -q 'does not exist' "$TMP/b" && pass "provider: /fake-pay/ is served by the provider (unknown session: 404 page)" || fail "provider: /fake-pay/ is served by the provider" "status $code"
+! grep -q 'does not exist' "$TMP/b" && pass "provider: the gateway does not serve /fake-pay/ (the path falls through to the frontend: $code)" || fail "provider: the gateway does not serve /fake-pay/" "status $code"
 
 # --- 7. failover ------------------------------------------------------------
 docker compose --profile app stop order-service-2 >/dev/null 2>&1
@@ -223,9 +248,13 @@ poll_until() { # poll_until STATUS SECONDS
 if [ -n "$ticket" ] && poll_until AWAITING_PAYMENT 60; then
     pay_url=$(jq -r .payment_url "$TMP/b")
     pass "purchase: status reaches AWAITING_PAYMENT ($pay_url)"
-    if [[ "$pay_url" == "$BASE"/fake-pay/* ]]; then pass "purchase: payment_url points at the gateway"; else fail "purchase: payment_url points at the gateway" "$pay_url"; fi
+    if [[ "$pay_url" == "$PROVIDER"/fake-pay/* ]]; then pass "purchase: payment_url points at the provider ($PROVIDER), not the gateway"; else fail "purchase: payment_url points at the provider" "$pay_url"; fi
     code=$(call -X POST "$pay_url/pay")
-    [[ "$code" == 303 ]] && pass "purchase: the fake-pay form post is accepted (303 back to the sale)" || fail "purchase: the fake-pay form post is accepted" "status $code"
+    if [[ "$code" == 303 && "$(header location)" == "$BASE/?sale=$SALE" ]]; then
+        pass "purchase: the fake-pay form post is accepted (303 back to the sale on the frontend)"
+    else
+        fail "purchase: the fake-pay form post is accepted (303 back to the sale on the frontend)" "status $code, location: $(header location)"
+    fi
     if poll_until CONFIRMED 60; then
         pass "purchase: status reaches CONFIRMED (the webhook came from the provider, through the gateway, to an order processor)"
     else
@@ -264,6 +293,17 @@ if [ "$n429" -ge 1 ] && [ "$ra" = 1 ] && echo "$body" | jq -e .message >/dev/nul
     pass "limits: 12 quick sessions from one IP: $n201 created, $n429 got 429 with Retry-After: 1 and a JSON message"
 else
     fail "limits: a burst of sessions from one IP gets 429 with Retry-After" "201s: $n201, 429s: $n429, retry-after: $ra"
+fi
+# Search, same IP: 5 r/s plus a burst of 20, so 40 quick searches (every q is new) must hit it
+n429=0; ra=""
+for i in $(seq 40); do
+    code=$(call "$BASE/v1/sales/search?q=limit-$RANDOM-$i")
+    if [ "$code" = 429 ]; then n429=$((n429 + 1)); ra=$(header retry-after); body=$(cat "$TMP/b"); fi
+done
+if [ "$n429" -ge 1 ] && [ "$ra" = 1 ] && echo "$body" | jq -e .message >/dev/null; then
+    pass "limits: 40 quick searches from one IP: $n429 got 429 with Retry-After: 1 and a JSON message"
+else
+    fail "limits: a burst of searches from one IP gets 429 with Retry-After" "429s: $n429, retry-after: $ra"
 fi
 # static files and the status route are unaffected by the session bucket
 code=$(call "$BASE/"); [ "$code" = 200 ] && pass "limits: static files are not rate limited" || fail "limits: static files are not rate limited" "status $code"

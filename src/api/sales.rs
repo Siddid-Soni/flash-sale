@@ -1,8 +1,9 @@
-//! Public sale details. `GET /v1/sales/{id}` is what every client loads first
-//! and the CDN caches for a second, so it must stay cheap when a stampede
-//! misses the edge: the product comes from a per-replica cache, and only
-//! `sold_out` is read from Redis (one `GET`). `GET /v1/sales` lists the latest
-//! sales for the home page, edge-cached the same way.
+//! Public sales, served by the site service. `GET /v1/sales/{id}` is what every
+//! client loads first and the CDN caches for a second, so it must stay cheap
+//! when a stampede misses the edge: the product comes from a per-process cache,
+//! and only `sold_out` is read from Redis (one `GET`). `GET /v1/sales` lists the
+//! latest sales for the home page and `GET /v1/sales/search?q=` finds them by
+//! name; both are edge-cached for a few seconds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -10,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use actix_web::{get, http::header, web, HttpResponse};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     actions,
@@ -71,12 +72,19 @@ impl SaleCache {
     }
 }
 
-/// Edge caching for both routes: fresh for a second, then served stale for up
+/// Edge caching of the details: fresh for a second, then served stale for up
 /// to 5 s more while one request refreshes it in the background
 const CACHE_CONTROL: &str = "public, max-age=1, stale-while-revalidate=5";
 
-/// Sales shown on the home page
+/// Edge caching of the list and of search: a new sale shows within about 5 s
+/// (no purge), and a stale copy is served for 30 s more while one request refreshes it
+const LIST_CACHE_CONTROL: &str = "public, max-age=5, stale-while-revalidate=30";
+
+/// Sales in the list and in a search
 const LIST_LIMIT: i64 = 50;
+
+/// Longest search text used, in characters
+const MAX_QUERY_CHARS: usize = 64;
 
 #[derive(Debug, Serialize)]
 struct SaleResponse {
@@ -124,9 +132,46 @@ async fn list_sales(pool: web::Data<DbPool>, redis: web::Data<RedisConn>) -> Res
         Ok::<_, ApiError>(actions::products::list_sales(&mut conn, LIST_LIMIT)?)
     })
     .await??;
+    sales_response(products, &redis).await
+}
 
+#[derive(Debug, Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+}
+
+/// The text searched for: trimmed, lowercased, without NUL (PostgreSQL refuses
+/// it) and cut to 64 characters. Empty means "no search".
+fn normalize_query(q: &str) -> String {
+    q.trim().to_lowercase().chars().filter(|&c| c != '\0').take(MAX_QUERY_CHARS).collect::<String>().trim().to_string()
+}
+
+/// Sales whose name contains `q` (any case), newest start first, in the shape
+/// of the list. `%`, `_` and `\` in `q` match themselves. An empty `q` answers
+/// as the list does.
+#[get("/sales/search")]
+async fn search_sales(
+    pool: web::Data<DbPool>,
+    redis: web::Data<RedisConn>,
+    params: web::Query<SearchParams>,
+) -> Result<HttpResponse, ApiError> {
+    let needle = normalize_query(params.q.as_deref().unwrap_or(""));
+    let products = web::block(move || {
+        let mut conn = pool.get()?;
+        Ok::<_, ApiError>(if needle.is_empty() {
+            actions::products::list_sales(&mut conn, LIST_LIMIT)?
+        } else {
+            actions::products::search_sales(&mut conn, &needle, LIST_LIMIT)?
+        })
+    })
+    .await??;
+    sales_response(products, &redis).await
+}
+
+/// The answer for a list of products: their sold-out flags from one `MGET`
+async fn sales_response(products: Vec<Product>, redis: &RedisConn) -> Result<HttpResponse, ApiError> {
     let ids: Vec<i32> = products.iter().map(|p| p.id).collect();
-    let mut con = redis.get_ref().clone();
+    let mut con = redis.clone();
     let stock = cache::stock_levels(&mut con, &ids).await?;
     let sales: Vec<SaleResponse> = products
         .into_iter()
@@ -134,7 +179,7 @@ async fn list_sales(pool: web::Data<DbPool>, redis: web::Data<RedisConn>) -> Res
         .map(|(product, stock)| SaleResponse::new(product, stock.unwrap_or(0) <= 0))
         .collect();
 
-    Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, CACHE_CONTROL)).json(sales))
+    Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, LIST_CACHE_CONTROL)).json(sales))
 }
 
 impl SaleResponse {
@@ -150,9 +195,10 @@ impl SaleResponse {
     }
 }
 
-// GET /v1/sales, GET /v1/sales/{sale_id}
+// GET /v1/sales, GET /v1/sales/search, GET /v1/sales/{sale_id}
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(list_sales).service(get_sale);
+    // `search` first: `{sale_id}` would otherwise be tried on "search" (and fail with 404)
+    cfg.service(list_sales).service(search_sales).service(get_sale);
 }
 
 #[cfg(test)]
@@ -172,6 +218,15 @@ mod tests {
             sale_start_time: now,
             created_at: now,
         }
+    }
+
+    #[test]
+    fn queries_are_trimmed_lowercased_and_cut() {
+        assert_eq!(normalize_query("  PhOnE \t"), "phone");
+        assert_eq!(normalize_query("   "), "");
+        assert_eq!(normalize_query("a\0b"), "ab");
+        assert_eq!(normalize_query(&"Ä".repeat(100)), "ä".repeat(64));
+        assert_eq!(normalize_query(&format!("{} z", "a".repeat(63))), "a".repeat(63), "the cut leaves no trailing space");
     }
 
     #[tokio::test]

@@ -373,6 +373,30 @@ a.nav__cell:hover {
   margin-top: 22px;
 }
 
+.search {
+  display: grid;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.search__input {
+  width: 100%;
+  min-height: 48px;
+  padding: 0 14px;
+  border: 2px solid var(--line);
+  border-radius: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.search__input:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .sales {
   list-style: none;
   margin: 22px 0 0;

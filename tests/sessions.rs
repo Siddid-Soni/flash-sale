@@ -11,7 +11,7 @@ use flash_sale::{auth::{self, AuthUser}, schema::users};
 #[actix_web::test]
 async fn session_creates_a_guest_and_returns_its_token() {
     let env = common::env().await;
-    let app = test_app!(env);
+    let app = site_app!(env);
 
     let first: Value = test::call_and_read_body_json(&app, test::TestRequest::post().uri("/v1/session").to_request()).await;
     let second: Value = test::call_and_read_body_json(&app, test::TestRequest::post().uri("/v1/session").to_request()).await;

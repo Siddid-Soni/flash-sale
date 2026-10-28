@@ -11,8 +11,9 @@
 //!    the same key (counted);
 //! 3. polls `GET /v1/orders/status/{ticket}` every `POLL_MS` until
 //!    `AWAITING_PAYMENT` (the time from checkout to link is recorded);
-//! 4. with probability `PAY_RATIO` pays by POSTing the fake-pay form (the
-//!    redirect is not followed) after a think time, else abandons; a share
+//! 4. with probability `PAY_RATIO` pays by POSTing the fake-pay form at the
+//!    provider's own address, outside the gateway (the redirect is not
+//!    followed) after a think time, else abandons; a share
 //!    (`LATE_RATIO`) of the payers pays only after the link has expired, and
 //!    another (`RACE_RATIO`) pays 150 ms before it, racing the expiration worker;
 //! 5. keeps polling until a final state (`CONFIRMED`, `EXPIRED`, `FAILED`,
@@ -23,7 +24,9 @@
 //! with `GATEWAY_TRUST_XFF=1`) and a browser-like `User-Agent`.
 //!
 //! Environment (required: `SALE_ID`, `USERS_FILE`, `JWT_SECRET`):
-//!   BASE_URL (http://localhost:8000), USERS_LIMIT (all lines of the file),
+//!   BASE_URL (http://localhost:8000), PROVIDER_URL (http://localhost:8090: where the
+//!   payment page is; the path of the `payment_url` the user was given is used on it),
+//!   USERS_LIMIT (all lines of the file),
 //!   ARRIVAL_SECS (10), PAY_RATIO (0.6), LATE_RATIO (0.05), RACE_RATIO (0.05), POLL_MS (2000),
 //!   PAY_THINK_MIN_MS (500), PAY_THINK_MAX_MS (6000), DEADLINE_SECS (180),
 //!   SESSION_SAMPLE (0: this many users get their token from `POST /v1/session`
@@ -84,6 +87,8 @@ struct Reply {
 struct Ctx {
     client: reqwest::Client,
     base: String,
+    /// The payment provider's address (it is not behind the gateway)
+    provider: String,
     sale: i32,
     secret: String,
     started: Instant,
@@ -317,7 +322,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
             if !paid && Instant::now() >= *at {
                 paid = true;
                 let sent_utc = Utc::now();
-                let reply = pay(ctx, &ip, url).await;
+                let reply = pay(ctx, url).await;
                 let received_utc = Utc::now();
                 if reply.status == 303 {
                     let e = expires.expect("expiry known when paying");
@@ -402,15 +407,15 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
 }
 
 /// POSTs the fake provider's pay form; the redirect is not followed
-async fn pay(ctx: &Ctx, ip: &str, payment_url: &str) -> Reply {
-    // The URL names the public host; go through the same base as everything else
+async fn pay(ctx: &Ctx, payment_url: &str) -> Reply {
+    // The URL names the provider's published address; `PROVIDER_URL` replaces the host when the
+    // generator reaches the provider some other way
     let path = payment_url.find("/fake-pay/").map(|i| &payment_url[i..]).unwrap_or(payment_url);
     let mut attempt = 0;
     loop {
         let request = ctx
             .client
-            .post(ctx.url(&format!("{path}/pay")))
-            .header("X-Forwarded-For", ip)
+            .post(format!("{}{path}/pay", ctx.provider))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Content-Length", "0");
         let reply = ctx.call(Ep::Pay, request).await;
@@ -502,6 +507,7 @@ async fn main() {
     let ctx = Arc::new(Ctx {
         client,
         base,
+        provider: opt("PROVIDER_URL", "http://localhost:8090").trim_end_matches('/').to_owned(),
         sale,
         secret: var("JWT_SECRET"),
         started,
