@@ -17,7 +17,8 @@
 //!    (`LATE_RATIO`) of the payers pays only after the link has expired, and
 //!    another (`RACE_RATIO`) pays 150 ms before it, racing the expiration worker;
 //! 5. keeps polling until a final state (`CONFIRMED`, `EXPIRED`, `FAILED`,
-//!    `REFUNDED`) or `DEADLINE_SECS`.
+//!    `REFUNDED`) or `DEADLINE_SECS`; a payer who sees `EXPIRED` polls on for
+//!    `REFUND_GRACE`, since a payment at the deadline is refunded after the expiry.
 //!
 //! Load must reach the system through the gateway on port 8000 with a distinct
 //! `X-Forwarded-For` per simulated user (the gateway trusts it only when started
@@ -48,6 +49,9 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::time::sleep_until;
+
+/// How long a payer keeps polling after seeing EXPIRED (the frontend's `REFUND_GRACE_MS`)
+const REFUND_GRACE: Duration = Duration::from_secs(60);
 
 const BROWSER_UA: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
@@ -305,6 +309,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
     let mut pay_at: Option<(Instant, String)> = None;
     let mut expires: Option<DateTime<Utc>> = None;
     let mut paid = false;
+    let mut expired_since: Option<Instant> = None;
     let mut last_status = String::new();
     loop {
         let wake = match &pay_at {
@@ -390,6 +395,10 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
                     return rec;
                 }
             }
+            // Like the frontend: a user whose payment the provider accepted keeps
+            // polling a while after EXPIRED, because a payment made at the deadline
+            // is refunded only once the order has expired
+            "EXPIRED" if rec.pay_class.is_some() && expired_since.get_or_insert_with(Instant::now).elapsed() < REFUND_GRACE => {}
             "CONFIRMED" | "EXPIRED" | "FAILED" | "REFUNDED" => {
                 rec.outcome = match status.as_str() {
                     "CONFIRMED" => "confirmed",

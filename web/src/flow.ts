@@ -139,7 +139,8 @@ export async function checkoutWithRetry(
 export type StatusPollingOptions = {
   ticket: string;
   getToken: TokenGetter;
-  onUpdate: (update: StatusUpdate) => void;
+  /** Returning a boolean decides whether polling stops (see `logic/poll`). */
+  onUpdate: (update: StatusUpdate) => boolean | void;
   onError?: (error: unknown) => void;
   intervalMs?: number;
 };

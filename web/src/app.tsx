@@ -8,10 +8,10 @@ import { formatClock, formatCountdown, formatDelay, formatMoney, secondsLeft } f
 import { currentSession, forgetSession, parseSessionResponse, rememberSession } from './logic/session';
 import {
   finalStatusName,
-  isFinalStatus,
   parseSale,
   screenForFinalStatus,
   statusToScreen,
+  stopsPolling,
   type CheckoutOutcome,
   type Sale,
   type Screen,
@@ -128,6 +128,8 @@ export function App() {
   const stopPollRef = useRef<(() => void) | null>(null);
   const pollGenerationRef = useRef(0);
   const sessionPromiseRef = useRef<Promise<string> | null>(null);
+  /** When this ticket was first seen EXPIRED (for the refund grace period). */
+  const expiredSinceRef = useRef<number | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -180,23 +182,34 @@ export function App() {
     stopPollRef.current = null;
   }, []);
 
-  const applyUpdate = useCallback((ticket: string, update: StatusUpdate) => {
+  /** Shows an update; returns whether polling stops. */
+  const applyUpdate = useCallback((ticket: string, update: StatusUpdate): boolean => {
     const next = statusToScreen(update, ticket);
     if (next === null) {
       if (update.kind === 'retry') setWaitNote(update.message);
-      return;
+      return false;
     }
 
     setWaitNote('');
     setScreen(next);
 
-    if (isFinalStatus(update)) {
+    // A user who went to pay may see EXPIRED before the refund of a payment
+    // made at the deadline: keep polling a while for REFUNDED
+    const wentToPay = hasSentToPay(ticket);
+    if (update.kind === 'expired') expiredSinceRef.current ??= Date.now();
+    const stop = stopsPolling(update, wentToPay, expiredSinceRef.current, Date.now());
+
+    if (stop) {
       clearSentToPay(ticket);
       const final = finalStatusName(update);
       if (final !== null) writeTicket(SALE_ID, { ticket, final });
     } else {
       writeTicket(SALE_ID, { ticket, final: null });
+      if (update.kind === 'expired' && wentToPay) {
+        setWaitNote('If you paid, your refund will show here shortly. Checking for a minute…');
+      }
     }
+    return stop;
   }, []);
 
   const startPolling = useCallback(
@@ -204,6 +217,7 @@ export function App() {
       stopPolling();
       const generation = pollGenerationRef.current;
       if (ticketRef.current === null) ticketRef.current = ticket;
+      expiredSinceRef.current = null;
 
       void loadFlow()
         .then((flow) => {
@@ -212,8 +226,8 @@ export function App() {
             ticket,
             getToken,
             onUpdate: (update) => {
-              if (generation !== pollGenerationRef.current) return;
-              applyUpdate(ticket, update);
+              if (generation !== pollGenerationRef.current) return true;
+              return applyUpdate(ticket, update);
             },
             onError: () => {
               if (generation !== pollGenerationRef.current) return;

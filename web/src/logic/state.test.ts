@@ -6,6 +6,9 @@ import {
   mapStatusResponse,
   parseSale,
   parseSales,
+  REFUND_GRACE_MS,
+  stopsPolling,
+  type StatusUpdate,
   screenForFinalStatus,
   statusToScreen,
 } from './state';
@@ -236,5 +239,22 @@ describe('parseSales', () => {
   it('rejects a body that is not a list', () => {
     expect(parseSales({ sales: [] })).toBeNull();
     expect(parseSales([])).toEqual([]);
+  });
+});
+
+describe('stopsPolling', () => {
+  const expired: StatusUpdate = { kind: 'expired' };
+
+  it('stops on a final state, and on EXPIRED at once for a user who never went to pay', () => {
+    expect(stopsPolling({ kind: 'confirmed' }, true, null, 0)).toBe(true);
+    expect(stopsPolling({ kind: 'refunded' }, true, null, 0)).toBe(true);
+    expect(stopsPolling(expired, false, 0, 0)).toBe(true);
+    expect(stopsPolling({ kind: 'pending', position: 3 }, true, null, 0)).toBe(false);
+  });
+
+  it('keeps a payer polling on EXPIRED for the refund grace period', () => {
+    expect(stopsPolling(expired, true, 1_000, 1_000)).toBe(false);
+    expect(stopsPolling(expired, true, 1_000, 1_000 + REFUND_GRACE_MS - 1)).toBe(false);
+    expect(stopsPolling(expired, true, 1_000, 1_000 + REFUND_GRACE_MS)).toBe(true);
   });
 });

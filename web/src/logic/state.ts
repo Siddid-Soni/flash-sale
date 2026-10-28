@@ -67,6 +67,29 @@ export function isFinalStatus(update: StatusUpdate): boolean {
   );
 }
 
+/**
+ * How long a user who went to pay keeps polling after seeing `EXPIRED`. A
+ * payment made at the deadline is refunded only once the order has expired,
+ * so `REFUNDED` can follow `EXPIRED` a few seconds later.
+ */
+export const REFUND_GRACE_MS = 60_000;
+
+/**
+ * Whether polling may stop on this update. `EXPIRED` is final at once for a
+ * user who never went to pay; one who did keeps polling for `REFUND_GRACE_MS`
+ * after it was first seen (`expiredSinceMs`).
+ */
+export function stopsPolling(
+  update: StatusUpdate,
+  wentToPay: boolean,
+  expiredSinceMs: number | null,
+  nowMs: number,
+): boolean {
+  if (!isFinalStatus(update)) return false;
+  if (update.kind !== 'expired' || !wentToPay) return true;
+  return expiredSinceMs !== null && nowMs - expiredSinceMs >= REFUND_GRACE_MS;
+}
+
 export function finalStatusName(update: StatusUpdate): FinalStatusName | null {
   switch (update.kind) {
     case 'confirmed':

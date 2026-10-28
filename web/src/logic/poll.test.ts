@@ -20,7 +20,9 @@ describe('startStatusPolling', () => {
 
     const stop = startStatusPolling({
       fetchOnce,
-      onUpdate: (update) => updates.push(update.kind),
+      onUpdate: (update) => {
+        updates.push(update.kind);
+      },
       intervalMs: 2_000,
     });
 
@@ -48,7 +50,9 @@ describe('startStatusPolling', () => {
 
     const stop = startStatusPolling({
       fetchOnce,
-      onUpdate: (update) => updates.push(update.kind),
+      onUpdate: (update) => {
+        updates.push(update.kind);
+      },
       onError,
       intervalMs: 1_000,
     });
@@ -78,7 +82,9 @@ describe('startStatusPolling', () => {
     const updates: string[] = [];
     const stop = startStatusPolling({
       fetchOnce,
-      onUpdate: (update) => updates.push(update.kind),
+      onUpdate: (update) => {
+        updates.push(update.kind);
+      },
       intervalMs: 1_000,
     });
 
@@ -88,5 +94,28 @@ describe('startStatusPolling', () => {
 
     expect(updates).toEqual([]);
     expect(fetchOnce).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the update handler keep polling past a final state, then stop', async () => {
+    const fetchOnce = vi
+      .fn<() => Promise<StatusUpdate>>()
+      .mockResolvedValueOnce({ kind: 'expired' })
+      .mockResolvedValueOnce({ kind: 'expired' })
+      .mockResolvedValueOnce({ kind: 'refunded' });
+    const seen: string[] = [];
+
+    startStatusPolling({
+      fetchOnce,
+      onUpdate: (update) => {
+        seen.push(update.kind);
+        return update.kind === 'refunded';
+      },
+      intervalMs: 2_000,
+    });
+
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(seen).toEqual(['expired', 'expired', 'refunded']);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(fetchOnce).toHaveBeenCalledTimes(3);
   });
 });

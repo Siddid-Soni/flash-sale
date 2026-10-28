@@ -9,7 +9,11 @@ export const POLL_INTERVAL_MS = 2_000;
 export type PollOptions = {
   /** One polled status, already mapped from the HTTP response. */
   fetchOnce: () => Promise<StatusUpdate>;
-  onUpdate: (update: StatusUpdate) => void;
+  /**
+   * Called with each update. Returning a boolean decides whether polling
+   * stops; otherwise it stops on a final state.
+   */
+  onUpdate: (update: StatusUpdate) => boolean | void;
   /** Called when a poll throws; polling continues. */
   onError?: (error: unknown) => void;
   intervalMs?: number;
@@ -51,9 +55,10 @@ export function startStatusPolling(options: PollOptions): () => void {
     }
 
     if (stopped) return;
-    options.onUpdate(update);
+    const decided = options.onUpdate(update);
+    const final = typeof decided === 'boolean' ? decided : isFinalStatus(update);
 
-    if (isFinalStatus(update)) {
+    if (final) {
       stop();
       return;
     }
