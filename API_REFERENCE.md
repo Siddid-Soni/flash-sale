@@ -139,7 +139,7 @@ Notes:
 
 ### `GET /v1/orders/status/{queue_ticket_id}`
 
-Only winners poll, every 2 seconds. The answer comes from the read cache; if that entry is missing it falls back to PostgreSQL. A ticket with neither is `404`: Redis keeps no record of a ticket (a ticket whose cache write was lost reads `404` until its order exists).
+Only winners poll, every 2 seconds. The answer comes from the read cache only; this endpoint never reads PostgreSQL, so made-up tickets cost one Redis read each. A ticket without an entry is `404` (for example while a lost `PENDING` write waits for the processor's link write).
 
 ```bash
 curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization: Bearer $TOKEN"
@@ -150,7 +150,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 | `status` | Extra fields | Meaning |
 |---|---|---|
 | `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache only). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition |
-| `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds) (answered from the order row when the cache entry is gone) |
+| `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds) |
 | `CONFIRMED` | | Paid in time (PostgreSQL decided and counted it in `products.sold`). Final. The unit stays taken: the expiration worker never returns a confirmed order's stock |
 | `EXPIRED` | | The payment window ran out; the expiration worker expired the order and returned the unit. Final |
 | `FAILED` | | The checkout never became an order: the publish failed and the unit was returned at once, or the order could not be created. Final |

@@ -230,7 +230,7 @@ async fn a_failed_publish_records_a_failed_order_returns_the_unit_and_the_retry_
     let failed_ticket = failed.queue_ticket_id.clone();
     assert_eq!(cache::ticket_sale(&failed_ticket), Some(sale));
 
-    // The ticket the failed attempt used reads as FAILED (from PostgreSQL)
+    // The ticket the failed attempt used reads as FAILED (the Order Service wrote it to the read cache)
     let resp = test::call_service(&app, status_request(&failed_ticket, &user).to_request()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "FAILED" }));
@@ -305,9 +305,9 @@ async fn a_failed_publish_whose_message_made_an_order_is_a_successful_checkout()
     let idem: Option<String> = env.redis.clone().get(cache::idem_key(sale, user.id, "k")).await.unwrap();
     assert_eq!(idem.as_deref(), Some(ticket.as_str()), "a retry gets this ticket");
 
-    // And the status endpoint answers from the order
+    // The status reads PENDING until the processor writes its link (forward-only)
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &user).to_request()).await;
-    assert_eq!(body["status"], "AWAITING_PAYMENT");
+    assert_eq!(body["status"], "PENDING");
     cleanup(&env, sale).await;
 }
 
@@ -372,7 +372,7 @@ async fn status_is_for_the_owner_only() {
 }
 
 #[actix_web::test]
-async fn status_falls_back_to_postgres_when_the_cache_has_no_entry() {
+async fn status_answers_from_the_read_cache_only() {
     let env = common::env().await;
     let app = test_app!(env);
     let sale = sale(&env, 5, 60).await;
@@ -383,12 +383,9 @@ async fn status_falls_back_to_postgres_when_the_cache_has_no_entry() {
         test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
     let ticket = body["queue_ticket_id"].as_str().unwrap().to_string();
 
-    // The status write was lost and no order exists yet: nothing is known (Redis keeps no hold)
+    // An order that exists only in PostgreSQL is not looked up: the endpoint
+    // never touches the database, so made-up tickets cannot reach it
     let _: () = redis.del(cache::status_key(&ticket)).await.unwrap();
-    let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no order yet");
-
-    // The order is born AWAITING_PAYMENT, with its link and deadline
     let expires = Utc::now() + Duration::minutes(5);
     let mut conn = env.pool.get().unwrap();
     let session = format!("xyz-{}", uuid::Uuid::new_v4().simple());
@@ -407,23 +404,27 @@ async fn status_falls_back_to_postgres_when_the_cache_has_no_entry() {
         })
         .execute(&mut conn)
         .unwrap();
+    let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no cache entry, no answer");
+
+    // Once the entry is written, it is the answer (and only for its owner)
+    let mut update = cache::StatusUpdate::new(OrderStatus::AwaitingPayment, owner.id);
+    update.payment_url = Some(url.clone());
+    update.expires_at = Some(expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    cache::set_status(&mut env.read_cache.clone(), &ticket, &update).await.unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(body["status"], "AWAITING_PAYMENT");
     assert_eq!(body["payment_url"], url.as_str());
-    assert_eq!(
-        body["expires_at"],
-        expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true).as_str()
-    );
     let resp = test::call_service(&app, status_request(&ticket, &stranger).to_request()).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // A paid order shows no payment link
+    // PostgreSQL moving on changes nothing until the cache is written
     diesel::update(orders::table.filter(orders::queue_ticket_id.eq(&ticket)))
         .set(orders::status.eq(OrderState::Confirmed))
         .execute(&mut conn)
         .unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(body, json!({ "status": "CONFIRMED" }));
+    assert_eq!(body["status"], "AWAITING_PAYMENT");
     cleanup(&env, sale).await;
 }
 

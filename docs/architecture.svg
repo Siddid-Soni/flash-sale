@@ -67,7 +67,7 @@
     <!-- site service: PostgreSQL (hops over the stock return) -->
     <path d="M324,72 V36 H1630 V400 H1608 a8,8 0 0 0 -16,0 H1489" marker-end="url(#arrow)"/>
   </g>
-  <!-- Order Service to PostgreSQL, rare paths only (hops over the processors' link) -->
+  <!-- Order Service to PostgreSQL: only the FAILED claim when a publish fails (hops over the processors' link) -->
   <path d="M640,316 V272 H1142 a8,8 0 0 1 16,0 H1460 V314" fill="none" stroke="#94a3b8" stroke-width="2" stroke-dasharray="7 5" marker-end="url(#arrow-slate)"/>
   <!-- signed webhook: provider to gateway, gateway to processors (hops over checkout.lua) -->
   <path d="M232,620 H252 V440 H276" fill="none" stroke="#ea580c" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
@@ -181,7 +181,7 @@
     <text x="117" y="548" text-anchor="end">directly</text>
     <text x="760" y="762">session · expire · refund (outbound)</text>
     <text x="980" y="28">users · products (own pool) · stock reads in Redis</text>
-    <text x="830" y="264" fill="#64748b">rare: status fallback · FAILED claim</text>
+    <text x="830" y="264" fill="#64748b">rare: FAILED claim when a publish fails</text>
     <text x="260" y="560" text-anchor="start" fill="#c2410c">signed webhook</text>
     <text x="820" y="540" fill="#c2410c">webhook (provider IP allow-list)</text>
     <text x="1350" y="626" fill="#6d28d9">return_unit.lua: return expired stock, once</text>
@@ -194,7 +194,7 @@
     <path d="M230,806 H266" stroke="#7c3aed" stroke-width="2.4"/>
     <text x="274" y="810">the only stock return</text>
     <path d="M450,806 H486" stroke="#94a3b8" stroke-width="2" stroke-dasharray="7 5"/>
-    <text x="494" y="810">rare paths</text>
+    <text x="494" y="810">rare path</text>
     <rect x="610" y="797" width="36" height="18" rx="5" fill="#ffffff" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="5 4"/>
     <text x="654" y="810">outside our gateway</text>
     <use href="#stack-slate" transform="translate(830,806) scale(0.3)"/>

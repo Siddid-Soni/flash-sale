@@ -1,28 +1,25 @@
 //! `GET /v1/orders/status/{ticket}`: what the client polls (only winners do).
 //!
-//! The answer comes from the read cache. If that entry is missing (the write
-//! after a transition was lost, or the entry expired) it falls back to the
-//! order in PostgreSQL, so a lost cache write never shows a winner the wrong
-//! thing. `PENDING` (waiting in Kafka) comes only from the cache: the order row
-//! does not exist yet, and it is never stored in PostgreSQL. A ticket with
-//! neither a cache entry nor an order is `404` (docs/FAILURE_CASES.md, case 3).
+//! The answer comes from the read cache only; this endpoint never touches
+//! PostgreSQL, so a flood of made-up tickets costs one Redis read each. Every
+//! transition writes the entry (and the writers retry until it lands), and an
+//! entry outlives its payment window by far (24 h), so a winner's entry is
+//! missing only if the read cache lost its data. A ticket without an entry is
+//! `404` (docs/FAILURE_CASES.md, case 3).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use actix_web::{get, http::header, web, HttpResponse};
-use chrono::SecondsFormat;
 use serde::Serialize;
 
 use crate::{
-    actions,
     auth::AuthUser,
     cache::{self, ReadCache},
     config::Config,
-    db::DbPool,
     error::ApiError,
-    models::{Order, OrderState, OrderStatus},
+    models::OrderStatus,
 };
 
 /// How long a replica reuses a partition's processor progress before reading
@@ -96,18 +93,9 @@ fn queue_position(offset: i64, processed_offset: Option<i64>) -> i64 {
     }
 }
 
-fn order_response(order: Order) -> StatusResponse {
-    let awaiting = order.status == OrderState::AwaitingPayment;
-    StatusResponse {
-        status: order.status.into(),
-        position: None,
-        payment_url: order.checkout_url.filter(|_| awaiting),
-        expires_at: order.expires_at.filter(|_| awaiting).map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)),
-    }
-}
-
 /// The status of the caller's ticket: `200 {status, position?, payment_url?,
-/// expires_at?}`, `403` for someone else's ticket, `404` if nobody knows it.
+/// expires_at?}`, `403` for someone else's ticket, `404` if the read cache has
+/// no entry for it.
 /// `position` (only while `PENDING`, and only if the entry knows its
 /// partition and offset) is the place in the queue, 1 being next, and `0`
 /// while the ticket is being processed (see `queue_position`).
@@ -116,7 +104,6 @@ fn order_response(order: Order) -> StatusResponse {
 async fn order_status(
     user: AuthUser,
     path: web::Path<String>,
-    pool: web::Data<DbPool>,
     read_cache: web::Data<ReadCache>,
     progress: web::Data<ProgressCache>,
     config: web::Data<Config>,
@@ -126,7 +113,6 @@ async fn order_status(
     let forbidden = || ApiError::Forbidden("this ticket belongs to someone else".into());
     cache::ticket_sale(&ticket).ok_or_else(not_found)?;
 
-    // 1. The read cache
     let mut cache_con = read_cache.get_ref().clone();
     if let Some(cached) = cache::read_status(&mut cache_con, &ticket).await? {
         if cached.user != user.id {
@@ -149,18 +135,7 @@ async fn order_status(
         }));
     }
 
-    // 2. PostgreSQL
-    let lookup = ticket.clone();
-    let order = web::block(move || {
-        let mut conn = pool.get()?;
-        Ok::<_, ApiError>(actions::orders::find_by_ticket(&mut conn, &lookup)?)
-    })
-    .await??;
-    match order {
-        Some(order) if order.user_id != user.id => Err(forbidden()),
-        Some(order) => Ok(respond(order_response(order))),
-        None => Err(not_found()),
-    }
+    Err(not_found())
 }
 
 fn respond(body: StatusResponse) -> HttpResponse {

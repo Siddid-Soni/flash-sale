@@ -4,8 +4,7 @@ use diesel::prelude::*;
 use crate::models::{NewOrder, Order, OrderState};
 use crate::schema::{orders, products};
 
-/// The order for a queue ticket, if one exists. The status endpoint's fallback
-/// after the read cache.
+/// The order for a queue ticket, if one exists
 pub fn find_by_ticket(conn: &mut PgConnection, ticket: &str) -> QueryResult<Option<Order>> {
     orders::table
         .filter(orders::queue_ticket_id.eq(ticket))

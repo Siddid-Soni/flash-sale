@@ -177,7 +177,7 @@ async fn checkout(
         Ok(published) => published,
         Err(e) => {
             log::error!("publish of {ticket} failed, compensating: {e}");
-            return compensate(&pool, &mut con, sale, user.id, ticket, &key).await;
+            return compensate(&pool, &mut con, &read_cache, sale, user.id, ticket, &key).await;
         }
     };
 
@@ -207,6 +207,7 @@ async fn checkout(
 async fn compensate(
     pool: &web::Data<DbPool>,
     con: &mut RedisConn,
+    read_cache: &web::Data<ReadCache>,
     sale: i32,
     user: i32,
     ticket: String,
@@ -219,12 +220,18 @@ async fn compensate(
     })
     .await;
     match recorded {
-        Ok(Ok(FailedInsert::Created)) => match cache::return_unit(con, sale, user, &ticket, Some(key)).await {
-            Ok(()) => log::info!("compensation for {ticket}: unit returned"),
-            Err(e) => log::error!("compensation for {ticket}: the unit could not be returned: {e}"),
-        },
+        Ok(Ok(FailedInsert::Created)) => {
+            match cache::return_unit(con, sale, user, &ticket, Some(key)).await {
+                Ok(()) => log::info!("compensation for {ticket}: unit returned"),
+                Err(e) => log::error!("compensation for {ticket}: the unit could not be returned: {e}"),
+            }
+            // The status endpoint reads only the read cache
+            write_status(read_cache, &ticket, OrderStatus::Failed, user).await;
+        }
         Ok(Ok(FailedInsert::Existed)) => {
             log::info!("{ticket}: its order exists, the message reached the queue after all");
+            // Forward-only: never overrides the processor's link, which follows
+            write_status(read_cache, &ticket, OrderStatus::Pending, user).await;
             return Ok(ticket_response(HttpResponse::Accepted(), ticket));
         }
         Ok(Err(e)) => log::error!("compensation for {ticket}: recording the failure failed, the unit stays reserved: {e}"),
@@ -233,6 +240,14 @@ async fn compensate(
     Ok(HttpResponse::ServiceUnavailable()
         .insert_header((header::RETRY_AFTER, "1"))
         .json(ErrorBody { message: "the checkout queue is unavailable, retry with the same key".into() }))
+}
+
+/// Best effort, like the write after a successful publish
+async fn write_status(read_cache: &web::Data<ReadCache>, ticket: &str, status: OrderStatus, user: i32) {
+    let mut status_con = read_cache.get_ref().clone();
+    if let Err(e) = cache::set_status(&mut status_con, ticket, &StatusUpdate::new(status, user)).await {
+        log::warn!("status write for {ticket} failed: {e}");
+    }
 }
 
 // POST /v1/sales/{sale_id}/checkout

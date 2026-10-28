@@ -148,7 +148,7 @@ Compose starts Redis with `--appendonly yes`, so the append-only file is on with
 - A lost `user_live` marker: a user could reserve a second unit; the unique index on live orders per user and product refuses the second order.
 - A lost stock return: a unit missing from stock, so a sale that sells out one unit early (the same shape as the accepted failure cases).
 - Redis keeps no sale counter: `products.sold` is the only count.
-- The read cache (`status:<ticket>`) can be lost with no harm: the status endpoint falls back to PostgreSQL.
+- The read cache (`status:<ticket>`) is the only source of the status endpoint, which never reads PostgreSQL, so a flood of made-up tickets cannot reach the database. Every writer retries until its write lands and entries live 24 h, far beyond the payment window; losing the read cache's data (see Redis loss) would show `404` until the next transition writes the entry again.
 
 Rebuilding `stock:{sale}` from PostgreSQL (`total_inventory - sold -` live orders) and a reconciliation job are in the design but **not implemented**; after a Redis loss an operator would have to reset the counters by hand. For a stricter setup: `appendfsync always` (slower), Redis replicas (replication is asynchronous, so failover can lose the same last moments), and separate clusters for inventory and read cache. Kafka has the same shape. Compose runs one broker with replication factor 1, so `acks=all` means one copy. Production needs three brokers with `min.insync.replicas=2`. A Kafka message lost anyway leaves a reserved unit with no order, which is lost for the rest of the sale (accepted failure case 1, section 5): fewer units sold, never more.
 
