@@ -24,15 +24,18 @@ pub struct QueueError(pub String);
 
 pub type QueueResult<T> = Result<T, QueueError>;
 
-/// What the processors need to create an order and its payment session
+/// Everything the processors need to create an order and its payment session:
+/// Redis keeps no record of the ticket, so the event carries it all
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckoutEvent {
     /// Queue ticket, `<sale>.<uuid>`; also the Kafka message key
     pub ticket: String,
     pub sale: i32,
     pub user: i32,
-    /// When `checkout.lua` created the hold (Redis `TIME`, epoch ms)
+    /// When `checkout.lua` reserved the unit (Redis `TIME`, epoch ms)
     pub checkout_ms: i64,
+    /// The `Idempotency-Key` the order is stored with
+    pub idempotency_key: String,
 }
 
 /// Where the broker stored an event. `offset` becomes the queue position.
@@ -46,8 +49,8 @@ pub struct Published {
 pub trait CheckoutQueue: Send + Sync {
     /// Appends the event to the topic, keyed by its ticket, and returns once
     /// every in-sync replica has stored it. Fails when the producer gives up
-    /// (`delivery.timeout.ms`), after which the message can no longer arrive:
-    /// the caller then releases the hold.
+    /// (`delivery.timeout.ms`), after which the caller compensates: it records
+    /// the ticket as `FAILED` in PostgreSQL and returns the unit.
     async fn publish(&self, event: &CheckoutEvent) -> QueueResult<Published>;
 }
 
@@ -97,9 +100,7 @@ impl CheckoutQueue for KafkaQueue {
         let payload = serde_json::to_vec(event).map_err(|e| QueueError(format!("encode event: {e}")))?;
         let record = FutureRecord::to(&self.topic).key(event.ticket.as_str()).payload(&payload);
         // No waiting for room in the producer's queue: a full queue fails at
-        // once (the caller compensates and answers 503). Waiting here would
-        // add to `delivery.timeout.ms`, which counts from the enqueue, and the
-        // expiration worker's leaked-hold margin is that timeout alone
+        // once (the caller compensates and answers 503)
         match self.producer.send(record, Timeout::After(Duration::ZERO)).await {
             Ok(delivery) => Ok(Published { partition: delivery.partition, offset: delivery.offset }),
             Err((e, _message)) => Err(QueueError(format!("publish to {}: {e}", self.topic))),
@@ -137,9 +138,15 @@ mod tests {
 
     #[test]
     fn event_round_trips_as_json() {
-        let event = CheckoutEvent { ticket: "42.6f1c".into(), sale: 42, user: 7, checkout_ms: 1_700_000_000_123 };
+        let event = CheckoutEvent {
+            ticket: "42.6f1c".into(),
+            sale: 42,
+            user: 7,
+            checkout_ms: 1_700_000_000_123,
+            idempotency_key: "k1".into(),
+        };
         let json = serde_json::to_string(&event).unwrap();
-        assert_eq!(json, r#"{"ticket":"42.6f1c","sale":42,"user":7,"checkout_ms":1700000000123}"#);
+        assert_eq!(json, r#"{"ticket":"42.6f1c","sale":42,"user":7,"checkout_ms":1700000000123,"idempotency_key":"k1"}"#);
         assert_eq!(serde_json::from_str::<CheckoutEvent>(&json).unwrap(), event);
     }
 }

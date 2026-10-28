@@ -17,7 +17,7 @@ async fn publishes_keyed_events_to_an_ensured_topic() {
     ensure_topic(&config).await.unwrap();
 
     let queue = KafkaQueue::new(&config).unwrap();
-    let event = |n: i32| CheckoutEvent { ticket: format!("1.ticket-{n}"), sale: 1, user: n, checkout_ms: 1_000 + n as i64 };
+    let event = |n: i32| CheckoutEvent { ticket: format!("1.ticket-{n}"), sale: 1, user: n, checkout_ms: 1_000 + n as i64, idempotency_key: format!("k{n}") };
 
     let first = queue.publish(&event(1)).await.unwrap();
     assert!((0..3).contains(&first.partition));

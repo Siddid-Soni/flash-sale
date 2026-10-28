@@ -4,8 +4,8 @@ use diesel::prelude::*;
 use crate::models::{NewOrder, Order, OrderState};
 use crate::schema::{orders, products};
 
-/// The order for a queue ticket, if the processor has created it. The last
-/// fallback of the status endpoint, after the read cache and the hold.
+/// The order for a queue ticket, if one exists. The status endpoint's fallback
+/// after the read cache.
 pub fn find_by_ticket(conn: &mut PgConnection, ticket: &str) -> QueryResult<Option<Order>> {
     orders::table
         .filter(orders::queue_ticket_id.eq(ticket))
@@ -25,17 +25,45 @@ pub fn insert_awaiting_payment(conn: &mut PgConnection, new_order: &NewOrder) ->
     find_by_ticket(conn, new_order.queue_ticket_id).map(|order| order.filter(|o| o.user_id == new_order.user_id))
 }
 
-/// Marks an order whose hold was released before its link was ready `FAILED`
-/// (only from `AWAITING_PAYMENT`, so a final state is never overwritten).
-pub fn mark_failed(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
-    let updated = diesel::update(
-        orders::table
-            .filter(orders::queue_ticket_id.eq(ticket))
-            .filter(orders::status.eq(OrderState::AwaitingPayment)),
-    )
-    .set(orders::status.eq(OrderState::Failed))
-    .execute(conn)?;
-    Ok(updated == 1)
+/// What `insert_failed` found
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedInsert {
+    /// This call created the `FAILED` row: the ticket will never become an order
+    Created,
+    /// A row for the ticket already existed (the message reached Kafka after
+    /// all and a processor made the order)
+    Existed,
+}
+
+/// Records a ticket whose publish failed as a `FAILED` order, so the decision
+/// is PostgreSQL's: the row is inserted `ON CONFLICT DO NOTHING` on the ticket,
+/// and only a call that created it may return the unit to stock. A message that
+/// reached Kafka anyway finds the row and stops at it (the processor), or made
+/// the order first (then the row `Existed`).
+///
+/// The row needs an amount (the product's price, read here: this path is rare)
+/// and an idempotency key. It is stored under the ticket itself, not the
+/// client's key, because `(user_id, idempotency_key)` is unique and the
+/// client's retry with the same key (compensation forgets it in Redis) must
+/// still be able to make its order. Fails if the product does not exist.
+pub fn insert_failed(conn: &mut PgConnection, user_id: i32, product_id: i32, ticket: &str) -> QueryResult<FailedInsert> {
+    let amount_cents: i32 = products::table.find(product_id).select(products::price_cents).first(conn)?;
+    let created = diesel::insert_into(orders::table)
+        .values(&NewOrder {
+            user_id,
+            product_id,
+            queue_ticket_id: ticket,
+            idempotency_key: ticket,
+            status: OrderState::Failed,
+            amount_cents,
+            payment_session_id: None,
+            checkout_url: None,
+            expires_at: None,
+        })
+        .on_conflict(orders::queue_ticket_id)
+        .do_nothing()
+        .execute(conn)?;
+    Ok(if created == 1 { FailedInsert::Created } else { FailedInsert::Existed })
 }
 
 /// What the decision transaction for a payment came to
@@ -45,13 +73,20 @@ pub enum Settlement {
     Confirmed,
     /// The order was already `CONFIRMED` (a rerun or a duplicate event)
     AlreadyConfirmed,
-    /// The payment cannot be kept: the deadline passed, or the order was
-    /// already `EXPIRED` or `FAILED`. The order is now `REFUNDED`; the
-    /// payment still has to be refunded at the provider.
+    /// The payment cannot be kept: the order was already `EXPIRED` or `FAILED`.
+    /// The order is now `REFUNDED`; the payment still has to be refunded at the
+    /// provider. No stock moves (the expiration worker returned the unit when it
+    /// expired the order, or nothing was reserved).
     Refund,
-    /// The deadline was ahead but the product has no unit left (`sold =
+    /// The order is still `AWAITING_PAYMENT` but its deadline has passed. The
+    /// inbox never decides a deadline: nothing was changed. The event must stay
+    /// unprocessed and be tried again; once the expiration worker has expired
+    /// the order (and returned the unit) the retry finds it `EXPIRED`.
+    Postponed,
+    /// The payment was in time but the product has no unit left (`sold =
     /// total_inventory`): Redis and PostgreSQL disagree. Nothing was counted;
-    /// the order is now `REFUNDED`, the payment still to be refunded.
+    /// the order is now `REFUNDED` (no stock moves), the payment still to be
+    /// refunded.
     SoldOut,
     /// The order was already `REFUNDED` by an earlier run: only the provider
     /// refund and the status write may be missing
@@ -62,8 +97,8 @@ pub enum Settlement {
     Missing,
 }
 
-/// PostgreSQL's decision between a payment and the deadline (one transaction).
-/// The order is confirmed only if, at PostgreSQL's own `now()`, it is still
+/// PostgreSQL's decision on a payment (one transaction). The order is
+/// confirmed only if, at PostgreSQL's own `now()`, it is still
 /// `AWAITING_PAYMENT` for this session and its deadline is ahead:
 ///
 /// ```sql
@@ -73,14 +108,19 @@ pub enum Settlement {
 /// ```
 ///
 /// If the guard matches no row the confirmation is rolled back (to a
-/// savepoint). The expiration worker's `expire_due` is the mirror image
-/// (`status = 'AWAITING_PAYMENT' AND expires_at <= now()`); both need the
-/// order's row lock and see the other's result after it, so exactly one wins.
+/// savepoint) and the order is `REFUNDED`. The expiration worker's
+/// `expire_batch` is the mirror image (`status = 'AWAITING_PAYMENT' AND
+/// expires_at <= now()`); both need the order's row lock and see the other's
+/// result after it, so exactly one wins.
 ///
-/// When the order cannot be confirmed it is set `REFUNDED` in the same
-/// transaction (from `AWAITING_PAYMENT`, `EXPIRED` or `FAILED`, never from
-/// `CONFIRMED`), which records the decision before the provider is asked to
-/// refund; a rerun finds `REFUNDED` and goes straight to the refund.
+/// **The inbox never decides a deadline.** An order that is `EXPIRED` or
+/// `FAILED` is set `REFUNDED` (never from `CONFIRMED`) in the same transaction,
+/// which records the decision before the provider is asked to refund; a rerun
+/// finds `REFUNDED` and goes straight to the refund. An order still
+/// `AWAITING_PAYMENT` after its `expires_at` is left alone (`Postponed`): only
+/// the expiration worker expires an order, and it returns the unit when it
+/// does, so the retry that finds the order `EXPIRED` refunds without moving
+/// stock.
 pub fn settle_payment(conn: &mut PgConnection, ticket: &str, session_id: &str, product_id: i32) -> QueryResult<Settlement> {
     conn.transaction(|conn| {
         let confirmed = conn.transaction(|conn| {
@@ -114,11 +154,18 @@ pub fn settle_payment(conn: &mut PgConnection, ticket: &str, session_id: &str, p
             Err(e) => return Err(e),
         };
 
+        // Refundable: already expired or failed; and, when the guard failed on
+        // an in-time payment, the order that was still awaiting it
+        let refundable: &[OrderState] = if sold_out {
+            &[OrderState::AwaitingPayment, OrderState::Expired, OrderState::Failed]
+        } else {
+            &[OrderState::Expired, OrderState::Failed]
+        };
         let refunded = diesel::update(
             orders::table
                 .filter(orders::queue_ticket_id.eq(ticket))
                 .filter(orders::payment_session_id.eq(session_id))
-                .filter(orders::status.eq_any([OrderState::AwaitingPayment, OrderState::Expired, OrderState::Failed])),
+                .filter(orders::status.eq_any(refundable)),
         )
         .set(orders::status.eq(OrderState::Refunded))
         .execute(conn)?;
@@ -133,109 +180,42 @@ pub fn settle_payment(conn: &mut PgConnection, ticket: &str, session_id: &str, p
         Ok(match status {
             Some(OrderState::Confirmed) => Settlement::AlreadyConfirmed,
             Some(OrderState::Refunded) => Settlement::AlreadyRefunded,
+            Some(OrderState::AwaitingPayment) => Settlement::Postponed,
             Some(other) => Settlement::Unexpected(other),
             None => Settlement::Missing,
         })
     })
 }
 
-/// Marks the due, unpaid orders among `tickets` `EXPIRED` in one statement and
-/// returns the tickets it changed (the expiration worker's half of the race
-/// with `settle_payment`):
+/// The expiration worker's half of the race with `settle_payment`: in one
+/// statement, marks up to `limit` unpaid orders past their deadline `EXPIRED`
+/// (oldest deadline first, rows another worker holds skipped) and returns them.
+/// The caller then returns each order's unit to stock, once.
 ///
 /// ```sql
-/// UPDATE orders SET status = 'EXPIRED' WHERE queue_ticket_id = ANY($1)
-///   AND status = 'AWAITING_PAYMENT' AND expires_at <= now() RETURNING queue_ticket_id
+/// UPDATE orders SET status = 'EXPIRED', updated_at = now() WHERE id IN (
+///   SELECT id FROM orders WHERE status = 'AWAITING_PAYMENT' AND expires_at <= now()
+///   ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) RETURNING *
 /// ```
-pub fn expire_due(conn: &mut PgConnection, tickets: &[String]) -> QueryResult<Vec<String>> {
-    diesel::update(
-        orders::table
-            .filter(orders::queue_ticket_id.eq_any(tickets))
-            .filter(orders::status.eq(OrderState::AwaitingPayment))
-            .filter(orders::expires_at.le(diesel::dsl::now)),
+///
+/// An order is returned by exactly one call: after it, its status is no longer
+/// `AWAITING_PAYMENT`, so several workers at once never share an order.
+pub fn expire_batch(conn: &mut PgConnection, limit: i64) -> QueryResult<Vec<Order>> {
+    // Raw SQL: the DSL cannot update a table from a subselect over the same table
+    diesel::sql_query(
+        "UPDATE orders SET status = 'EXPIRED', updated_at = now() \
+         WHERE id IN (SELECT id FROM orders WHERE status = 'AWAITING_PAYMENT' AND expires_at <= now() \
+                      ORDER BY expires_at LIMIT $1 FOR UPDATE SKIP LOCKED) \
+         RETURNING *",
     )
-    .set(orders::status.eq(OrderState::Expired))
-    .returning(orders::queue_ticket_id)
+    .bind::<diesel::sql_types::BigInt, _>(limit)
     .get_results(conn)
-}
-
-/// The orders of `tickets`: after `expire_due`, the worker reads what
-/// PostgreSQL decided for the tickets it did not expire
-pub fn find_by_tickets(conn: &mut PgConnection, tickets: &[String]) -> QueryResult<Vec<Order>> {
-    orders::table
-        .filter(orders::queue_ticket_id.eq_any(tickets))
-        .select(Order::as_select())
-        .load(conn)
-}
-
-/// Whether the product still has a unit PostgreSQL could sell
-/// (`sold < total_inventory`). When a hold is live this is true unless Redis
-/// and PostgreSQL disagree, which is how the worker tells a payment refunded
-/// after its deadline from one refunded after the guard failed.
-pub fn has_free_unit(conn: &mut PgConnection, product_id: i32) -> QueryResult<bool> {
-    products::table
-        .filter(products::id.eq(product_id))
-        .filter(products::sold.lt(products::total_inventory))
-        .count()
-        .get_result::<i64>(conn)
-        .map(|n| n > 0)
-}
-
-/// Marks an order whose payment was refunded `REFUNDED`: from `AWAITING_PAYMENT`,
-/// `EXPIRED` or `FAILED`, never from `CONFIRMED`. Returns false if it was left alone.
-/// (`settle_payment` does this as part of its decision; this is the standalone form.)
-pub fn mark_refunded(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
-    let updated = diesel::update(
-        orders::table.filter(orders::queue_ticket_id.eq(ticket)).filter(orders::status.eq_any([
-            OrderState::AwaitingPayment,
-            OrderState::Expired,
-            OrderState::Failed,
-        ])),
-    )
-    .set(orders::status.eq(OrderState::Refunded))
-    .execute(conn)?;
-    Ok(updated == 1)
-}
-
-/// Marks an order whose hold the worker released `EXPIRED`, only from
-/// `AWAITING_PAYMENT`: a `CONFIRMED` or `REFUNDED` order is never overwritten.
-/// The unpaid loop does this in batches (`expire_due`); this is the form for the
-/// stale-order sweep. Returns whether the order was changed.
-pub fn mark_expired(conn: &mut PgConnection, ticket: &str) -> QueryResult<bool> {
-    let updated = diesel::update(
-        orders::table
-            .filter(orders::queue_ticket_id.eq(ticket))
-            .filter(orders::status.eq(OrderState::AwaitingPayment)),
-    )
-    .set(orders::status.eq(OrderState::Expired))
-    .execute(conn)?;
-    Ok(updated == 1)
-}
-
-/// `AWAITING_PAYMENT` orders whose deadline passed before `expired_before`, in
-/// id order after `after_id`: the stale-order sweep checks each against its
-/// hold. A page at a time, so rows that stay (their hold is still live) cannot
-/// hide the ones behind them.
-pub fn stale_awaiting_payment(
-    conn: &mut PgConnection,
-    expired_before: DateTime<Utc>,
-    after_id: i64,
-    limit: i64,
-) -> QueryResult<Vec<Order>> {
-    orders::table
-        .filter(orders::status.eq(OrderState::AwaitingPayment))
-        .filter(orders::expires_at.lt(expired_before))
-        .filter(orders::id.gt(after_id))
-        .order(orders::id.asc())
-        .limit(limit)
-        .select(Order::as_select())
-        .load(conn)
 }
 
 /// `EXPIRED` orders last changed between `since` and `before`, in id order
 /// after `after_id`: the sweep re-checks that the status reached the read
 /// cache and the payment session was stopped (a worker may have died after
-/// the order update).
+/// the order update). It never returns stock.
 pub fn recently_expired(
     conn: &mut PgConnection,
     since: DateTime<Utc>,

@@ -22,7 +22,7 @@ use tokio::sync::watch;
 
 use flash_sale::{
     actions,
-    cache::{self, CheckoutOutcome, HoldState, MaxScore, ReleasedAs},
+    cache::{self, CheckoutOutcome},
     models::{NewOrder, NewProduct, Order, OrderState, OrderStatus},
     payment::{FakeProvider, PaymentProvider, PaymentResult, ProviderEvent, Session, SharedProvider},
     processor::{self, Outcome, Processor},
@@ -58,14 +58,14 @@ async fn fixture(stock: i32) -> Fixture {
 
 impl Fixture {
     fn processor_with(&self, provider: SharedProvider) -> Processor {
-        Processor::new(self.env.pool.clone(), self.env.redis.clone(), self.env.read_cache.clone(), provider, WINDOW_SECS)
+        Processor::new(self.env.pool.clone(), self.env.read_cache.clone(), provider, WINDOW_SECS)
     }
 
     fn processor(&self) -> Processor {
         self.processor_with(self.env.shared_provider())
     }
 
-    /// A new guest with a `PENDING` hold and the event its checkout would publish
+    /// A new guest whose checkout reserved a unit, and the event it would publish
     async fn winner(&self) -> CheckoutEvent {
         let user = actions::users::create_guest(&mut self.env.pool.get().unwrap()).unwrap();
         let ticket = cache::new_ticket(self.sale);
@@ -73,16 +73,12 @@ impl Fixture {
             cache::checkout(&mut self.env.redis.clone(), self.sale, user.id, &format!("key-{}", user.id), &ticket)
                 .await
                 .unwrap();
-        let CheckoutOutcome::Held { checkout_ms } = outcome else { panic!("{outcome:?}") };
-        CheckoutEvent { ticket, sale: self.sale, user: user.id, checkout_ms }
+        let CheckoutOutcome::Reserved { checkout_ms } = outcome else { panic!("{outcome:?}") };
+        CheckoutEvent { ticket, sale: self.sale, user: user.id, checkout_ms, idempotency_key: format!("key-{}", user.id) }
     }
 
     fn order(&self, ticket: &str) -> Option<Order> {
         actions::orders::find_by_ticket(&mut self.env.pool.get().unwrap(), ticket).unwrap()
-    }
-
-    async fn hold_state(&self, ticket: &str) -> String {
-        cache::read_hold(&mut self.env.redis.clone(), self.sale, ticket).await.unwrap().unwrap().state
     }
 
     async fn stock(&self) -> i64 {
@@ -93,24 +89,17 @@ impl Fixture {
         cache::read_status(&mut self.env.read_cache.clone(), ticket).await.unwrap()
     }
 
-    async fn expiry_score(&self, ticket: &str) -> Option<i64> {
-        let score: Option<f64> = self.env.redis.clone().zscore(cache::holds_expiry_key(self.sale), ticket).await.unwrap();
-        score.map(|s| s as i64)
-    }
-
-    async fn release(&self, ticket: &str) {
-        let outcome = cache::release_hold(
-            &mut self.env.redis.clone(),
-            self.sale,
-            ticket,
-            HoldState::Pending,
-            MaxScore::Any,
-            ReleasedAs::Failed,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, cache::ReleaseOutcome::Released);
+    /// A unit-gating key as it stands: every inventory key the processor must leave alone
+    async fn inventory_keys(&self) -> Vec<(String, String)> {
+        let mut con = self.env.redis.clone();
+        let keys: Vec<String> = con.keys(format!("*{{{}}}*", self.sale)).await.unwrap();
+        let mut snapshot = Vec::new();
+        for key in keys {
+            let value: String = redis::cmd("GET").arg(&key).query_async(&mut con).await.unwrap_or_default();
+            snapshot.push((key, value));
+        }
+        snapshot.sort();
+        snapshot
     }
 
     async fn cleanup(&self) {
@@ -133,6 +122,7 @@ async fn a_checkout_event_becomes_an_order_with_a_payment_link() {
     let fx = fixture(5).await;
     let event = fx.winner().await;
     let processor = fx.processor();
+    let inventory_before = fx.inventory_keys().await;
 
     assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Linked);
 
@@ -140,18 +130,15 @@ async fn a_checkout_event_becomes_an_order_with_a_payment_link() {
     let order = fx.order(&event.ticket).unwrap();
     assert_eq!((order.status, order.user_id, order.product_id), (OrderState::AwaitingPayment, event.user, fx.sale));
     assert_eq!(order.amount_cents, 59_900);
-    assert_eq!(order.idempotency_key, format!("key-{}", event.user), "the key comes from the hold");
+    assert_eq!(order.idempotency_key, format!("key-{}", event.user), "the key comes from the event");
     let session_id = order.payment_session_id.clone().unwrap();
     assert_eq!(order.checkout_url.as_deref(), Some(format!("http://pay.test/fake-pay/{session_id}").as_str()));
     let expires_at = order.expires_at.unwrap();
     let window = expires_at - Utc::now();
     assert!(window > Duration::seconds(WINDOW_SECS as i64 - 10) && window <= Duration::seconds(WINDOW_SECS as i64));
 
-    // The hold moved to the expiry set, scored with the same deadline
-    assert_eq!(fx.hold_state(&event.ticket).await, "AWAITING_PAYMENT");
-    assert_eq!(fx.expiry_score(&event.ticket).await, Some(expires_at.timestamp_millis()));
-    let pending: Option<f64> = fx.env.redis.clone().zscore(cache::holds_pending_key(fx.sale), &event.ticket).await.unwrap();
-    assert!(pending.is_none());
+    // No inventory key was touched: the stock and the markers are as checkout left them
+    assert_eq!(fx.inventory_keys().await, inventory_before);
     assert_eq!(fx.stock().await, 4);
 
     // The status entry the client polls: the link and the same deadline
@@ -175,19 +162,17 @@ async fn a_redelivered_event_changes_nothing() {
     let processor = fx.processor();
     assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Linked);
     let before = fx.order(&event.ticket).unwrap();
-    let score = fx.expiry_score(&event.ticket).await;
 
     // The crash came before the status write: the redelivery repairs it
     let _: () = fx.env.read_cache.clone().0.del(cache::status_key(&event.ticket)).await.unwrap();
-    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Redelivered);
-    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Redelivered);
+    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Linked);
+    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Linked);
 
     let after = fx.order(&event.ticket).unwrap();
     assert_eq!(
         (after.id, after.status, &after.payment_session_id, &after.checkout_url, after.expires_at),
         (before.id, before.status, &before.payment_session_id, &before.checkout_url, before.expires_at)
     );
-    assert_eq!(fx.expiry_score(&event.ticket).await, score);
     assert_eq!(fx.stock().await, 4);
     let status = fx.status(&event.ticket).await.unwrap();
     assert_eq!((status.status, status.payment_url), (OrderStatus::AwaitingPayment, before.checkout_url.clone()));
@@ -197,88 +182,57 @@ async fn a_redelivered_event_changes_nothing() {
     fx.cleanup().await;
 }
 
+/// The Order Service could not publish, recorded the ticket as FAILED and
+/// returned the unit; the message reached Kafka after all
 #[tokio::test]
-async fn a_released_hold_is_skipped_without_an_order() {
+async fn a_failed_order_stops_the_processor_and_expires_its_session() {
     let fx = fixture(5).await;
     let event = fx.winner().await;
-    fx.release(&event.ticket).await;
+    assert!(matches!(
+        actions::orders::insert_failed(&mut fx.env.pool.get().unwrap(), event.user, fx.sale, &event.ticket).unwrap(),
+        actions::orders::FailedInsert::Created
+    ));
+    let inventory_before = fx.inventory_keys().await;
 
-    assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Skipped);
-    assert!(fx.order(&event.ticket).is_none());
-    assert!(fx.status(&event.ticket).await.is_none());
-    assert!(fx.fake.session_id_for_ticket(&event.ticket).await.unwrap().is_none(), "no payment session was made");
-    assert_eq!(fx.stock().await, 5);
-    fx.cleanup().await;
-}
+    assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Failed);
 
-/// Releases the hold while the processor is creating the session: the window
-/// between the order insert and `link_ready.lua`
-struct ReleasingProvider {
-    inner: SharedProvider,
-    fixture_redis: cache::RedisConn,
-    sale: i32,
-}
-
-#[async_trait]
-impl PaymentProvider for ReleasingProvider {
-    fn name(&self) -> &'static str {
-        "releasing"
-    }
-
-    async fn create_session(&self, ticket: &str, amount: i32, at: DateTime<Utc>, key: &str) -> PaymentResult<Session> {
-        let session = self.inner.create_session(ticket, amount, at, key).await?;
-        let outcome = cache::release_hold(
-            &mut self.fixture_redis.clone(),
-            self.sale,
-            ticket,
-            HoldState::Pending,
-            MaxScore::Any,
-            ReleasedAs::Expired,
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, cache::ReleaseOutcome::Released);
-        Ok(session)
-    }
-
-    async fn expire_session(&self, id: &str) -> PaymentResult<()> {
-        self.inner.expire_session(id).await
-    }
-
-    async fn refund(&self, id: &str) -> PaymentResult<()> {
-        self.inner.refund(id).await
-    }
-
-    fn verify_webhook(&self, headers: &HeaderMap, body: &[u8]) -> PaymentResult<ProviderEvent> {
-        self.inner.verify_webhook(headers, body)
-    }
-}
-
-#[tokio::test]
-async fn a_hold_released_before_the_link_fails_the_order_and_expires_the_session() {
-    let fx = fixture(5).await;
-    let event = fx.winner().await;
-    let provider: SharedProvider =
-        Arc::new(ReleasingProvider { inner: fx.env.shared_provider(), fixture_redis: fx.env.redis.clone(), sale: fx.sale });
-
-    assert_eq!(fx.processor_with(provider).handle(&event).await.unwrap(), Outcome::Failed);
-
+    // The row stays FAILED, without a session or link; nothing else was written
     let order = fx.order(&event.ticket).unwrap();
-    assert_eq!(order.status, OrderState::Failed);
-    let session = fx.fake.session(&order.payment_session_id.unwrap()).await.unwrap().unwrap();
-    assert_eq!(session.state, "EXPIRED");
-    let status = fx.status(&event.ticket).await.unwrap();
-    assert_eq!((status.status, status.payment_url), (OrderStatus::Failed, None));
-    // The hold stays released (the releaser returned the unit), never linked
-    assert_eq!(fx.hold_state(&event.ticket).await, "EXPIRED");
-    assert_eq!(fx.expiry_score(&event.ticket).await, None);
-    assert_eq!(fx.stock().await, 5);
+    assert_eq!((order.status, order.payment_session_id, order.checkout_url, order.expires_at), (OrderState::Failed, None, None, None));
+    assert!(fx.status(&event.ticket).await.is_none(), "no status entry");
+    assert_eq!(fx.inventory_keys().await, inventory_before, "no inventory key");
+    // The session made for the message is stopped: nobody can pay it
+    let session_id = fx.fake.session_id_for_ticket(&event.ticket).await.unwrap().unwrap();
+    assert_eq!(fx.fake.session(&session_id).await.unwrap().unwrap().state, "EXPIRED");
+    // A redelivery does the same
+    assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Failed);
+    fx.cleanup().await;
+}
+
+/// A redelivery after the order was paid or expired writes nothing and leaves
+/// its (paid) session alone
+#[tokio::test]
+async fn a_redelivery_after_the_order_moved_on_is_skipped() {
+    let fx = fixture(5).await;
+    let event = fx.winner().await;
+    let processor = fx.processor();
+    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Linked);
+    let session_id = fx.order(&event.ticket).unwrap().payment_session_id.unwrap();
+    diesel::update(orders::table.filter(orders::queue_ticket_id.eq(&event.ticket)))
+        .set(orders::status.eq(OrderState::Confirmed))
+        .execute(&mut fx.env.pool.get().unwrap())
+        .unwrap();
+    let before = fx.status(&event.ticket).await;
+
+    assert_eq!(processor.handle(&event).await.unwrap(), Outcome::Skipped);
+    assert_eq!(fx.order(&event.ticket).unwrap().status, OrderState::Confirmed);
+    assert_eq!(fx.status(&event.ticket).await, before);
+    assert_eq!(fx.fake.session(&session_id).await.unwrap().unwrap().state, "OPEN", "the session is not touched");
     fx.cleanup().await;
 }
 
 #[tokio::test]
-async fn an_order_another_constraint_refuses_leaves_the_hold_alone() {
+async fn an_order_another_constraint_refuses_fails_the_ticket_and_expires_the_session() {
     let fx = fixture(5).await;
     let event = fx.winner().await;
     // The user already has a live order from some other ticket
@@ -299,19 +253,19 @@ async fn an_order_another_constraint_refuses_leaves_the_hold_alone() {
 
     assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Dropped);
     assert!(fx.order(&event.ticket).is_none());
-    assert_eq!(fx.hold_state(&event.ticket).await, "PENDING", "the leaked-hold loop releases it later");
-    assert!(fx.status(&event.ticket).await.is_none(), "no status was written");
-    // The session made for it is stopped: nobody can pay a link that is never shown
+    // The client is told, and the session made for it is stopped: nobody can
+    // pay a link that is never shown
+    assert_eq!(fx.status(&event.ticket).await.unwrap().status, OrderStatus::Failed);
     let session_id = fx.fake.session_id_for_ticket(&event.ticket).await.unwrap().unwrap();
     assert_eq!(fx.fake.session(&session_id).await.unwrap().unwrap().state, "EXPIRED");
     fx.cleanup().await;
 }
 
-/// The processor died after the INSERT but before `link_ready.lua`: the hold is
-/// still `PENDING` and the order exists with its first session and deadline.
-/// The redelivery keeps that row and links the hold with its deadline.
+/// The processor died after the INSERT but before the status write: the order
+/// exists with its first session and deadline. The redelivery keeps that row
+/// and writes its link and deadline.
 #[tokio::test]
-async fn a_redelivery_after_the_insert_links_the_hold_with_the_orders_deadline() {
+async fn a_redelivery_after_the_insert_publishes_the_orders_link_and_deadline() {
     let fx = fixture(5).await;
     let event = fx.winner().await;
     let first_deadline_ms = Utc::now().timestamp_millis() + 120_000;
@@ -331,7 +285,7 @@ async fn a_redelivery_after_the_insert_links_the_hold_with_the_orders_deadline()
         })
         .execute(&mut fx.env.pool.get().unwrap())
         .unwrap();
-    assert_eq!(fx.hold_state(&event.ticket).await, "PENDING");
+    assert!(fx.status(&event.ticket).await.is_none());
 
     assert_eq!(fx.processor().handle(&event).await.unwrap(), Outcome::Linked);
 
@@ -341,8 +295,6 @@ async fn a_redelivery_after_the_insert_links_the_hold_with_the_orders_deadline()
         (Some(session.id.as_str()), Some(first_deadline)),
         "the row of the first attempt stays"
     );
-    assert_eq!(fx.hold_state(&event.ticket).await, "AWAITING_PAYMENT");
-    assert_eq!(fx.expiry_score(&event.ticket).await, Some(first_deadline_ms));
     let status = fx.status(&event.ticket).await.unwrap();
     assert_eq!((status.status, status.payment_url), (OrderStatus::AwaitingPayment, Some(session.url.clone())));
     assert_eq!(status.expires_at, Some(millis(first_deadline)));
@@ -427,8 +379,8 @@ async fn the_consumer_loop_processes_commits_and_reports_progress() {
     let (stop, shutdown) = watch::channel(false);
     let processor = Arc::new(fx.processor());
     let run = tokio::spawn({
-        let (config, inventory, read_cache) = (config.clone(), fx.env.redis.clone(), fx.env.read_cache.clone());
-        async move { processor::run(&config, processor, inventory, read_cache, shutdown).await }
+        let (config, read_cache) = (config.clone(), fx.env.read_cache.clone());
+        async move { processor::run(&config, processor, read_cache, shutdown).await }
     });
 
     // Per partition: the last message by offset
@@ -466,13 +418,9 @@ async fn the_consumer_loop_processes_commits_and_reports_progress() {
         let status = fx.status(&event.ticket).await.unwrap();
         assert_eq!(status.status, OrderStatus::AwaitingPayment);
         assert!(status.payment_url.unwrap().starts_with("http://pay.test/fake-pay/"));
-        assert_eq!(fx.hold_state(&event.ticket).await, "AWAITING_PAYMENT");
     }
-    // processed_upto per partition = checkout time of the last message, progress = its offset
-    let mut inventory = fx.env.redis.clone();
-    for (&partition, &(offset, checkout_ms)) in &last {
-        let upto = cache::read_processed_upto(&mut inventory, fx.sale, partition).await.unwrap();
-        assert_eq!(upto, Some(checkout_ms), "partition {partition}");
+    // The queue-position progress per partition = the offset of the last message
+    for (&partition, &(offset, _)) in &last {
         let progress = cache::read_progress(&mut read_cache, &config.checkout_topic, partition).await.unwrap();
         assert_eq!(progress, Some(offset), "partition {partition}");
     }

@@ -153,23 +153,12 @@ async fn an_expired_session_cannot_be_paid() {
     fx.cleanup().await;
 }
 
-/// A payment after the hold ran out but before the session was expired is
-/// accepted by the provider: it does not know about our hold
+/// A payment after our deadline but before the session was expired is
+/// accepted by the provider: it does not know our deadline
 #[actix_web::test]
 async fn the_provider_accepts_a_payment_the_merchant_will_have_to_refund() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    flash_sale::cache::release_hold(
-        &mut fx.env.redis.clone(),
-        fx.sale,
-        &a.event.ticket,
-        flash_sale::cache::HoldState::AwaitingPayment,
-        flash_sale::cache::MaxScore::Any,
-        flash_sale::cache::ReleasedAs::Expired,
-        false,
-    )
-    .await
-    .unwrap();
     let app = provider_app!(fx.env);
 
     let resp = test::call_service(&app, test::TestRequest::post().uri(&format!("/fake-pay/{}/pay", a.session.id)).to_request()).await;

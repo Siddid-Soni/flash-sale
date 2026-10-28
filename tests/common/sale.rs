@@ -12,6 +12,7 @@ use redis::AsyncCommands;
 use flash_sale::{
     actions,
     cache::{self, CheckoutOutcome},
+    expiry::{Expirer, Settings},
     inbox::InboxWorker,
     models::{NewPaymentInboxEntry, NewProduct, Order},
     payment::{
@@ -24,6 +25,15 @@ use flash_sale::{
 
 use super::{Env, WEBHOOK_SECRET};
 
+/// Held by a test while it has orders past their deadline or runs the
+/// expiration worker, which expires every due order in the database: tests of
+/// one binary run in parallel and must not expire each other's orders
+static DUE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+pub async fn due_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    DUE.lock().await
+}
+
 pub const PRICE_CENTS: i32 = 59_900;
 pub const WINDOW_SECS: u64 = 300;
 
@@ -32,7 +42,7 @@ pub struct SaleFixture {
     pub sale: i32,
 }
 
-/// An order waiting for payment: its hold is `AWAITING_PAYMENT`
+/// An order waiting for payment: `AWAITING_PAYMENT` in PostgreSQL, with its session
 pub struct Awaiting {
     pub event: CheckoutEvent,
     pub order: Order,
@@ -74,20 +84,34 @@ impl SaleFixture {
     }
 
     pub fn processor(&self) -> Processor {
-        Processor::new(
+        Processor::new(self.env.pool.clone(), self.env.read_cache.clone(), self.env.shared_provider(), WINDOW_SECS)
+    }
+
+    /// An expiration worker with a batch of `batch` orders
+    pub fn expirer_with(&self, batch: usize) -> Expirer {
+        let settings = Settings {
+            batch,
+            stale_after: Duration::minutes(10),
+            expired_recheck: Duration::minutes(30),
+        };
+        Expirer::new(
             self.env.pool.clone(),
             self.env.redis.clone(),
             self.env.read_cache.clone(),
             self.env.shared_provider(),
-            WINDOW_SECS,
+            settings,
         )
+    }
+
+    pub fn expirer(&self) -> Expirer {
+        self.expirer_with(200)
     }
 
     pub fn inbox_worker(&self) -> Arc<InboxWorker> {
         Arc::new(InboxWorker::new(self.env.pool.clone(), self.env.read_cache.clone(), self.env.shared_provider()))
     }
 
-    /// A new guest with a `PENDING` hold and the event its checkout would publish
+    /// A new guest whose checkout reserved a unit, and the event it would publish
     pub async fn winner(&self) -> CheckoutEvent {
         let user = actions::users::create_guest(&mut self.env.pool.get().unwrap()).unwrap();
         let ticket = cache::new_ticket(self.sale);
@@ -95,11 +119,11 @@ impl SaleFixture {
             cache::checkout(&mut self.env.redis.clone(), self.sale, user.id, &format!("key-{}", user.id), &ticket)
                 .await
                 .unwrap();
-        let CheckoutOutcome::Held { checkout_ms } = outcome else { panic!("{outcome:?}") };
-        CheckoutEvent { ticket, sale: self.sale, user: user.id, checkout_ms }
+        let CheckoutOutcome::Reserved { checkout_ms } = outcome else { panic!("{outcome:?}") };
+        CheckoutEvent { ticket, sale: self.sale, user: user.id, checkout_ms, idempotency_key: format!("key-{}", user.id) }
     }
 
-    /// A winner whose order and payment session exist and whose hold awaits payment
+    /// A winner whose order and payment session exist and which awaits payment
     pub async fn awaiting(&self) -> Awaiting {
         let event = self.winner().await;
         assert_eq!(self.processor().handle(&event).await.unwrap(), Outcome::Linked);
@@ -116,16 +140,9 @@ impl SaleFixture {
         actions::products::find_product(&mut self.env.pool.get().unwrap(), self.sale).unwrap().unwrap()
     }
 
-    /// Moves the payment deadline of an `AWAITING_PAYMENT` order, in PostgreSQL
-    /// (which decides) and in `holds:expiry` (which says when to look), to `at_ms`
-    /// (epoch ms)
-    pub async fn set_deadline(&self, ticket: &str, at_ms: i64) {
-        self.set_pg_deadline(ticket, at_ms);
-        self.set_redis_deadline(ticket, at_ms).await;
-    }
-
-    /// Only PostgreSQL's deadline of the order
-    pub fn set_pg_deadline(&self, ticket: &str, at_ms: i64) {
+    /// Moves the payment deadline of an order, in PostgreSQL (which decides), to
+    /// `at_ms` (epoch ms)
+    pub fn set_deadline(&self, ticket: &str, at_ms: i64) {
         use flash_sale::schema::orders;
         let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap();
         let changed = diesel::update(orders::table.filter(orders::queue_ticket_id.eq(ticket)))
@@ -135,38 +152,28 @@ impl SaleFixture {
         assert_eq!(changed, 1, "{ticket} has no order");
     }
 
-    /// Only the hold's score in `holds:expiry`
-    pub async fn set_redis_deadline(&self, ticket: &str, at_ms: i64) {
-        let changed: i64 = redis::cmd("ZADD")
-            .arg(cache::holds_expiry_key(self.sale))
-            .arg("XX")
-            .arg("CH")
-            .arg(at_ms)
-            .arg(ticket)
-            .query_async(&mut self.env.redis.clone())
-            .await
-            .unwrap();
-        assert_eq!(changed, 1, "{ticket} is not in holds:expiry");
+    /// The deadline has passed
+    pub fn make_due(&self, ticket: &str) {
+        self.set_deadline(ticket, Utc::now().timestamp_millis() - 1_000);
     }
 
-    /// The deadline has passed, for PostgreSQL and for Redis
-    pub async fn make_due(&self, ticket: &str) {
-        self.set_deadline(ticket, Utc::now().timestamp_millis() - 1_000).await;
+    /// Runs the expiration worker until no order is due (every sale's, as the
+    /// worker does); returns how many orders it expired. Take `due_guard` first.
+    pub async fn expire_due(&self) -> usize {
+        let expirer = self.expirer();
+        let mut expired = 0;
+        loop {
+            let pass = expirer.expire_pass().await.unwrap();
+            expired += pass.expired;
+            if !pass.more {
+                return expired;
+            }
+        }
     }
 
-    /// Holds waiting in `holds:expiry:{sale}`
-    pub async fn expiry_len(&self) -> i64 {
-        self.env.redis.clone().zcard(cache::holds_expiry_key(self.sale)).await.unwrap()
-    }
-
-    pub async fn hold_state(&self, ticket: &str) -> String {
-        self.hold_state_opt(ticket).await.expect("the hold should exist")
-    }
-
-    /// The hold's state, `None` when the hold does not exist (a paid hold is
-    /// deleted when the worker closes it)
-    pub async fn hold_state_opt(&self, ticket: &str) -> Option<String> {
-        cache::read_hold(&mut self.env.redis.clone(), self.sale, ticket).await.unwrap().map(|h| h.state)
+    /// The ticket `user_live` names for a user, if any
+    pub async fn user_live(&self, user: i32) -> Option<String> {
+        self.env.redis.clone().get(cache::user_live_key(self.sale, user)).await.unwrap()
     }
 
     pub async fn counter(&self, key: String) -> i64 {

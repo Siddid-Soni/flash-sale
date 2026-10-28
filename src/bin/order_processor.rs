@@ -33,12 +33,10 @@ async fn main() {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     let config = Config::from_env();
     let pool = db::init_pool(&config);
-    let inventory = cache::connect(&config).await;
     let read_cache = cache::connect_read_cache(&config).await;
     let provider = payment::from_config(&config);
     let inbox = Arc::new(InboxWorker::new(pool.clone(), read_cache.clone(), provider.clone()));
-    let processor =
-        Arc::new(Processor::new(pool, inventory.clone(), read_cache.clone(), provider.clone(), config.payment_window_secs));
+    let processor = Arc::new(Processor::new(pool, read_cache.clone(), provider.clone(), config.payment_window_secs));
 
     // The Order Service creates the topic too; whichever starts first does it
     if let Err(e) = queue::ensure_topic(&config).await {
@@ -81,7 +79,7 @@ async fn main() {
 
     let inbox_loop = tokio::spawn(inbox.run(shutdown.clone()));
 
-    if let Err(e) = processor::run(&config, processor, inventory, read_cache, shutdown).await {
+    if let Err(e) = processor::run(&config, processor, read_cache, shutdown).await {
         log::error!("Order processor stopped: {e}");
         std::process::exit(1);
     }

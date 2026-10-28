@@ -89,11 +89,11 @@ curl -si http://localhost:8000/v1/sales/1
 | `200` | `{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}`; `Cache-Control: public, max-age=1, stale-while-revalidate=5`, `X-Cache-Status` |
 | `404` | `{"message": "sale 9 not found"}` (a non-numeric id is also `404`) |
 
-`sold_out` is true when `stock:{sale}` is 0 or missing. It can turn false again when a hold is released and a unit returns to stock.
+`sold_out` is true when `stock:{sale}` is 0 or missing. It can turn false again when the expiration worker expires an unpaid order and its unit returns to stock.
 
 ### `POST /v1/sales/{sale_id}/checkout`
 
-Reserves one unit for the caller. This is the hot path: it never touches PostgreSQL.
+Reserves one unit for the caller. This is the hot path: it touches PostgreSQL only when the Kafka publish fails.
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8000/v1/session | jq -r .token)
@@ -101,7 +101,7 @@ curl -si -X POST http://localhost:8000/v1/sales/1/checkout \
   -H "Authorization: Bearer $TOKEN" -H "Idempotency-Key: $(uuidgen)"
 ```
 
-Checks happen in this order: the replica's sold-out flag, then in Redis: sale known, sale started (Redis `TIME`), idempotency key, one live hold per user, stock.
+Checks happen in this order: the replica's sold-out flag, then in Redis: sale known, sale started (Redis `TIME`), idempotency key, one live ticket per user (`user_live`), stock.
 
 | Status | Meaning | Body and headers |
 |---|---|---|
@@ -114,18 +114,19 @@ Checks happen in this order: the replica's sold-out flag, then in Redis: sale kn
 | `409` | The caller already holds or bought one | `{"message": "you already hold or bought one"}` |
 | `410` | Sold out | `{"message": "sold out"}` |
 | `429` | Gateway rate limit | see Gateway behaviour |
-| `503` | The Kafka publish failed. The hold was released and the key forgotten, so a retry with the same key starts over | `{"message": "the checkout queue is unavailable, retry with the same key"}`, `Retry-After: 1` |
+| `503` | The Kafka publish failed. The ticket was recorded as a `FAILED` order, the unit returned and the key forgotten, so a retry with the same key starts over | `{"message": "the checkout queue is unavailable, retry with the same key"}`, `Retry-After: 1` |
 
 Notes:
 
-- The ticket is `<sale>.<uuid v4>`. The sale id in it lets the status endpoint find the hold.
+- The ticket is `<sale>.<uuid v4>`. The sale id in it tells the status endpoint which sale the ticket belongs to.
+- If the publish fails but the message had reached Kafka after all (an order for the ticket already exists), the answer is the normal `202` with the ticket, not `503`.
 - Retrying with the same key is always safe. A retry of a successful checkout gets `200` and the same ticket, not `409`.
 - Once a replica's sold-out flag is set (refreshed every 100 ms from Redis), it answers `410` without asking Redis, also to a winner retrying. The winner's ticket still works on the status endpoint.
 - A replica that has not yet seen a sale asks Redis; unknown sales are never short-circuited.
 
 ### `GET /v1/orders/status/{queue_ticket_id}`
 
-Only winners poll, every 2 seconds. The answer comes from the read cache; if that entry is missing it falls back to the hold in the inventory Redis, then to PostgreSQL.
+Only winners poll, every 2 seconds. The answer comes from the read cache; if that entry is missing it falls back to PostgreSQL. A ticket with neither is `404`: Redis keeps no record of a ticket (a ticket whose cache write was lost reads `404` until its order exists).
 
 ```bash
 curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization: Bearer $TOKEN"
@@ -135,12 +136,12 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 
 | `status` | Extra fields | Meaning |
 |---|---|---|
-| `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache or the hold). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition (a fallback answer) |
-| `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds). If the cache entry is gone and the order row does not exist yet, the answer from the hold alone has neither |
-| `CONFIRMED` | | Paid in time (PostgreSQL decided and counted it in `products.sold`). Final. Answered from PostgreSQL: the hold is still waiting for the expiration worker, or already deleted |
-| `EXPIRED` | | The payment window ran out and the unit was returned. Final |
-| `FAILED` | | The hold was released before a payment link existed (publish failed, a leaked hold, or released while the processor worked). Final |
-| `REFUNDED` | | A payment arrived but could not be honoured (PostgreSQL's deadline had passed, the order was already `EXPIRED` or `FAILED`, or the PostgreSQL guard refused) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
+| `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache only). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition |
+| `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds) (answered from the order row when the cache entry is gone) |
+| `CONFIRMED` | | Paid in time (PostgreSQL decided and counted it in `products.sold`). Final. The unit stays taken: the expiration worker never returns a confirmed order's stock |
+| `EXPIRED` | | The payment window ran out; the expiration worker expired the order and returned the unit. Final |
+| `FAILED` | | The checkout never became an order: the publish failed and the unit was returned at once, or the order could not be created. Final |
+| `REFUNDED` | | A payment arrived but could not be honoured (the order was already `EXPIRED` or `FAILED`, or the PostgreSQL guard refused an in-time payment) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
 
 ```json
 {"status": "PENDING", "position": 42}
@@ -193,8 +194,8 @@ That event is made up, but it is stored and a processor keeps retrying it becaus
 
 | `type` | Sent when | Effect |
 |---|---|---|
-| `checkout.session.completed` | The user paid (`payment_id` is set) | The order is confirmed if its deadline is still ahead on PostgreSQL's clock, else refunded |
-| `checkout.session.payment_failed` | The user cancelled (`payment_id` is `null`) | Nothing; the hold runs out by itself |
+| `checkout.session.completed` | The user paid (`payment_id` is set) | The order is confirmed if its deadline is still ahead on PostgreSQL's clock. If the order is already `EXPIRED` or `FAILED` it is refunded. If its deadline has passed but the expiration worker has not expired it yet, nothing is decided: the event stays in the inbox and is retried, and is refunded once the worker has expired the order |
+| `checkout.session.payment_failed` | The user cancelled (`payment_id` is `null`) | Nothing; the order runs out by itself |
 
 `id` and `payment_id` are derived from the session, so a redelivered event has the same id and the inbox's unique `provider_event_id` drops the duplicate. The fake provider delivers at least once: it retries with a delay of 1 s doubling to 1 h and gives up after 24 h. The webhook route has no rate limit and no bot check at the gateway (only the address check).
 
@@ -229,7 +230,7 @@ Body: `name` (1-255 characters), `price_cents` (positive), `total_inventory` (1 
 | `409` | The session is already `PAID`, `CANCELED` or `REFUNDED` (page says so) |
 | `410` | The session is `EXPIRED`; payment is no longer possible |
 
-The provider does not know about our hold. It accepts a payment on any `OPEN` session, even after the deadline, and the backend then refunds. It refuses only `EXPIRED` sessions, which the expiration worker sets after releasing a hold. Sessions live 7 days so a late payment can still be refunded.
+The provider does not know our deadline. It accepts a payment on any `OPEN` session, even after the deadline, and the backend then refunds. It refuses only `EXPIRED` sessions, which the expiration worker sets after expiring an order. Sessions live 7 days so a late payment can still be refunded.
 
 ### Fake provider API (internal)
 
@@ -241,28 +242,30 @@ Not reachable through the gateway: the order processor and the expiration worker
 | `POST /v1/checkout/sessions/{id}/expire` | Stops an open session from accepting payment. `200 {"id", "state"}` also for an unknown, paid or already expired session |
 | `POST /v1/refunds` with body `{"session_id"}` | Refunds a paid session: `200`, and `200` again when repeated. `409` for a session that was not paid or is unknown |
 
-## Order and hold states
+## Order states
 
-A ticket has one of six statuses (`status:<ticket>`, API). `PENDING` is the sixth: it exists only in the hold and the read cache, while the checkout event waits in Kafka. The order row is created later, directly as `AWAITING_PAYMENT`, so `orders.status` has the other five. The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker releases or closes the hold. Redis holds stock and holds only; PostgreSQL is the record of sales.
+A ticket has one of six statuses (`status:<ticket>`, API). `PENDING` is the sixth: it exists only in the read cache, while the checkout event waits in Kafka. The order row is created later, directly as `AWAITING_PAYMENT` (or as `FAILED` by the Order Service when a publish fails), so `orders.status` has the other five. PostgreSQL decides every outcome, between a payment and the payment deadline too, on its own clock. Redis gates admission only: it holds `stock:{sale}`, the user's `user_live` marker and the idempotency key, and no per-ticket state.
 
 ```
-checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_at)--> CONFIRMED
-               |                              |
-               | leaked: behind progress      | unpaid: 5 min after the link
-               v                              v
-            FAILED                         EXPIRED          (a payment after the deadline: REFUNDED)
+checkout --> PENDING --(order created)--> AWAITING_PAYMENT --(paid before expires_at)--> CONFIRMED
+ (Redis: unit,  |                                |
+  user_live)    | publish failed                 | unpaid: 5 min after the link
+                v                                v
+             FAILED                           EXPIRED          (a payment after that: REFUNDED)
 ```
 
-| Status | Hold state | Waiting for | Leaves by |
-|---|---|---|---|
-| `PENDING` (never in PostgreSQL) | `PENDING` | An order processor (no clock runs; no order row yet) | Link ready (the order is inserted as `AWAITING_PAYMENT` first); or release: publish failed (at once), or leaked (expiration worker) |
-| `AWAITING_PAYMENT` | `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment: the order becomes `CONFIRMED` in PostgreSQL (the hold stays `AWAITING_PAYMENT` and in `holds:expiry`); or, at `expires_at`, the expiration worker expires the order and releases the hold |
-| `CONFIRMED` | `AWAITING_PAYMENT`, then deleted | The expiration worker, at the deadline | The worker closes (deletes) the hold; no stock is returned and no counter changes (the sale is in `products.sold`). Final |
-| `EXPIRED` | `EXPIRED` | | Final (a late payment still turns it into `REFUNDED`) |
-| `FAILED` | `FAILED` | | Final (same) |
-| `REFUNDED` | `AWAITING_PAYMENT`, then `EXPIRED` (late payment) or deleted (guard failure) | The expiration worker, at the deadline | Late payment: the worker releases the hold. Guard failure: it closes (deletes) the hold without returning stock. Final |
+| Status | Waiting for | Leaves by |
+|---|---|---|
+| `PENDING` (never in PostgreSQL) | An order processor (no clock runs; no order row yet) | The processor inserts the order as `AWAITING_PAYMENT`; or the publish failed: the Order Service inserts a `FAILED` order and returns the unit at once |
+| `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment: the order becomes `CONFIRMED`; or, at `expires_at`, the expiration worker expires the order and returns the unit (`INCR stock`, clear `user_live`) |
+| `CONFIRMED` | | Final. The unit stays taken, `user_live` stays until it expires a day after the sale, the sale is counted in `products.sold` |
+| `EXPIRED` | | Final (a late payment still turns it into `REFUNDED`, moving no stock) |
+| `FAILED` | | Final (same) |
+| `REFUNDED` | | Final. Moves no stock: the worker already returned the unit of an expired order, and an in-time payment refused by the guard never had a unit to sell |
 
-The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`). A paid hold stays `AWAITING_PAYMENT` in Redis until the worker closes it (deletes it), so the status endpoint reads the order row from PostgreSQL when the hold says `AWAITING_PAYMENT`, or when it is gone, and the read cache has no entry. Hold states `CONFIRMED` and `REFUNDED` do not exist.
+The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`). When the read cache has no entry the status endpoint reads the order row from PostgreSQL.
+
+The rare failures this design accepts, each of which can only sell fewer units than there are, are in [docs/FAILURE_CASES.md](docs/FAILURE_CASES.md).
 
 ## Gateway behaviour
 

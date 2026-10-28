@@ -6,8 +6,9 @@ pub struct Config {
     pub database_url: String,
     /// Where the API listens; `0.0.0.0:8080` in a container
     pub bind_addr: String,
-    /// Inventory Redis: stock, holds, queues, processor progress. All inventory
-    /// scripts run here and touch only inventory keys
+    /// Inventory Redis: stock, one-per-user markers, idempotency keys, sale
+    /// start times. All inventory scripts run here and touch
+    /// only inventory keys
     pub redis_url: String,
     /// Read cache Redis: only `status:<ticket>`, what clients poll. Defaults to
     /// `REDIS_URL` (one instance locally, separate clusters in production)
@@ -17,8 +18,8 @@ pub struct Config {
     pub checkout_topic: String,
     /// Partitions the topic is created with (processors scale up to this many)
     pub checkout_partitions: i32,
-    /// How long the producer retries a publish before reporting failure. Also
-    /// the margin the expiration worker keeps before it releases a leaked hold
+    /// How long the producer retries a publish before reporting failure (after
+    /// which the Order Service compensates and answers 503)
     pub kafka_delivery_timeout_ms: u32,
     pub db_pool_size: u32,
     /// Redis connections the API spreads its worker threads over. Each one
@@ -63,15 +64,13 @@ pub struct Config {
     /// Cap on checkout messages one order processor starts per second
     /// (0 = unlimited); the Stage 9 backlog test throttles with it
     pub processor_max_per_sec: u32,
-    /// Holds the expiration worker releases per sale and pass; a full batch is
-    /// followed at once by another
+    /// Orders the expiration worker expires per pass; a full batch is followed
+    /// at once by another
     pub expiry_batch: usize,
     /// How long the expiration worker sleeps when a pass found nothing more to do
     pub expiry_interval_ms: u64,
-    /// How often the expiration worker checks for leaked holds (it reads the
-    /// consumer group's offsets from Kafka each time)
-    pub expiry_leaked_every_ms: u64,
-    /// How often the expiration worker sweeps for orders left behind by a crash
+    /// How often the expiration worker sweeps for expired orders whose status or
+    /// payment session step was missed
     pub expiry_sweep_secs: u64,
     /// Names this Order Service replica; when set, every response carries
     /// `X-Replica: <id>` so balancing and failover can be observed at the gateway
@@ -125,7 +124,6 @@ impl Config {
             processor_max_per_sec: or_default("PROCESSOR_MAX_PER_SEC", 0),
             expiry_batch: or_default("EXPIRY_BATCH", 200),
             expiry_interval_ms: or_default("EXPIRY_INTERVAL_MS", 250),
-            expiry_leaked_every_ms: or_default("EXPIRY_LEAKED_EVERY_MS", 1000),
             expiry_sweep_secs: or_default("EXPIRY_SWEEP_SECS", 60),
             replica_id: env::var("REPLICA_ID").ok().filter(|id| !id.trim().is_empty()),
             session_challenge: or_default("SESSION_CHALLENGE", "off".to_string()),

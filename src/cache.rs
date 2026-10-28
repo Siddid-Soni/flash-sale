@@ -1,8 +1,10 @@
 //! Redis connections and the keys stored in Redis (see ROADMAP.md, Redis Keys).
 //!
-//! There are two roles. The inventory Redis (`REDIS_URL`) holds stock, holds,
-//! queues and processor progress; every inventory Lua script runs there and
-//! touches only inventory keys. The read cache (`READ_CACHE_URL`, the same
+//! There are two roles. The inventory Redis (`REDIS_URL`) gates admission only:
+//! stock, the one-per-user marker, idempotency keys and the sale's opening
+//! time; every inventory Lua script runs there and
+//! touches only inventory keys. Kafka is the queue and PostgreSQL decides every
+//! outcome, so Redis keeps no per-ticket state. The read cache (`READ_CACHE_URL`, the same
 //! instance locally) holds only `status:<ticket>`, what clients poll, and
 //! `progress:<topic>:<partition>`, what turns an offset into a queue position,
 //! so polling can never slow down checkout.
@@ -53,7 +55,8 @@ pub fn sale_start_key(sale: i32) -> String {
     format!("sale_start:{{{sale}}}")
 }
 
-/// The user's live ticket (one per user)
+/// The user's live ticket (one per user): set by `checkout.lua` with a TTL
+/// that outlives the sale, deleted by whoever returns the unit
 pub fn user_live_key(sale: i32, user: i32) -> String {
     format!("user_live:{{{sale}}}:{user}")
 }
@@ -61,29 +64,6 @@ pub fn user_live_key(sale: i32, user: i32) -> String {
 /// Ticket for an idempotency key
 pub fn idem_key(sale: i32, user: i32, key: &str) -> String {
     format!("idem:{{{sale}}}:{user}:{key}")
-}
-
-/// Hash with `state`, `user`, `checkout_ms`, `idem` (the idempotency key the
-/// order is stored with), later `payment_session`. A paid hold stays
-/// `AWAITING_PAYMENT` until the expiration worker closes it (a paid hold is
-/// deleted then; a released one is kept for a day).
-pub fn hold_key(sale: i32, ticket: &str) -> String {
-    format!("hold:{{{sale}}}:{ticket}")
-}
-
-/// Sorted set of `PENDING` holds, score = checkout time (ms)
-pub fn holds_pending_key(sale: i32) -> String {
-    format!("holds:pending:{{{sale}}}")
-}
-
-/// Sorted set of `AWAITING_PAYMENT` holds, score = link ready + payment window (ms)
-pub fn holds_expiry_key(sale: i32) -> String {
-    format!("holds:expiry:{{{sale}}}")
-}
-
-/// Order processor progress for one partition: checkout time (ms)
-pub fn processed_upto_key(sale: i32, partition: i32) -> String {
-    format!("processed_upto:{{{sale}}}:{partition}")
 }
 
 /// Processor progress for one partition in the *read cache*: the highest
@@ -124,11 +104,12 @@ pub async fn sold_out(con: &mut RedisConn, sale: i32) -> redis::RedisResult<bool
     Ok(stock.unwrap_or(0) <= 0)
 }
 
-/// How long an idempotency key, a released hold and a status entry live (24 h)
+/// How long an idempotency key and a status entry live (24 h), and the least
+/// TTL of `user_live`
 pub const DAY_SECS: u64 = 24 * 60 * 60;
 
-/// A new queue ticket for a sale: `<sale>.<uuid v4>`. The sale id in front lets
-/// the status fallback find `hold:{sale}:<ticket>` from the ticket alone.
+/// A new queue ticket for a sale: `<sale>.<uuid v4>`. The sale id in front
+/// tells the status endpoint, from the ticket alone, which sale it belongs to.
 pub fn new_ticket(sale: i32) -> String {
     format!("{sale}.{}", uuid::Uuid::new_v4())
 }
@@ -154,8 +135,9 @@ static CHECKOUT_SCRIPT: LazyLock<redis::Script> =
 /// What `checkout.lua` decided
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutOutcome {
-    /// A `PENDING` hold now exists for the ticket passed in
-    Held { checkout_ms: i64 },
+    /// A unit is reserved for the ticket passed in; `checkout_ms` is Redis
+    /// `TIME` when it was
+    Reserved { checkout_ms: i64 },
     /// The idempotency key was seen before: the ticket it made (a retry)
     Existing { ticket: String },
     /// Before the opening time (epoch ms)
@@ -163,11 +145,11 @@ pub enum CheckoutOutcome {
     /// No `sale_start:{sale}`: the sale does not exist in Redis
     NotFound,
     /// The user already holds or bought a unit
-    AlreadyHolds,
+    AlreadyLive,
     SoldOut,
 }
 
-/// Runs `checkout.lua`: holds one unit for `user` under `ticket` (made with
+/// Runs `checkout.lua`: reserves one unit for `user` under `ticket` (made with
 /// `new_ticket`), or says why not. Inventory Redis only.
 pub async fn checkout(
     con: &mut RedisConn,
@@ -181,255 +163,68 @@ pub async fn checkout(
         .key(idem_key(sale, user, idem))
         .key(user_live_key(sale, user))
         .key(stock_key(sale))
-        .key(hold_key(sale, ticket))
-        .key(holds_pending_key(sale))
         .arg(ticket)
-        .arg(user)
-        .arg(idem)
         .arg(DAY_SECS)
         .invoke_async(con)
         .await?;
     let bad = || unexpected_reply("unexpected checkout.lua reply");
     Ok(match (r.first().map(String::as_str), r.len()) {
-        (Some("ok"), 2) => CheckoutOutcome::Held { checkout_ms: r[1].parse().map_err(|_| bad())? },
+        (Some("ok"), 2) => CheckoutOutcome::Reserved { checkout_ms: r[1].parse().map_err(|_| bad())? },
         (Some("existing"), 2) => CheckoutOutcome::Existing { ticket: r[1].clone() },
         (Some("not_started"), 2) => CheckoutOutcome::NotStarted { sale_start_ms: r[1].parse().map_err(|_| bad())? },
         (Some("not_found"), _) => CheckoutOutcome::NotFound,
-        (Some("already"), _) => CheckoutOutcome::AlreadyHolds,
+        (Some("already"), _) => CheckoutOutcome::AlreadyLive,
         (Some("sold_out"), _) => CheckoutOutcome::SoldOut,
         _ => return Err(bad()),
     })
 }
 
-static RELEASE_SCRIPT: LazyLock<redis::Script> =
-    LazyLock::new(|| redis::Script::new(include_str!("../scripts/release.lua")));
+static RETURN_UNIT_SCRIPT: LazyLock<redis::Script> =
+    LazyLock::new(|| redis::Script::new(include_str!("../scripts/return_unit.lua")));
 
-/// The state a hold must be in to be released; decides the sorted set it is in
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldState {
-    Pending,
-    AwaitingPayment,
-}
-
-impl HoldState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HoldState::Pending => "PENDING",
-            HoldState::AwaitingPayment => "AWAITING_PAYMENT",
-        }
-    }
-
-    /// The sorted set holding the sale's holds in this state
-    pub fn queue_key(self, sale: i32) -> String {
-        match self {
-            HoldState::Pending => holds_pending_key(sale),
-            HoldState::AwaitingPayment => holds_expiry_key(sale),
-        }
-    }
-}
-
-/// The state a released hold ends in
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReleasedAs {
-    /// A `PENDING` hold that never got an order (publish failed, or leaked)
-    Failed,
-    /// An `AWAITING_PAYMENT` hold nobody paid for
-    Expired,
-}
-
-impl ReleasedAs {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ReleasedAs::Failed => "FAILED",
-            ReleasedAs::Expired => "EXPIRED",
-        }
-    }
-}
-
-/// Release only holds whose score in their sorted set is at or below this
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaxScore {
-    /// Whatever the score (compensation)
-    Any,
-    /// Redis `TIME` at the moment of the release (unpaid-hold loop)
-    Now,
-    /// An epoch-ms bound (leaked-hold loop: behind processor progress)
-    UpTo(i64),
-}
-
-impl MaxScore {
-    fn arg(self) -> String {
-        match self {
-            MaxScore::Any => "+inf".into(),
-            MaxScore::Now => "now".into(),
-            MaxScore::UpTo(ms) => ms.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReleaseOutcome {
-    /// This call returned the unit to stock
-    Released,
-    /// Not this call's to release: another caller won, the hold changed state,
-    /// does not exist, or its score is above the bound
-    NotReleased,
-}
-
-/// Runs `release.lua`. Exactly one of several concurrent callers gets
-/// `Released` for a hold. `clear_idem` also deletes the hold's idempotency key
-/// so the client's retry with the same key makes a fresh checkout; only
-/// compensation after a failed publish sets it.
-pub async fn release_hold(
+/// Runs `return_unit.lua`: `INCR stock:{sale}`, delete the user's `user_live`
+/// if it still names `ticket` and, when `idem` is given, delete the idempotency
+/// key if it still names `ticket` (compensation after a failed publish, so the
+/// client's retry with the same key makes a fresh checkout).
+///
+/// Not idempotent: each caller has just won a PostgreSQL decision that happens
+/// once per ticket and calls this once, without retry. Inventory Redis only.
+pub async fn return_unit(
     con: &mut RedisConn,
     sale: i32,
+    user: i32,
     ticket: &str,
-    expected: HoldState,
-    max_score: MaxScore,
-    released_as: ReleasedAs,
-    clear_idem: bool,
-) -> redis::RedisResult<ReleaseOutcome> {
-    let reply: String = RELEASE_SCRIPT
-        .key(hold_key(sale, ticket))
-        .key(expected.queue_key(sale))
-        .key(stock_key(sale))
-        .arg(ticket)
-        .arg(sale)
-        .arg(expected.as_str())
-        .arg(max_score.arg())
-        .arg(released_as.as_str())
-        .arg(if clear_idem { "1" } else { "0" })
-        .arg(DAY_SECS)
-        .invoke_async(con)
-        .await?;
-    match reply.as_str() {
-        "released" => Ok(ReleaseOutcome::Released),
-        "not_released" => Ok(ReleaseOutcome::NotReleased),
-        _ => Err(unexpected_reply("unexpected release.lua reply")),
+    idem: Option<&str>,
+) -> redis::RedisResult<()> {
+    let mut call = RETURN_UNIT_SCRIPT.key(stock_key(sale));
+    call.key(user_live_key(sale, user));
+    if let Some(idem) = idem {
+        call.key(idem_key(sale, user, idem));
     }
-}
-
-/// A hold as stored in `hold:{sale}:{ticket}`
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hold {
-    /// `PENDING`, `AWAITING_PAYMENT`, `FAILED` or `EXPIRED`
-    pub state: String,
-    pub user: i32,
-    pub checkout_ms: i64,
-    /// The idempotency key the order is stored with
-    pub idem: String,
-}
-
-/// Reads a hold from the inventory Redis; `None` if it does not exist (never
-/// did, or deleted/expired after it ended)
-pub async fn read_hold(con: &mut RedisConn, sale: i32, ticket: &str) -> redis::RedisResult<Option<Hold>> {
-    let fields: HashMap<String, String> = redis::cmd("HGETALL").arg(hold_key(sale, ticket)).query_async(con).await?;
-    let (Some(state), Some(user)) = (fields.get("state"), fields.get("user").and_then(|u| u.parse().ok())) else {
-        return Ok(None);
-    };
-    Ok(Some(Hold {
-        state: state.clone(),
-        user,
-        checkout_ms: fields.get("checkout_ms").and_then(|v| v.parse().ok()).unwrap_or(0),
-        idem: fields.get("idem").cloned().unwrap_or_default(),
-    }))
-}
-
-static LINK_READY_SCRIPT: LazyLock<redis::Script> =
-    LazyLock::new(|| redis::Script::new(include_str!("../scripts/link_ready.lua")));
-
-/// What `link_ready.lua` decided
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LinkOutcome {
-    /// The hold moved from `PENDING` to `AWAITING_PAYMENT`
-    Ready,
-    /// It already was, with this session (a redelivered message): success
-    Already,
-    /// Released, expired or linked to another session
-    Gone,
-}
-
-/// Runs `link_ready.lua`: moves the hold from `holds:pending` to
-/// `holds:expiry` with score `expires_at_ms`, only if it is still `PENDING`.
-pub async fn link_ready(
-    con: &mut RedisConn,
-    sale: i32,
-    ticket: &str,
-    payment_session: &str,
-    expires_at_ms: i64,
-) -> redis::RedisResult<LinkOutcome> {
-    let reply: String = LINK_READY_SCRIPT
-        .key(hold_key(sale, ticket))
-        .key(holds_pending_key(sale))
-        .key(holds_expiry_key(sale))
-        .arg(ticket)
-        .arg(payment_session)
-        .arg(expires_at_ms)
-        .invoke_async(con)
-        .await?;
-    match reply.as_str() {
-        "ready" => Ok(LinkOutcome::Ready),
-        "already" => Ok(LinkOutcome::Already),
-        "gone" => Ok(LinkOutcome::Gone),
-        _ => Err(unexpected_reply("unexpected link_ready.lua reply")),
-    }
-}
-
-static SETTLE_SCRIPT: LazyLock<redis::Script> =
-    LazyLock::new(|| redis::Script::new(include_str!("../scripts/settle_hold.lua")));
-
-/// Runs `settle_hold.lua` for a due hold whose order PostgreSQL settled for
-/// good (`CONFIRMED`, or `REFUNDED` with no unit for it): takes the hold out of
-/// `holds:expiry` and, in the same step, deletes it. No counter changes and no
-/// stock is returned. Exactly one of several concurrent callers gets `true`.
-pub async fn settle_hold(con: &mut RedisConn, sale: i32, ticket: &str) -> redis::RedisResult<bool> {
-    let reply: String = SETTLE_SCRIPT
-        .key(hold_key(sale, ticket))
-        .key(holds_expiry_key(sale))
-        .arg(ticket)
-        .invoke_async(con)
-        .await?;
-    match reply.as_str() {
-        "settled" => Ok(true),
-        "not_settled" => Ok(false),
-        _ => Err(unexpected_reply("unexpected settle_hold.lua reply")),
-    }
+    let _: i64 = call.arg(ticket).invoke_async(con).await?;
+    Ok(())
 }
 
 static SET_MAX_SCRIPT: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(include_str!("../scripts/set_max.lua")));
 
 /// Raises the integer at `key` to `value` and never lowers it (`set_max.lua`).
-/// Returns whether it changed. For `processed_upto` and `progress` keys, which
+/// Returns whether it changed. For `progress` keys, which
 /// several replicas write and which must only move forward.
 pub async fn raise_to(con: &mut RedisConn, key: &str, value: i64) -> redis::RedisResult<bool> {
     let changed: i64 = SET_MAX_SCRIPT.key(key).arg(value).invoke_async(con).await?;
     Ok(changed == 1)
 }
 
-/// Reads `processed_upto:{sale}:{partition}`: checkout time (ms) up to which
-/// the partition's processor has finished; `None` if never written
-pub async fn read_processed_upto(con: &mut RedisConn, sale: i32, partition: i32) -> redis::RedisResult<Option<i64>> {
-    redis::cmd("GET").arg(processed_upto_key(sale, partition)).query_async(con).await
-}
-
 /// Reports that the contiguous prefix of `partition` is processed up to and
-/// including `offset`. The one place both progress keys are written, so they
-/// cannot drift apart: `processed_upto:{sale}:{partition}` (inventory; for each
-/// `(sale, checkout_ms)` in `upto`, the checkout time of the last message of
-/// that sale in the prefix) and `progress:<topic>:<partition>` (read cache; the
-/// offset, for queue positions). Both only ever rise.
+/// including `offset`: writes `progress:<topic>:<partition>` to the read cache,
+/// which turns a ticket's offset into a queue position. It only ever rises.
 pub async fn record_progress(
-    inventory: &mut RedisConn,
     read_cache: &mut ReadCache,
     topic: &str,
     partition: i32,
     offset: i64,
-    upto: &[(i32, i64)],
 ) -> redis::RedisResult<()> {
-    for &(sale, checkout_ms) in upto {
-        raise_to(inventory, &processed_upto_key(sale, partition), checkout_ms).await?;
-    }
     raise_to(&mut read_cache.0, &progress_key(topic, partition), offset).await?;
     Ok(())
 }
@@ -500,7 +295,7 @@ pub struct CachedStatus {
 }
 
 /// Reads `status:<ticket>` from the read cache; `None` if missing (never
-/// written, expired, or the write was lost: callers fall back to the hold)
+/// written, expired, or the write was lost: callers fall back to PostgreSQL)
 pub async fn read_status(cache: &mut ReadCache, ticket: &str) -> redis::RedisResult<Option<CachedStatus>> {
     let fields: HashMap<String, String> = redis::cmd("HGETALL").arg(status_key(ticket)).query_async(&mut cache.0).await?;
     let status = fields.get("status").and_then(|s| OrderStatus::parse(s));
@@ -535,10 +330,6 @@ mod tests {
         assert_eq!(sale_start_key(42), "sale_start:{42}");
         assert_eq!(user_live_key(42, 7), "user_live:{42}:7");
         assert_eq!(idem_key(42, 7, "k1"), "idem:{42}:7:k1");
-        assert_eq!(hold_key(42, "42.abc"), "hold:{42}:42.abc");
-        assert_eq!(holds_pending_key(42), "holds:pending:{42}");
-        assert_eq!(holds_expiry_key(42), "holds:expiry:{42}");
-        assert_eq!(processed_upto_key(42, 3), "processed_upto:{42}:3");
         assert_eq!(status_key("42.abc"), "status:42.abc");
         assert_eq!(progress_key("orders.checkout", 3), "progress:orders.checkout:3");
     }

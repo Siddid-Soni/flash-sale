@@ -7,10 +7,7 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use actix_web::{http::StatusCode, web, App, HttpServer};
-use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use redis::AsyncCommands;
@@ -18,8 +15,6 @@ use redis::AsyncCommands;
 use common::sale::{clear_inbox, SaleFixture};
 use flash_sale::{
     api,
-    cache,
-    expiry::{Expirer, ExpiryError, LagSource, PartitionLag, Settings},
     models::{OrderState, OrderStatus},
     payment::{
         dispatcher::{Dispatcher, DispatcherSettings},
@@ -29,15 +24,6 @@ use flash_sale::{
 };
 
 static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct QuietKafka;
-
-#[async_trait]
-impl LagSource for QuietKafka {
-    async fn partitions(&self) -> Result<Vec<PartitionLag>, ExpiryError> {
-        Ok(vec![PartitionLag { partition: 0, lagging: false }])
-    }
-}
 
 /// The order processor's web server on a free port; returns the webhook URL
 fn start_processor_webhook(fx: &SaleFixture) -> String {
@@ -54,11 +40,12 @@ fn start_processor_webhook(fx: &SaleFixture) -> String {
 }
 
 /// The user pays at the page, the provider's dispatcher delivers the signed
-/// event to the processor, which confirms the order at once; the worker later
-/// settles the hold and counts the sale once
+/// event to the processor, which confirms the order at once and counts the
+/// sale once; the expiration worker never returns a confirmed order's unit
 #[actix_web::test]
 async fn paying_at_the_page_ends_with_a_confirmed_order_and_a_counted_sale() {
     let _guard = LOCK.lock().await;
+    let _due = common::sale::due_guard().await;
     let fx = SaleFixture::new(3).await;
     let _: () = fx.env.redis.clone().del("fakepay:outbox").await.unwrap();
     clear_inbox(&fx.env);
@@ -90,49 +77,23 @@ async fn paying_at_the_page_ends_with_a_confirmed_order_and_a_counted_sale() {
         .get_result(&mut fx.env.pool.get().unwrap())
         .unwrap();
     assert_eq!(unprocessed, 0, "the event was handled on receipt, not left for the inbox loop");
-    assert_eq!(fx.hold_state(ticket).await, "AWAITING_PAYMENT", "the worker settles the hold, not the payment path");
     assert_eq!(fx.stock().await, 2);
 
-    // The deadline arrives (both clocks); the worker finds the paid order
+    // The deadline arrives; the worker leaves the paid order alone
     let past = Utc::now() - Duration::seconds(1);
     diesel::update(orders::table.filter(orders::queue_ticket_id.eq(ticket)))
         .set(orders::expires_at.eq(past))
         .execute(&mut fx.env.pool.get().unwrap())
         .unwrap();
-    let _: i64 = redis::cmd("ZADD")
-        .arg(cache::holds_expiry_key(fx.sale))
-        .arg("XX")
-        .arg("CH")
-        .arg(past.timestamp_millis())
-        .arg(ticket)
-        .query_async(&mut fx.env.redis.clone())
-        .await
-        .unwrap();
-    let settings = Settings {
-        batch: 100,
-        delivery_timeout_ms: 30_000,
-        stale_after: Duration::minutes(10),
-        sale_lookback: Duration::days(3),
-        expired_recheck: Duration::minutes(30),
-    };
-    let worker = Expirer::new(
-        fx.env.pool.clone(),
-        fx.env.redis.clone(),
-        fx.env.read_cache.clone(),
-        fx.env.shared_provider(),
-        Arc::new(QuietKafka),
-        settings,
-    );
-    let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
-    assert_eq!((pass.confirmed, pass.released), (1, 0));
-    assert_eq!(fx.hold_state_opt(ticket).await, None, "the paid hold is gone");
+    fx.expire_due().await;
+    assert_eq!(fx.order(ticket).unwrap().status, OrderState::Confirmed);
     assert_eq!(fx.stock().await, 2, "no stock came back");
+    assert_eq!(fx.user_live(a.event.user).await.as_deref(), Some(ticket.as_str()), "the buyer stays marked");
     assert_eq!(fx.product().sold, 1);
-    let queued: i64 = fx.env.redis.clone().zcard(cache::holds_expiry_key(fx.sale)).await.unwrap();
-    assert_eq!(queued, 0);
+    assert_eq!(fx.status(ticket).await.unwrap().status, OrderStatus::Confirmed);
 
-    // Nothing is closed twice
-    assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().confirmed, 0);
-    assert_eq!(fx.product().sold, 1);
+    // Nothing is touched twice
+    fx.expire_due().await;
+    assert_eq!((fx.stock().await, fx.product().sold), (2, 1));
     fx.cleanup().await;
 }

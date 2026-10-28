@@ -1,0 +1,1 @@
+DROP INDEX orders_awaiting_payment_expires_at_idx;

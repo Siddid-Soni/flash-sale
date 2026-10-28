@@ -72,24 +72,24 @@ create_sale() {
   jq -er '.id' <<<"$resp" || { echo "could not create the sale: $resp" >&2; return 1; }
 }
 
-# wait_converged SALE TIMEOUT_SECS: no AWAITING_PAYMENT orders, no holds queued, the
-# sale's payment inbox events and the provider's webhook outbox drained. Waiting for
-# holds:expiry to be empty includes the paid holds: the expiration worker closes them at their
-# deadline and releases the unpaid ones, so stock:{sale} is final after this (sales are counted
-# only in PostgreSQL, products.sold).
+# wait_converged SALE TIMEOUT_SECS: PostgreSQL has no AWAITING_PAYMENT order left for the sale,
+# its payment inbox events (including the ones postponed until the expiration worker expired
+# their order) are processed, and the provider's webhook outbox is drained. The expiration
+# worker returns each unit right after expiring its order, so stock:{sale} is final a moment
+# after this (sales are counted only in PostgreSQL, products.sold).
 wait_converged() {
-  local sale=$1 limit=$2 t=0 live pend exp inbox outbox
+  local sale=$1 limit=$2 t=0 live inbox outbox
   while [ "$t" -lt "$limit" ]; do
     live=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $sale AND status = 'AWAITING_PAYMENT'")
-    pend=$(rcli ZCARD "holds:pending:{$sale}"); exp=$(rcli ZCARD "holds:expiry:{$sale}")
     inbox=$(psql_ "SELECT count(*) FROM payment_inbox WHERE processed_at IS NULL AND payload->'data'->'object'->>'ticket' LIKE '$sale.%'")
     outbox=$(rcli ZCARD fakepay:outbox)
-    if [ "$live" = 0 ] && [ "$pend" = 0 ] && [ "$exp" = 0 ] && [ "$inbox" = 0 ] && [ "$outbox" = 0 ]; then
+    if [ "$live" = 0 ] && [ "$inbox" = 0 ] && [ "$outbox" = 0 ]; then
+      sleep 2   # the last units returned to Redis
       echo "Converged after ${t}s"; return 0
     fi
     sleep 2; t=$((t + 2))
   done
-  echo "NOT converged after ${limit}s: live orders $live, holds pending $pend, holds expiry $exp, inbox $inbox, outbox $outbox"
+  echo "NOT converged after ${limit}s: AWAITING_PAYMENT orders $live, inbox $inbox, outbox $outbox"
   return 1
 }
 

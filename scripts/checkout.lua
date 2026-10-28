@@ -1,13 +1,18 @@
--- Reserve one unit of a sale for a user, atomically (roadmap step 3).
+-- Reserve one unit of a sale for a user, atomically (roadmap step 43).
 -- KEYS: 1 sale_start:{s}  2 idem:{s}:{user}:{key}  3 user_live:{s}:{user}
---       4 stock:{s}  5 hold:{s}:{ticket}  6 holds:pending:{s}
--- ARGV: 1 new ticket  2 user id  3 idempotency key  4 idempotency TTL secs
--- Returns {'ok', checkout_ms}              a hold was created for ARGV[1]
+--       4 stock:{s}
+-- ARGV: 1 new ticket  2 one day in seconds (idempotency TTL, and the least
+--       TTL of user_live)
+-- Returns {'ok', checkout_ms}              the unit is reserved for ARGV[1]
 --         {'existing', ticket}             the idempotency key was seen: a retry
 --         {'not_started', sale_start_ms}   before the opening time
 --         {'not_found'}                    no sale_start: the sale is unknown
 --         {'already'}                      the user already holds or bought a unit
 --         {'sold_out'}
+--
+-- Redis gates admission only: it keeps no record of the ticket beyond
+-- user_live and the idempotency key. The queue is Kafka, the outcome is
+-- PostgreSQL's.
 --
 -- The order of the checks matters. The idempotency check comes before the
 -- one-per-user check, or a retry (same user, same key) would be told 409
@@ -43,8 +48,11 @@ if stock <= 0 then
 end
 redis.call('DECR', KEYS[4])
 
-redis.call('HSET', KEYS[5], 'state', 'PENDING', 'user', ARGV[2], 'checkout_ms', now_str, 'idem', ARGV[3])
-redis.call('ZADD', KEYS[6], now_str, ARGV[1])
-redis.call('SET', KEYS[3], ARGV[1])
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[4])
+-- user_live outlives the sale by a day, so Redis cleans up a confirmed buyer's
+-- marker (or one left by a lost unit) on its own: the seconds until the sale
+-- starts plus one day, at least one day
+local day = tonumber(ARGV[2])
+local ttl = day + math.max(math.ceil((tonumber(start) - now) / 1000), 0)
+redis.call('SET', KEYS[3], ARGV[1], 'EX', ttl)
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
 return {'ok', now_str}

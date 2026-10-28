@@ -98,13 +98,14 @@ async fn a_winner_gets_202_and_a_retry_gets_the_same_ticket_with_200() {
     assert_eq!(location, body["status_url"].as_str().unwrap());
     assert_eq!(stock(&env, sale).await, 4);
 
-    // One event, keyed by the ticket's sale and user
+    // One event, carrying everything the processor needs (Redis keeps no hold)
     let events = fake.events();
     assert_eq!(events.len(), 1);
     assert_eq!((events[0].ticket.as_str(), events[0].sale, events[0].user), (ticket.as_str(), sale, user.id));
-    // The hold remembers the key for the processor
-    let hold = cache::read_hold(&mut env.redis.clone(), sale, &ticket).await.unwrap().unwrap();
-    assert_eq!((hold.state.as_str(), hold.user, hold.idem.as_str()), ("PENDING", user.id, "attempt-1"));
+    assert_eq!(events[0].idempotency_key, "attempt-1");
+    assert!((Utc::now().timestamp_millis() - events[0].checkout_ms).abs() < 5_000);
+    let live: Option<String> = env.redis.clone().get(cache::user_live_key(sale, user.id)).await.unwrap();
+    assert_eq!(live.as_deref(), Some(ticket.as_str()));
     // The queue position is stored with the PENDING status
     let cached = cache::read_status(&mut env.read_cache.clone(), &ticket).await.unwrap().unwrap();
     assert_eq!((cached.status, cached.partition, cached.offset), (OrderStatus::Pending, Some(3), Some(0)));
@@ -186,7 +187,7 @@ async fn sold_out_answers_410_and_the_flag_follows_stock() {
     assert_eq!(resp.status(), StatusCode::GONE);
     assert_eq!(stock(&env, sale).await, 1, "the flagged request never touched Redis");
 
-    // Stock came back (a released hold): the flag clears on the next refresh
+    // Stock came back (an expired order): the flag clears on the next refresh
     flags.refresh(&mut env.redis.clone()).await.unwrap();
     assert!(!flags.is_sold_out(sale));
     let resp = test::call_service(&app, checkout_request(sale, &late, Some("k")).to_request()).await;
@@ -194,8 +195,17 @@ async fn sold_out_answers_410_and_the_flag_follows_stock() {
     cleanup(&env, sale).await;
 }
 
+fn orders_of(env: &common::Env, sale: i32) -> Vec<flash_sale::models::Order> {
+    use flash_sale::models::Order;
+    orders::table
+        .filter(orders::product_id.eq(sale))
+        .select(Order::as_select())
+        .load(&mut env.pool.get().unwrap())
+        .unwrap()
+}
+
 #[actix_web::test]
-async fn a_failed_publish_returns_the_unit_and_the_retry_succeeds() {
+async fn a_failed_publish_records_a_failed_order_returns_the_unit_and_the_retry_succeeds() {
     let env = common::env().await;
     let (fake, queue) = common::fake_queue();
     let app = test_app!(env, queue);
@@ -208,26 +218,115 @@ async fn a_failed_publish_returns_the_unit_and_the_retry_succeeds() {
     assert_eq!(resp.headers().get("Retry-After").unwrap(), "1");
     assert_eq!(stock(&env, sale).await, 2, "the unit came back at once");
     let mut con = env.redis.clone();
-    assert_eq!(con.zcard::<_, i64>(cache::holds_pending_key(sale)).await.unwrap(), 0);
     assert!(!con.exists::<_, bool>(cache::user_live_key(sale, user.id)).await.unwrap());
-    let held: Vec<String> = con.keys(format!("hold:{{{sale}}}:*")).await.unwrap();
-    assert_eq!(held.len(), 1);
-    let failed_ticket = held[0].rsplit(':').next().unwrap().to_string();
-    assert_eq!(cache::read_hold(&mut con, sale, &failed_ticket).await.unwrap().unwrap().state, "FAILED");
+    assert!(!con.exists::<_, bool>(cache::idem_key(sale, user.id, "k")).await.unwrap());
 
-    // The ticket the failed attempt used reads as FAILED (hold fallback)
+    // PostgreSQL has the ticket as a FAILED order, with the product's price
+    let rows = orders_of(&env, sale);
+    assert_eq!(rows.len(), 1);
+    let failed = &rows[0];
+    assert_eq!((failed.status, failed.user_id, failed.amount_cents), (OrderState::Failed, user.id, 59_900));
+    assert_eq!((failed.payment_session_id.as_deref(), failed.checkout_url.as_deref(), failed.expires_at), (None, None, None));
+    let failed_ticket = failed.queue_ticket_id.clone();
+    assert_eq!(cache::ticket_sale(&failed_ticket), Some(sale));
+
+    // The ticket the failed attempt used reads as FAILED (from PostgreSQL)
     let resp = test::call_service(&app, status_request(&failed_ticket, &user).to_request()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "FAILED" }));
 
-    // The retry with the same key makes a new hold
+    // The retry with the same key makes a new ticket; its order can be stored
+    // under that key although the FAILED row came first
     fake.set_failing(false);
     let resp = test::call_service(&app, checkout_request(sale, &user, Some("k")).to_request()).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: Value = test::read_body_json(resp).await;
     assert_ne!(body["queue_ticket_id"], failed_ticket.as_str());
     assert_eq!(stock(&env, sale).await, 1);
-    assert_eq!(fake.events().len(), 1);
+    let events = fake.events();
+    assert_eq!(events.len(), 1);
+    let processed = common::sale::SaleFixture { env: common::env().await, sale }.processor().handle(&events[0]).await.unwrap();
+    assert_eq!(processed, flash_sale::processor::Outcome::Linked);
+    assert_eq!(orders_of(&env, sale).len(), 2);
+    cleanup(&env, sale).await;
+}
+
+/// A queue whose publish fails after the message "reached Kafka": the
+/// processor makes the order before the Order Service learns of the failure
+struct ArrivesThenFails {
+    pool: flash_sale::db::DbPool,
+}
+
+#[async_trait::async_trait]
+impl flash_sale::queue::CheckoutQueue for ArrivesThenFails {
+    async fn publish(
+        &self,
+        event: &flash_sale::queue::CheckoutEvent,
+    ) -> flash_sale::queue::QueueResult<flash_sale::queue::Published> {
+        let session = format!("session-{}", uuid::Uuid::new_v4().simple());
+        diesel::insert_into(orders::table)
+            .values(&NewOrder {
+                user_id: event.user,
+                product_id: event.sale,
+                queue_ticket_id: &event.ticket,
+                idempotency_key: &event.idempotency_key,
+                status: OrderState::AwaitingPayment,
+                amount_cents: 59_900,
+                payment_session_id: Some(&session),
+                checkout_url: Some(&format!("http://pay.test/fake-pay/{session}")),
+                expires_at: Some(Utc::now() + Duration::minutes(5)),
+            })
+            .execute(&mut self.pool.get().unwrap())
+            .unwrap();
+        Err(flash_sale::queue::QueueError("timed out after the broker stored it".into()))
+    }
+}
+
+#[actix_web::test]
+async fn a_failed_publish_whose_message_made_an_order_is_a_successful_checkout() {
+    let env = common::env().await;
+    let queue: flash_sale::queue::SharedQueue = std::sync::Arc::new(ArrivesThenFails { pool: env.pool.clone() });
+    let app = test_app!(env, queue);
+    let sale = sale(&env, 2, 60).await;
+    let user = guest(&env);
+
+    let resp = test::call_service(&app, checkout_request(sale, &user, Some("k")).to_request()).await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: Value = test::read_body_json(resp).await;
+    let ticket = body["queue_ticket_id"].as_str().unwrap().to_string();
+
+    // The FAILED insert lost: the order is the processor's, and no compensation ran
+    let rows = orders_of(&env, sale);
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].queue_ticket_id.as_str(), rows[0].status), (ticket.as_str(), OrderState::AwaitingPayment));
+    assert_eq!(stock(&env, sale).await, 1, "the unit stays reserved");
+    let live: Option<String> = env.redis.clone().get(cache::user_live_key(sale, user.id)).await.unwrap();
+    assert_eq!(live.as_deref(), Some(ticket.as_str()));
+    let idem: Option<String> = env.redis.clone().get(cache::idem_key(sale, user.id, "k")).await.unwrap();
+    assert_eq!(idem.as_deref(), Some(ticket.as_str()), "a retry gets this ticket");
+
+    // And the status endpoint answers from the order
+    let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &user).to_request()).await;
+    assert_eq!(body["status"], "AWAITING_PAYMENT");
+    cleanup(&env, sale).await;
+}
+
+#[actix_web::test]
+async fn a_failed_publish_with_postgres_unable_to_record_it_keeps_the_unit_reserved() {
+    let env = common::env().await;
+    let (fake, queue) = common::fake_queue();
+    let app = test_app!(env, queue);
+    // Redis knows a sale PostgreSQL does not: the FAILED row cannot be written
+    let sale = 2_000_000_000 - (uuid::Uuid::new_v4().as_u128() % 1_000_000) as i32;
+    cache::init_sale(&mut env.redis.clone(), sale, 2, Utc::now() - Duration::seconds(60)).await.unwrap();
+    let user = guest(&env);
+
+    fake.set_failing(true);
+    let resp = test::call_service(&app, checkout_request(sale, &user, Some("k")).to_request()).await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    // No PostgreSQL decision, no compensation (accepted: docs/FAILURE_CASES.md, case 1)
+    assert_eq!(stock(&env, sale).await, 1);
+    assert!(env.redis.clone().exists::<_, bool>(cache::user_live_key(sale, user.id)).await.unwrap());
     cleanup(&env, sale).await;
 }
 
@@ -273,7 +372,7 @@ async fn status_is_for_the_owner_only() {
 }
 
 #[actix_web::test]
-async fn status_falls_back_to_the_hold_and_then_to_postgres() {
+async fn status_falls_back_to_postgres_when_the_cache_has_no_entry() {
     let env = common::env().await;
     let app = test_app!(env);
     let sale = sale(&env, 5, 60).await;
@@ -284,22 +383,16 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
         test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
     let ticket = body["queue_ticket_id"].as_str().unwrap().to_string();
 
-    // The status write was lost: the hold says PENDING (no position known)
+    // The status write was lost and no order exists yet: nothing is known (Redis keeps no hold)
     let _: () = redis.del(cache::status_key(&ticket)).await.unwrap();
-    let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "PENDING" }));
-    let resp = test::call_service(&app, status_request(&ticket, &stranger).to_request()).await;
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // Both Redis sources are gone: the order row answers, with the payment link
-    let _: () = redis.del(cache::hold_key(sale, &ticket)).await.unwrap();
     let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND, "no order yet");
 
     // The order is born AWAITING_PAYMENT, with its link and deadline
     let expires = Utc::now() + Duration::minutes(5);
     let mut conn = env.pool.get().unwrap();
+    let session = format!("xyz-{}", uuid::Uuid::new_v4().simple());
+    let url = format!("http://localhost/fake-pay/{session}");
     diesel::insert_into(orders::table)
         .values(&NewOrder {
             user_id: owner.id,
@@ -308,15 +401,15 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
             idempotency_key: "k",
             status: OrderState::AwaitingPayment,
             amount_cents: 59_900,
-            payment_session_id: Some("xyz"),
-            checkout_url: Some("http://localhost/fake-pay/xyz"),
+            payment_session_id: Some(&session),
+            checkout_url: Some(&url),
             expires_at: Some(expires),
         })
         .execute(&mut conn)
         .unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(body["status"], "AWAITING_PAYMENT");
-    assert_eq!(body["payment_url"], "http://localhost/fake-pay/xyz");
+    assert_eq!(body["payment_url"], url.as_str());
     assert_eq!(
         body["expires_at"],
         expires.to_rfc3339_opts(chrono::SecondsFormat::Millis, true).as_str()
@@ -324,63 +417,11 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
     let resp = test::call_service(&app, status_request(&ticket, &stranger).to_request()).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-    // An AWAITING_PAYMENT hold with no order row yet still answers
-    let _: () = redis
-        .hset_multiple(cache::hold_key(sale, &ticket), &[("state", "AWAITING_PAYMENT"), ("user", &owner.id.to_string())])
-        .await
-        .unwrap();
-    diesel::delete(orders::table.filter(orders::queue_ticket_id.eq(&ticket))).execute(&mut conn).unwrap();
-    let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(body, json!({ "status": "AWAITING_PAYMENT" }));
-    cleanup(&env, sale).await;
-}
-
-/// A paid hold stays AWAITING_PAYMENT in Redis until the expiration worker
-/// closes it, so the status must not be answered from the hold then: the
-/// order row says CONFIRMED. Once the worker has closed the hold (deleted it),
-/// the status falls through to PostgreSQL, which answers.
-#[actix_web::test]
-async fn a_paid_hold_the_worker_has_not_settled_reports_confirmed_from_postgres() {
-    let env = common::env().await;
-    let app = test_app!(env);
-    let sale = sale(&env, 5, 60).await;
-    let owner = guest(&env);
-    let mut redis = env.redis.clone();
-
-    let body: Value =
-        test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
-    let ticket = body["queue_ticket_id"].as_str().unwrap().to_string();
-    let expires = Utc::now() + Duration::minutes(5);
-    let mut conn = env.pool.get().unwrap();
-    diesel::insert_into(orders::table)
-        .values(&NewOrder {
-            user_id: owner.id,
-            product_id: sale,
-            queue_ticket_id: &ticket,
-            idempotency_key: "k",
-            status: OrderState::Confirmed,
-            amount_cents: 59_900,
-            payment_session_id: None,
-            checkout_url: None,
-            expires_at: None,
-        })
-        .execute(&mut conn)
-        .unwrap();
+    // A paid order shows no payment link
     diesel::update(orders::table.filter(orders::queue_ticket_id.eq(&ticket)))
-        .set((orders::checkout_url.eq("http://localhost/fake-pay/xyz"), orders::expires_at.eq(expires)))
+        .set(orders::status.eq(OrderState::Confirmed))
         .execute(&mut conn)
         .unwrap();
-    // The hold is AWAITING_PAYMENT (the worker has not been there) and the status write was lost
-    let _: () = redis
-        .hset_multiple(cache::hold_key(sale, &ticket), &[("state", "AWAITING_PAYMENT"), ("user", &owner.id.to_string())])
-        .await
-        .unwrap();
-    let _: () = redis.del(cache::status_key(&ticket)).await.unwrap();
-    let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
-    assert_eq!(body, json!({ "status": "CONFIRMED" }), "no payment link for a paid order");
-
-    // Once the worker has closed the hold it is gone, and PostgreSQL still answers
-    let _: () = redis.del(cache::hold_key(sale, &ticket)).await.unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(body, json!({ "status": "CONFIRMED" }));
     cleanup(&env, sale).await;

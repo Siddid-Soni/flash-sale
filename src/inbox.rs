@@ -1,5 +1,5 @@
 //! Payment events: the order processor turns each provider event into a
-//! confirmed order or a refund (roadmap steps 8 and 21, redesigned so that
+//! confirmed order or a refund (roadmap steps 8, 21 and 46, redesigned so that
 //! PostgreSQL alone decides between a payment and the payment deadline).
 //!
 //! `InboxWorker::handle_event` is the one place an event is acted on. It runs
@@ -20,16 +20,23 @@
 //! worker's `UPDATE ... SET status = 'EXPIRED' ... AND expires_at <= now()`
 //! is its mirror image; both take the order's row lock and see each other's
 //! result afterwards, on one clock, so exactly one of them wins an order. There
-//! is no claim in Redis: the payment path writes no inventory key, only the
+//! is no claim in Redis: the payment path touches no inventory key, only the
 //! read-cache status.
 //!
-//! **If the order cannot be confirmed** (the deadline passed, it is already
-//! `EXPIRED` or `FAILED`, or the guard failed) the same transaction marks it
+//! **The inbox never decides a deadline.** A payment for an order that is
+//! still `AWAITING_PAYMENT` after its `expires_at` changes nothing: the event
+//! stays unprocessed and the inbox loop retries it, until the expiration worker
+//! has expired the order (and returned the unit). The retry then finds the order
+//! `EXPIRED` and refunds, moving no stock. Only the worker returns stock.
+//!
+//! **If the order cannot be confirmed** (it is already `EXPIRED` or `FAILED`,
+//! or the in-time payment met a failed guard) the same transaction marks it
 //! `REFUNDED`. That is the durable record of the decision. Afterwards, outside
 //! any transaction, the provider is asked to refund the session and
 //! `status:<ticket>` is set `REFUNDED`; only when both worked is the inbox row
 //! marked processed. A guard failure means Redis and PostgreSQL disagree (Redis
-//! reserved a unit PostgreSQL does not have) and is logged as an error.
+//! reserved a unit PostgreSQL does not have) and is logged as an error; the
+//! refund returns no stock either.
 //!
 //! **Why a rerun converges.** Every step is idempotent and the decision
 //! leaves a trace the next run reads:
@@ -44,10 +51,9 @@
 //!
 //! Two handlers may run the same event at once (the webhook request and the
 //! inbox loop); the row lock of the decision lets one decide and the other see
-//! the result. Stock is never returned here and no inventory key is touched:
-//! the expiration worker closes the hold when it finds it due.
+//! the result. Stock is never returned here and no inventory key is touched.
 //!
-//! Failure events (the user cancelled) need nothing: the hold runs out by
+//! Failure events (the user cancelled) need nothing: the order runs out by
 //! itself. The event is just marked processed.
 //!
 //! Several processors may run: each locks one inbox row at a time with `FOR
@@ -77,6 +83,8 @@ const IDLE_WAIT: Duration = Duration::from_millis(250);
 const ERROR_WAIT: Duration = Duration::from_millis(100);
 /// A failing event is skipped by this processor for 1 s, 2 s, 4 s ... up to this
 const MAX_EVENT_BACKOFF: Duration = Duration::from_secs(60);
+/// An event for an order past its deadline but not yet expired is skipped for this long
+const POSTPONED_WAIT: Duration = Duration::from_secs(1);
 
 /// What handling one event came to
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +93,9 @@ pub enum Handled {
     Confirmed,
     /// The payment was refunded at the provider and the order is `REFUNDED`
     Refunded,
+    /// The order is past its deadline but the expiration worker has not
+    /// expired it yet: nothing was decided and the event must stay in the inbox
+    Postponed,
     /// A failure or unknown event: nothing to do
     NoAction,
     /// An event this backend cannot act on (a ticket that names no sale); logged
@@ -98,8 +109,9 @@ pub enum Received {
     Duplicate,
     /// Stored (now or before) and handled at once; the row is marked processed
     Handled(Handled),
-    /// Stored, but handling failed; the row stays unprocessed and the inbox
-    /// loop retries it. The reason is recorded in the row.
+    /// Stored, but not decided: handling failed, or the order is past its
+    /// deadline and waits for the expiration worker. The row stays unprocessed
+    /// and the inbox loop retries it.
     Deferred(String),
 }
 
@@ -156,7 +168,7 @@ impl InboxWorker {
     /// failure and while another caller runs the same event.
     pub async fn handle_event(&self, event: &ProviderEvent) -> Result<Handled, ProcessError> {
         if event.kind != EventKind::PaymentSucceeded {
-            log::info!("Event {} ({}) needs no action; the hold runs out by itself", event.id, event.event_type);
+            log::info!("Event {} ({}) needs no action; the order runs out by itself", event.id, event.event_type);
             return Ok(Handled::NoAction);
         }
         let Some(sale) = cache::ticket_sale(&event.ticket) else {
@@ -193,8 +205,16 @@ impl InboxWorker {
                 Ok(Handled::Confirmed)
             }
             Settlement::Refund => {
-                log::info!("The deadline of {} ended before payment {} could be kept; refunding", order.queue_ticket_id, event.session_id);
+                log::info!("Order {} is no longer payable; refunding payment {}", order.queue_ticket_id, event.session_id);
                 self.finish_refund(&order, &event.session_id).await
+            }
+            Settlement::Postponed => {
+                log::info!(
+                    "Order {} is past its deadline but not expired yet; payment {} waits for the expiration worker",
+                    order.queue_ticket_id,
+                    event.session_id
+                );
+                Ok(Handled::Postponed)
             }
             Settlement::SoldOut => {
                 log::error!(
@@ -233,6 +253,8 @@ impl InboxWorker {
             return Ok(Received::Duplicate);
         }
         match self.handle_event(event).await {
+            // Nothing decided: the row stays open for the loop
+            Ok(Handled::Postponed) => Ok(Received::Deferred("the order is past its deadline and not expired yet".into())),
             Ok(handled) => {
                 log::debug!("Webhook event {}: {handled:?}", event.id);
                 match self.db(move |conn| actions::payments::mark_processed(conn, id)).await {
@@ -253,17 +275,21 @@ impl InboxWorker {
         }
     }
 
-    /// Handles one inbox row: reads its event and acts on it
-    async fn process_entry(&self, entry: &PaymentInboxEntry) -> Result<(), ProcessError> {
+    /// Handles one inbox row: reads its event and acts on it. Returns whether
+    /// the event is done (false: `Postponed`, leave the row unprocessed).
+    async fn process_entry(&self, entry: &PaymentInboxEntry) -> Result<bool, ProcessError> {
         match ProviderEvent::from_json(entry.payload.clone()) {
             Some(event) => {
                 let handled = self.handle_event(&event).await?;
                 log::debug!("Inbox event {}: {handled:?}", entry.provider_event_id);
+                Ok(handled != Handled::Postponed)
             }
             // The webhook parses before it stores, so this is not expected
-            None => log::error!("Inbox event {} cannot be read; marked processed", entry.provider_event_id),
+            None => {
+                log::error!("Inbox event {} cannot be read; marked processed", entry.provider_event_id);
+                Ok(true)
+            }
         }
-        Ok(())
     }
 
     /// Ids this processor is still backing off from
@@ -279,6 +305,13 @@ impl InboxWorker {
         let failures = backoff.get(&id).map_or(0, |(n, _)| *n) + 1;
         let wait = Duration::from_secs(1u64 << (failures - 1).min(6)).min(MAX_EVENT_BACKOFF);
         backoff.insert(id, (failures, Instant::now() + wait));
+    }
+
+    /// The event waits for the expiration worker: skip it for a second, without
+    /// counting a failure
+    fn note_postponed(&self, id: i64) {
+        let mut backoff = self.backoff.lock().unwrap_or_else(|p| p.into_inner());
+        backoff.insert(id, (0, Instant::now() + POSTPONED_WAIT));
     }
 
     fn note_success(&self, id: i64) {
@@ -301,18 +334,26 @@ impl InboxWorker {
         let mut conn = self.pool.get()?;
         let skip = self.skipped();
         let mut current = None;
+        let mut postponed = false;
         let result = conn.transaction::<_, ProcessError, _>(|conn| {
             let Some(entry) = actions::payments::claim_next(conn, &skip)? else { return Ok(false) };
             current = Some(entry.id);
-            runtime.block_on(self.process_entry(&entry))?;
-            // Only after the last phase
-            actions::payments::mark_processed(conn, entry.id)?;
+            if runtime.block_on(self.process_entry(&entry))? {
+                // Only after the last phase
+                actions::payments::mark_processed(conn, entry.id)?;
+            } else {
+                postponed = true;
+            }
             Ok(true)
         });
         match (result, current) {
             (Ok(found), id) => {
                 if let Some(id) = id {
-                    self.note_success(id);
+                    if postponed {
+                        self.note_postponed(id);
+                    } else {
+                        self.note_success(id);
+                    }
                 }
                 Ok(found)
             }

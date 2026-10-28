@@ -370,7 +370,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
                             until_expiry + 1000
                         } else if race {
                             // Just before the expiry: the provider accepts the payment, but its
-                            // webhook arrives about when the hold is released, so either side
+                            // webhook arrives about when the expiration worker expires the order, so either side
                             // may win (the loser is refunded)
                             until_expiry - 150
                         } else {

@@ -4,13 +4,13 @@
 # (default 10,000) all checking out within ARRIVAL_SECS (10) of the sale opening, the
 # processor starting RATE (default 200) messages per second. The last link then appears
 # about N / RATE seconds after the first (50 s), longer than the payment window (30 s), so a
-# hold that waited in the queue longer than the window shows that the payment timer does not
-# run while an order is queued. The roadmap's design point is the same script with
+# user who waited in the queue longer than the window shows that the payment timer does not
+# run while an order is queued: the deadline is set by the processor when it creates the order. The roadmap's design point is the same script with
 # N=UNITS=100000 and RATE=1000.
 #
 # Asserts (PASS/FAIL per check, non-zero exit on a FAIL, report appended to load/RESULTS.md):
-#   - no PENDING hold (waiting in Kafka) was released: no FAILED orders, no EXPIRED order without a payment
-#     link, the expiration worker logged no leaked-hold release, every user got an order;
+#   - nothing waiting in Kafka was failed or expired: no FAILED orders, no EXPIRED order without a
+#     payment link, every user got an order (a queued ticket has no order and no deadline at all);
 #   - every user who got a link got the full payment window (the time left to pay when the
 #     generator first saw the link is the window minus at most one polling interval), and
 #     the users who pay late in that window (after waiting longer than the window in the
@@ -46,7 +46,6 @@ start_stack
 
 echo "Inserting $N users and creating a sale of $UNITS units; the queue drains at $RATE/s (about ${EXPECTED_DRAIN}s)"
 insert_users "$N" "$WORK/users"
-T0=$(date -u +%FT%TZ)
 SALE=$(create_sale "$UNITS" 25)
 echo "Sale $SALE"
 
@@ -69,18 +68,15 @@ LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 
 BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none') FROM (SELECT status::text, count(*) AS n FROM orders WHERE product_id = $SALE GROUP BY status ORDER BY status) s")
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
 R_STOCK=$(rcli GET "stock:{$SALE}")
-HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
 DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
-LEAKED_LOG=$(docker compose --profile app logs --no-log-prefix --since "$T0" expiration-worker 2>&1 </dev/null | grep -c 'leaked holds' || true)
 MAX_LINK=$(j .checkout_to_link_ms.max); MIN_LEFT=$(j .min_window_left_ms)
 WINDOW_MS=$((PAYMENT_WINDOW_SECS * 1000))
 SLACK=$((POLL_MS * 12 / 10 + 1000))   # one polling interval with jitter, plus a second
 
 check_cond "the system settled" "converged=$CONVERGED, orders: $BY_STATUS" $((1 - CONVERGED))
 check "every user got an order (none dropped, none left in the queue)" "$ORDERS" "$N"
-check "FAILED orders (a PENDING hold released would end FAILED)" "$FAILED_ORDERS" 0
+check "FAILED orders (none: no publish failed, nothing queued was given up)" "$FAILED_ORDERS" 0
 check "EXPIRED or FAILED orders that never had a payment link" "$UNLINKED" 0
-check "leaked-hold releases logged by the expiration worker" "$LEAKED_LOG" 0
 check "generator outcomes failed, timeout or error" "$(j '[.outcomes.failed // 0, .outcomes.timeout // 0, .outcomes.error // 0, .outcomes.sold_out // 0, .outcomes.conflict // 0] | add')" 0
 check_cond "the backlog was real: the last link came after more than the payment window" \
   "slowest checkout to link ${MAX_LINK} ms, window ${WINDOW_MS} ms" $([ "$MAX_LINK" -gt "$WINDOW_MS" ] && echo 0 || echo 1)
@@ -91,8 +87,7 @@ check "CONFIRMED orders equal payments accepted in time (the generator pays only
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
 check "orders still AWAITING_PAYMENT" "$LIVE" 0
-check "stock:{sale} equals $UNITS minus sold (every abandoned hold released)" "$R_STOCK" "$((UNITS - P_SOLD))"
-check "holds left in holds:pending and holds:expiry" "$HP + $HE" "0 + 0"
+check "stock:{sale} equals $UNITS minus products.sold (every unit of an expired order returned once)" "$R_STOCK" "$((UNITS - P_SOLD))"
 check "server errors (5xx) in the generator's samples" "$(j .server_errors_5xx)" 0
 check "network failures in the generator's samples" "$(j .network_failures)" 0
 echo "INFO  turned away by rate limits (429): $(j .rate_limited_429)"

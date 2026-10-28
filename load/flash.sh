@@ -8,7 +8,7 @@
 #
 # Needs the repository's docker compose (postgres, redis, kafka start if they are not
 # up). It rebuilds and starts the app profile with test settings:
-#   PAYMENT_WINDOW_SECS=30 (so abandoned holds expire within the run) and
+#   PAYMENT_WINDOW_SECS=30 (so abandoned orders expire within the run) and
 #   GATEWAY_TRUST_XFF=1 (each simulated user gets its own X-Forwarded-For address).
 # At the end it brings the app profile back up with the default settings, the gateway
 # no longer trusting X-Forwarded-For. Do not run `cargo test` while the app is up.
@@ -54,12 +54,12 @@ REFUNDED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND statu
 BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none') FROM (SELECT status::text, count(*) AS n FROM orders WHERE product_id = $SALE GROUP BY status ORDER BY status) s")
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
 R_STOCK=$(rcli GET "stock:{$SALE}")
-HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
+FAILED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'FAILED'")
 DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
 LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'AWAITING_PAYMENT'")
 IN_TIME=$(j .payments.in_time); BOUNDARY=$(j .payments.boundary); LATE=$(j .payments.late)
 
-check_cond "the system settled (no AWAITING_PAYMENT orders, no queued holds, inbox and outbox drained)" "converged=$CONVERGED, orders: $BY_STATUS" $((1 - CONVERGED))
+check_cond "the system settled (no AWAITING_PAYMENT orders, inbox and outbox drained)" "converged=$CONVERGED, orders: $BY_STATUS" $((1 - CONVERGED))
 check_cond "CONFIRMED orders equal the payments that arrived in time, and are at most $UNITS" \
   "CONFIRMED $CONFIRMED; payments surely in time $IN_TIME, at the boundary $BOUNDARY" \
   $([ "$CONFIRMED" -ge "$IN_TIME" ] && [ "$CONFIRMED" -le $((IN_TIME + BOUNDARY)) ] && [ "$CONFIRMED" -le "$UNITS" ] && echo 0 || echo 1)
@@ -70,8 +70,8 @@ check "CONFIRMED orders equal users the generator saw CONFIRMED" "$CONFIRMED" "$
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
 check "orders still AWAITING_PAYMENT" "$LIVE" 0
-check "stock:{sale} equals $UNITS minus sold (every abandoned hold released)" "$R_STOCK" "$((UNITS - P_SOLD))"
-check "holds left in holds:pending and holds:expiry" "$HP + $HE" "0 + 0"
+check "stock:{sale} equals $UNITS minus products.sold (every unit of an expired order returned once, none of a confirmed one)" "$R_STOCK" "$((UNITS - P_SOLD))"
+check "FAILED orders (no publish failed)" "$FAILED" 0
 check "server errors (5xx) in the generator's samples" "$(j .server_errors_5xx)" 0
 check "network failures in the generator's samples" "$(j .network_failures)" 0
 RATE_LIMITED=$(j .rate_limited_429)

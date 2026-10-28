@@ -13,8 +13,8 @@ use super::{webhook, PaymentError, PaymentResult, Session};
 use crate::cache::RedisConn;
 
 /// How long a fake session and its ticket mapping are kept: 7 days. Far longer
-/// than the payment window, so a payment that arrives after the hold was
-/// released can still be found and refunded.
+/// than the payment window, so a payment that arrives after the order was
+/// expired can still be found and refunded.
 pub const FAKE_SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Key of a fake session: the stand-in for the provider's own database,
@@ -171,7 +171,7 @@ impl FakeProvider {
     /// The user pays or cancels at the payment page: moves the session out of
     /// `OPEN` and queues its webhook event, atomically (`fakepay_settle.lua`).
     /// The provider checks only its own session: it does not know whether the
-    /// merchant's hold is still alive, so a payment after the hold expired but
+    /// merchant's deadline has passed, so a payment after the deadline but
     /// before the session was expired is accepted (and the backend refunds it).
     pub async fn settle(&self, session: &FakeSession, action: Settle) -> PaymentResult<Settled> {
         let (to, event_type) = match action {

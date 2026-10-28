@@ -8,7 +8,7 @@
 //! The page reads and writes sessions only through `FakeProvider`. It does
 //! not call the backend: pressing a button settles the session and queues a
 //! webhook event, and the provider's dispatcher delivers that separately
-//! (`crate::payment::dispatcher`). The provider does not know about our hold,
+//! (`crate::payment::dispatcher`). The provider does not know our deadline,
 //! so paying an `OPEN` session always works, even after the deadline; the
 //! backend then refunds. Paying an `EXPIRED` session is refused.
 

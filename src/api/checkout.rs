@@ -1,8 +1,9 @@
 //! `POST /v1/sales/{sale_id}/checkout`: the hot path of the flash sale.
 //!
 //! One Lua call decides (`checkout.lua`); winners then go through Kafka and
-//! get `202` with a ticket to poll. Nothing here touches PostgreSQL, and once
-//! a replica knows a sale is sold out it does not touch Redis either.
+//! get `202` with a ticket to poll. PostgreSQL is touched only when a publish
+//! fails (below), and once a replica knows a sale is sold out it does not touch
+//! Redis either.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -13,7 +14,9 @@ use serde::Serialize;
 
 use crate::{
     auth::AuthUser,
-    cache::{self, CheckoutOutcome, HoldState, MaxScore, ReadCache, ReleasedAs, RedisConn, StatusUpdate},
+    actions::orders::FailedInsert,
+    cache::{self, CheckoutOutcome, ReadCache, RedisConn, StatusUpdate},
+    db::DbPool,
     error::{ApiError, ErrorBody},
     models::OrderStatus,
     queue::{CheckoutEvent, SharedQueue},
@@ -29,7 +32,7 @@ const MAX_TRACKED_SALES: usize = 1_000;
 /// gone, the thousands of requests that follow are answered `410` from
 /// memory. A sale is only tracked after Redis has answered for it once, and
 /// the flag is refreshed from `stock:{sale}` every 100 ms by `run_refresher`,
-/// so it clears again when a released hold returns a unit. Unknown sales go
+/// so it clears again when an expired order returns a unit. Unknown sales go
 /// to Redis.
 #[derive(Default)]
 pub struct SoldOutFlags {
@@ -125,16 +128,20 @@ fn idempotency_key(req: &HttpRequest) -> Result<String, ApiError> {
 ///   same `Idempotency-Key`
 /// - `403` before the sale opens, `409` if the caller already holds or bought
 ///   one, `410` if sold out, `404` for a sale Redis does not know
-/// - `503` (`Retry-After: 1`) if the publish failed: the hold is released at
-///   once and the key forgotten, so a retry with the same key starts over
+/// - `503` (`Retry-After: 1`) if the publish failed: the order is recorded
+///   `FAILED` in PostgreSQL and the unit returned at once, and the key
+///   forgotten, so a retry with the same key starts over
 ///
 /// A winner retrying after the last unit was taken gets `410` from a replica
 /// whose flag is set, because that answer is given without asking Redis.
 #[post("/sales/{sale_id}/checkout")]
+// One parameter per extractor
+#[allow(clippy::too_many_arguments)]
 async fn checkout(
     req: HttpRequest,
     user: AuthUser,
     path: web::Path<i32>,
+    pool: web::Data<DbPool>,
     redis: web::Data<RedisConn>,
     read_cache: web::Data<ReadCache>,
     queue: web::Data<SharedQueue>,
@@ -155,44 +162,28 @@ async fn checkout(
     }
 
     let checkout_ms = match outcome {
-        CheckoutOutcome::Held { checkout_ms } => checkout_ms,
+        CheckoutOutcome::Reserved { checkout_ms } => checkout_ms,
         CheckoutOutcome::Existing { ticket } => return Ok(ticket_response(HttpResponse::Ok(), ticket)),
         CheckoutOutcome::NotStarted { .. } => return Err(ApiError::Forbidden("the sale has not started".into())),
         CheckoutOutcome::NotFound => return Err(ApiError::NotFound(format!("sale {sale} not found"))),
-        CheckoutOutcome::AlreadyHolds => return Err(ApiError::Conflict("you already hold or bought one".into())),
+        CheckoutOutcome::AlreadyLive => return Err(ApiError::Conflict("you already hold or bought one".into())),
         CheckoutOutcome::SoldOut => return Err(ApiError::Gone("sold out".into())),
     };
 
-    let event = CheckoutEvent { ticket: ticket.clone(), sale, user: user.id, checkout_ms };
+    // The event carries everything the processor needs: Redis keeps no record
+    // of the ticket
+    let event = CheckoutEvent { ticket: ticket.clone(), sale, user: user.id, checkout_ms, idempotency_key: key.clone() };
     let published = match queue.publish(&event).await {
         Ok(published) => published,
         Err(e) => {
-            // The message cannot arrive any more: give the unit back at once
-            // and forget the key so the retry makes a new hold
-            log::error!("publish of {ticket} failed, releasing the hold: {e}");
-            match cache::release_hold(
-                &mut con,
-                sale,
-                &ticket,
-                HoldState::Pending,
-                MaxScore::Any,
-                ReleasedAs::Failed,
-                true,
-            )
-            .await
-            {
-                Ok(outcome) => log::info!("compensation for {ticket}: {outcome:?}"),
-                // The leaked-hold loop of the expiration worker still returns it
-                Err(e) => log::error!("compensation for {ticket} failed: {e}"),
-            }
-            return Ok(HttpResponse::ServiceUnavailable()
-                .insert_header((header::RETRY_AFTER, "1"))
-                .json(ErrorBody { message: "the checkout queue is unavailable, retry with the same key".into() }));
+            log::error!("publish of {ticket} failed, compensating: {e}");
+            return compensate(&pool, &mut con, sale, user.id, ticket, &key).await;
         }
     };
 
-    // The reservation stands whether or not this write lands: the status
-    // endpoint falls back to the hold
+    // The reservation stands whether or not this write lands: the processor
+    // creates the order from the message, and until then the user just sees no
+    // place in the queue
     let mut status = StatusUpdate::new(OrderStatus::Pending, user.id);
     status.partition = Some(published.partition);
     status.offset = Some(published.offset);
@@ -203,6 +194,45 @@ async fn checkout(
     }
 
     Ok(ticket_response(HttpResponse::Accepted(), ticket))
+}
+
+/// The publish failed. PostgreSQL decides what happens to the unit: the order
+/// is inserted as `FAILED` (`ON CONFLICT DO NOTHING` on the ticket), and only a
+/// call that created the row returns the unit to stock, clears `user_live` (if
+/// it still names the ticket) and forgets the idempotency key, then answers
+/// `503`. If the row already existed the message reached Kafka after all and a
+/// processor made the order: the checkout succeeded. If PostgreSQL cannot be
+/// reached the unit stays reserved (lost for the rest of the sale: accepted,
+/// `docs/FAILURE_CASES.md` case 1) and the answer is still `503`.
+async fn compensate(
+    pool: &web::Data<DbPool>,
+    con: &mut RedisConn,
+    sale: i32,
+    user: i32,
+    ticket: String,
+    key: &str,
+) -> Result<HttpResponse, ApiError> {
+    let (pool, lookup) = (pool.get_ref().clone(), ticket.clone());
+    let recorded = web::block(move || -> Result<FailedInsert, ApiError> {
+        let mut conn = pool.get()?;
+        Ok(crate::actions::orders::insert_failed(&mut conn, user, sale, &lookup)?)
+    })
+    .await;
+    match recorded {
+        Ok(Ok(FailedInsert::Created)) => match cache::return_unit(con, sale, user, &ticket, Some(key)).await {
+            Ok(()) => log::info!("compensation for {ticket}: unit returned"),
+            Err(e) => log::error!("compensation for {ticket}: the unit could not be returned: {e}"),
+        },
+        Ok(Ok(FailedInsert::Existed)) => {
+            log::info!("{ticket}: its order exists, the message reached the queue after all");
+            return Ok(ticket_response(HttpResponse::Accepted(), ticket));
+        }
+        Ok(Err(e)) => log::error!("compensation for {ticket}: recording the failure failed, the unit stays reserved: {e}"),
+        Err(e) => log::error!("compensation for {ticket}: recording the failure failed, the unit stays reserved: {e}"),
+    }
+    Ok(HttpResponse::ServiceUnavailable()
+        .insert_header((header::RETRY_AFTER, "1"))
+        .json(ErrorBody { message: "the checkout queue is unavailable, retry with the same key".into() }))
 }
 
 // POST /v1/sales/{sale_id}/checkout

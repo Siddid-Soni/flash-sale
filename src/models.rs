@@ -6,8 +6,9 @@ use crate::schema::{orders, payment_inbox, products, users};
 
 /// The states an order row can be in; the PostgreSQL enum `order_status`.
 /// There is no `PENDING` here: the processor inserts the order only once its
-/// payment session exists, so a row is born `AWAITING_PAYMENT`. See
-/// `OrderStatus` for what clients see.
+/// payment session exists, so a row is born `AWAITING_PAYMENT` (or `FAILED`, when
+/// the Order Service could not publish the checkout). See `OrderStatus` for what
+/// clients see.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, diesel_derive_enum::DbEnum, Serialize, Deserialize)]
 #[ExistingTypePath = "crate::schema::sql_types::OrderStatus"]
 #[DbValueStyle = "SCREAMING_SNAKE_CASE"]
@@ -20,10 +21,9 @@ pub enum OrderState {
     Refunded,
 }
 
-/// What a client is told about a ticket; mirrors the hold states in Redis (see
-/// ROADMAP.md, Holds). It is `OrderState` plus `Pending` (waiting in Kafka, no
-/// order yet): `PENDING` lives only in the read cache and in the hold, never in
-/// PostgreSQL.
+/// What a client is told about a ticket. It is `OrderState` plus `Pending`
+/// (waiting in Kafka, no order yet): `PENDING` lives only in the read cache,
+/// never in PostgreSQL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
@@ -36,7 +36,7 @@ pub enum OrderStatus {
 }
 
 impl OrderStatus {
-    /// The name used in Redis (`status:<ticket>`, holds) and in API responses
+    /// The name used in Redis (`status:<ticket>`) and in API responses
     pub fn as_str(self) -> &'static str {
         match self {
             OrderStatus::Pending => "PENDING",
@@ -109,7 +109,7 @@ pub struct NewProduct<'a> {
     pub sale_start_time: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Queryable, Selectable, Identifiable, Associations, Serialize)]
+#[derive(Debug, Clone, Queryable, QueryableByName, Selectable, Identifiable, Associations, Serialize)]
 #[diesel(belongs_to(User))]
 #[diesel(belongs_to(Product))]
 #[diesel(table_name = orders)]
@@ -132,7 +132,8 @@ pub struct Order {
 }
 
 /// Inserted by an order processor when it consumes a checkout event, once the
-/// payment session exists: the order is born with its link and deadline.
+/// payment session exists: the order is born with its link and deadline. The
+/// Order Service inserts one as `FAILED` (no session) when a publish fails.
 #[derive(Debug, Insertable)]
 #[diesel(table_name = orders)]
 pub struct NewOrder<'a> {

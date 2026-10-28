@@ -1,21 +1,23 @@
-//! The order processor's logic (roadmap steps 15-18): turn each checkout event
-//! into an order and a payment link, and report how far each Kafka partition
-//! has been processed.
+//! The order processor's logic (roadmap steps 15-18 and 45): turn each checkout
+//! event into an order and a payment link, and report how far each Kafka
+//! partition has been processed.
 //!
-//! - `Processor::handle` is the per-message work, in this order: (a) the hold
-//!   must still be `PENDING`; (b) the price; (c) the payment session (the
-//!   provider's idempotency key is the ticket); (d) the order, inserted
-//!   directly as `AWAITING_PAYMENT` with the session, link and deadline in one
-//!   INSERT (`ON CONFLICT DO NOTHING`, then read back by ticket); (e)
-//!   `link_ready.lua` moves the hold to `AWAITING_PAYMENT`, and the status
-//!   entry gets the link. If the hold was released meanwhile (`gone`) the
-//!   order becomes `FAILED` and the session expires. If another constraint
-//!   refuses the order (the user already has a live one) there is no row: the
-//!   session is expired and the hold is left to the leaked-hold loop. Every
-//!   step is idempotent, because a message is redelivered after a crash or a
-//!   rebalance, so the whole thing can simply run again. `PENDING` is never
-//!   stored in PostgreSQL: it exists only in the hold and the read cache,
-//!   while the message waits in Kafka.
+//! - `Processor::handle` is the per-message work, in this order: (a) the price;
+//!   (b) the payment session (the provider's idempotency key is the ticket);
+//!   (c) the order, inserted directly as `AWAITING_PAYMENT` with the session,
+//!   link and deadline in one INSERT (`ON CONFLICT DO NOTHING`, then read back
+//!   by ticket); (d) the link written to the status entry. If the ticket's row
+//!   is already `FAILED` (the Order Service could not publish it and recorded
+//!   that in PostgreSQL, yet the message arrived) the session is expired and
+//!   nothing else is written. If another constraint refuses the order (the user
+//!   already has a live one) there is no row: the session is expired and the
+//!   ticket is reported `FAILED`. The processor touches no inventory key: Redis
+//!   gates admission only, and the unit of an order that is never paid comes
+//!   back through the expiration worker (or the Order Service's compensation).
+//!   Every step is idempotent, because a message is redelivered after a crash
+//!   or a rebalance, so the whole thing can simply run again. `PENDING` is never
+//!   stored in PostgreSQL: it exists only in the read cache, while the message
+//!   waits in Kafka.
 //! - `PartitionProgress` tracks which offsets of one partition are done and
 //!   which prefix is complete; only that prefix may be committed or reported.
 //! - `run` is the Kafka consumer loop around both (see its docs).
@@ -37,10 +39,10 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 use crate::{
     actions,
-    cache::{self, LinkOutcome, ReadCache, RedisConn, StatusUpdate},
+    cache::{self, ReadCache, StatusUpdate},
     config::Config,
     db::DbPool,
-    models::{NewOrder, Order, OrderState, OrderStatus},
+    models::{NewOrder, OrderState, OrderStatus},
     payment::{PaymentError, SharedProvider},
     queue::CheckoutEvent,
 };
@@ -52,19 +54,17 @@ pub const GROUP_ID: &str = "order-processors";
 /// offset may be committed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The order and the payment session exist, the hold is `AWAITING_PAYMENT`
-    /// and the status entry carries the link
+    /// The order and the payment session exist and the status entry carries
+    /// the link (also a redelivery: the status entry was rewritten)
     Linked,
-    /// The hold was already linked (a redelivery): the status entry was rewritten
-    Redelivered,
-    /// The hold was released (or never existed): no order was made
-    Skipped,
-    /// The hold was released while the processor worked: the order is `FAILED`,
-    /// the session expired
+    /// The ticket's order is `FAILED` (its publish was reported as failed): the
+    /// session was expired and nothing else was written
     Failed,
+    /// The ticket's order is already past `AWAITING_PAYMENT` (a redelivery long
+    /// after it was paid or expired): nothing was written
+    Skipped,
     /// No order could be made for the message (the user already has a live
-    /// order, an unknown product, a malformed ticket). The hold is untouched:
-    /// the leaked-hold loop (Stage 6) releases it once progress passes it.
+    /// order, an unknown product, a malformed ticket)
     Dropped,
 }
 
@@ -90,7 +90,6 @@ pub struct Processor {
     pool: DbPool,
     /// Waiting for a database connection happens here, not in a blocking thread
     db_slots: Semaphore,
-    inventory: RedisConn,
     read_cache: ReadCache,
     provider: SharedProvider,
     payment_window: chrono::Duration,
@@ -99,17 +98,10 @@ pub struct Processor {
 }
 
 impl Processor {
-    pub fn new(
-        pool: DbPool,
-        inventory: RedisConn,
-        read_cache: ReadCache,
-        provider: SharedProvider,
-        payment_window_secs: u64,
-    ) -> Self {
+    pub fn new(pool: DbPool, read_cache: ReadCache, provider: SharedProvider, payment_window_secs: u64) -> Self {
         Self {
             db_slots: Semaphore::new(pool.max_size() as usize),
             pool,
-            inventory,
             read_cache,
             provider,
             payment_window: chrono::Duration::seconds(payment_window_secs as i64),
@@ -163,55 +155,34 @@ impl Processor {
     /// Handles one checkout event. Safe to run again for the same event, at
     /// any point after a failure; an `Err` is transient (the caller retries).
     pub async fn handle(&self, event: &CheckoutEvent) -> Result<Outcome, ProcessError> {
-        let (sale, ticket) = (event.sale, event.ticket.as_str());
+        let (sale, ticket, user) = (event.sale, event.ticket.as_str(), event.user);
         if cache::ticket_sale(ticket) != Some(sale) {
             log::error!("Checkout event for {ticket} names sale {sale}; dropped");
             return Ok(Outcome::Dropped);
         }
-        let mut inventory = self.inventory.clone();
 
-        // a. The hold must still be PENDING
-        let hold = match cache::read_hold(&mut inventory, sale, ticket).await? {
-            Some(hold) if hold.state == "PENDING" => hold,
-            Some(hold) if hold.state == "AWAITING_PAYMENT" => {
-                // Redelivery after the link was made. The crash may have come
-                // before the status write, so write it again from the order
-                let lookup = ticket.to_string();
-                let order = self.db(move |conn| actions::orders::find_by_ticket(conn, &lookup)).await?;
-                match order {
-                    Some(Order { status: OrderState::AwaitingPayment, checkout_url: Some(url), expires_at: Some(at), .. }) => {
-                        self.publish_link(ticket, hold.user, &url, at).await?;
-                    }
-                    other => log::info!("{ticket} is already {}; its order is {:?}", hold.state, other.map(|o| o.status)),
-                }
-                return Ok(Outcome::Redelivered);
-            }
-            // Released (FAILED, EXPIRED) or gone: its unit is back in stock
-            _ => return Ok(Outcome::Skipped),
-        };
-
-        // b. The price
+        // a. The price
         let Some(amount_cents) = self.price(sale).await? else {
             log::error!("{ticket}: no product {sale}; dropped");
             return Ok(Outcome::Dropped);
         };
 
-        // c. The payment session, idempotent per ticket
+        // b. The payment session, idempotent per ticket
         //
         // The payment deadline ("now + 5 min" in the roadmap) is computed once,
-        // in whole milliseconds, and used for the session, the order row, the
-        // hold's score in `holds:expiry` and the status entry, so the four
-        // agree. A rerun after a crash asks for a new one, but the provider
-        // returns the first session and the insert below keeps the first row,
-        // so the first deadline stays the one in force (see step e).
+        // in whole milliseconds, and used for the session, the order row and the
+        // status entry, so the three agree. A rerun after a crash asks for a
+        // new one, but the provider returns the first session and the insert
+        // below keeps the first row, so the first deadline stays the one in
+        // force (see step c).
         let expires_ms = Utc::now().timestamp_millis() + self.payment_window.num_milliseconds();
         let expires_at = DateTime::from_timestamp_millis(expires_ms).expect("a deadline in range");
         let session = self.provider.create_session(ticket, amount_cents, expires_at, ticket).await?;
 
-        // d. The order, born AWAITING_PAYMENT with its session, link and
+        // c. The order, born AWAITING_PAYMENT with its session, link and
         // deadline in one INSERT. A repeated ticket finds its row
-        let (idem, session_id, url) = (hold.idem.clone(), session.id.clone(), session.url.clone());
-        let (ticket_owned, user) = (ticket.to_string(), hold.user);
+        let (idem, session_id, url) = (event.idempotency_key.clone(), session.id.clone(), session.url.clone());
+        let ticket_owned = ticket.to_string();
         let inserted = self
             .db(move |conn| {
                 let order = NewOrder {
@@ -231,9 +202,8 @@ impl Processor {
         let order = match inserted {
             Ok(Some(order)) => order,
             Ok(None) => {
-                log::warn!("{ticket}: another constraint refused the order (user {} has a live order?); hold left for the leaked-hold loop", hold.user);
-                self.provider.expire_session(&session.id).await?;
-                return Ok(Outcome::Dropped);
+                log::warn!("{ticket}: another constraint refused the order (user {user} has a live order?); failing the ticket");
+                return self.drop_ticket(event, &session.id).await;
             }
             // A row that can never be inserted (unknown user...) is not retried forever
             Err(ProcessError::Db(diesel::result::Error::DatabaseError(
@@ -242,40 +212,48 @@ impl Processor {
                 | DatabaseErrorKind::NotNullViolation),
                 info,
             ))) => {
-                log::error!("{ticket}: order refused ({kind:?}: {}); hold left for the leaked-hold loop", info.message());
-                self.provider.expire_session(&session.id).await?;
-                return Ok(Outcome::Dropped);
+                log::error!("{ticket}: order refused ({kind:?}: {}); failing the ticket", info.message());
+                return self.drop_ticket(event, &session.id).await;
             }
             Err(e) => return Err(e),
         };
-        // On a redelivery this is the first attempt's row: its session and
-        // deadline are the ones in force (PostgreSQL decides on `expires_at`)
-        let (Some(session_id), Some(url), Some(expires_at)) =
-            (order.payment_session_id.as_deref(), order.checkout_url.as_deref(), order.expires_at)
-        else {
-            log::error!("{ticket}: its order has no session, link or deadline; dropped");
-            return Ok(Outcome::Dropped);
-        };
-        if order.status != OrderState::AwaitingPayment {
-            log::error!("{ticket}: the hold is PENDING but its order is {:?}; dropped", order.status);
-            return Ok(Outcome::Dropped);
-        }
 
-        // e. Link the hold, unless it was released in the meantime
-        match cache::link_ready(&mut inventory, sale, ticket, session_id, expires_at.timestamp_millis()).await? {
-            LinkOutcome::Ready | LinkOutcome::Already => {
-                self.publish_link(ticket, hold.user, url, expires_at).await?;
+        // d. What PostgreSQL holds for the ticket decides
+        match order.status {
+            OrderState::AwaitingPayment => {
+                // On a redelivery this is the first attempt's row: its session
+                // and deadline are the ones in force (PostgreSQL decides on
+                // `expires_at`)
+                let (Some(url), Some(expires_at)) = (order.checkout_url.as_deref(), order.expires_at) else {
+                    log::error!("{ticket}: its order has no link or deadline; dropped");
+                    return Ok(Outcome::Dropped);
+                };
+                self.publish_link(ticket, user, url, expires_at).await?;
                 Ok(Outcome::Linked)
             }
-            LinkOutcome::Gone => {
-                log::info!("{ticket}: the hold was released before its link was ready; failing the order");
-                let lookup = ticket.to_string();
-                self.db(move |conn| actions::orders::mark_failed(conn, &lookup)).await?;
-                self.provider.expire_session(session_id).await?;
-                self.write_status(ticket, &StatusUpdate::new(OrderStatus::Failed, hold.user)).await?;
+            OrderState::Failed => {
+                // The Order Service recorded the publish as failed and returned
+                // the unit; this message arrived anyway. Stop, writing nothing
+                log::info!("{ticket}: its order is FAILED; expiring the payment session");
+                self.provider.expire_session(&session.id).await?;
                 Ok(Outcome::Failed)
             }
+            // Confirmed, expired or refunded: a redelivery after the order moved
+            // on. The session is the order's own (paid, or already expired by
+            // the worker), so it is left alone
+            other => {
+                log::info!("{ticket}: its order is already {other:?}; nothing to do");
+                Ok(Outcome::Skipped)
+            }
         }
+    }
+
+    /// No order exists for the ticket and none can: the payment session made
+    /// for it is expired and the client is told `FAILED`
+    async fn drop_ticket(&self, event: &CheckoutEvent, session_id: &str) -> Result<Outcome, ProcessError> {
+        self.provider.expire_session(session_id).await?;
+        self.write_status(&event.ticket, &StatusUpdate::new(OrderStatus::Failed, event.user)).await?;
+        Ok(Outcome::Dropped)
     }
 
     /// `handle`, retried with backoff on any error until it succeeds. Returns
@@ -300,29 +278,10 @@ impl Processor {
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 
-/// A processed message, as far as progress is concerned
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Done {
-    pub sale: i32,
-    pub checkout_ms: i64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     InFlight,
-    /// Done; `None` for a message that named no sale (undecodable)
-    Complete(Option<Done>),
-}
-
-/// What a completed prefix lets the caller report
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Advance {
-    /// The highest offset of the contiguous done prefix; commit `offset + 1`
-    pub offset: i64,
-    /// Per sale, the checkout time of the last message of that sale in the
-    /// prefix, for `processed_upto`. Only sales whose value is higher than any
-    /// reported before by this tracker; Redis refuses a decrease anyway.
-    pub processed_upto: Vec<(i32, i64)>,
+    Done,
 }
 
 /// Which offsets of one partition are in flight or done. Messages finish in
@@ -332,7 +291,6 @@ pub struct Advance {
 pub struct PartitionProgress {
     slots: BTreeMap<i64, Slot>,
     in_flight: usize,
-    reported: HashMap<i32, i64>,
 }
 
 impl PartitionProgress {
@@ -344,37 +302,25 @@ impl PartitionProgress {
         }
     }
 
-    /// A message was fully handled. Returns what the completed prefix now
-    /// covers, if it grew; `None` for an offset not being tracked (the
-    /// partition was revoked and tracking restarted).
-    pub fn finish(&mut self, offset: i64, done: Option<Done>) -> Option<Advance> {
+    /// A message was fully handled. Returns the highest offset of the
+    /// contiguous done prefix (commit that plus one) if the prefix grew; `None`
+    /// for an offset not being tracked (the partition was revoked and tracking
+    /// restarted) or one finished behind a message still in flight.
+    pub fn finish(&mut self, offset: i64) -> Option<i64> {
         match self.slots.get_mut(&offset)? {
             slot @ Slot::InFlight => {
-                *slot = Slot::Complete(done);
+                *slot = Slot::Done;
                 self.in_flight -= 1;
             }
-            Slot::Complete(_) => return None,
+            Slot::Done => return None,
         }
 
         let mut last = None;
-        let mut by_sale: HashMap<i32, i64> = HashMap::new();
-        while let Some((&first, Slot::Complete(done))) = self.slots.first_key_value().map(|(k, v)| (k, *v)) {
+        while let Some((&first, Slot::Done)) = self.slots.first_key_value() {
             self.slots.remove(&first);
             last = Some(first);
-            if let Some(done) = done {
-                by_sale.insert(done.sale, done.checkout_ms);
-            }
         }
-        let offset = last?;
-        let mut processed_upto = Vec::new();
-        for (sale, ms) in by_sale {
-            if self.reported.get(&sale).is_none_or(|&reported| ms > reported) {
-                self.reported.insert(sale, ms);
-                processed_upto.push((sale, ms));
-            }
-        }
-        processed_upto.sort_unstable();
-        Some(Advance { offset, processed_upto })
+        last
     }
 
     /// Messages being handled
@@ -476,7 +422,7 @@ impl ConsumerContext for RebalanceContext {
 
 /// How a handler task ended
 enum Finished {
-    Completed { partition: i32, offset: i64, done: Option<Done> },
+    Completed { partition: i32, offset: i64 },
     /// Gave up at shutdown, or panicked: not done
     Aborted,
 }
@@ -513,22 +459,15 @@ struct Loop<'a> {
     consumer: &'a StreamConsumer<RebalanceContext>,
     topic: &'a str,
     concurrency: usize,
-    inventory: RedisConn,
     read_cache: ReadCache,
     partitions: HashMap<i32, PartitionState>,
     /// Handler tasks that have not reported yet
     live: usize,
     /// Next offset to commit per partition, once it advanced
     to_commit: HashMap<i32, i64>,
-    /// Progress not yet written to Redis (new, or the write failed), per partition
-    pending: HashMap<i32, PendingProgress>,
-}
-
-/// One partition's progress to write with `cache::record_progress`
-struct PendingProgress {
-    offset: i64,
-    /// sale -> checkout ms
-    upto: HashMap<i32, i64>,
+    /// Progress not yet written to the read cache (new, or the write failed):
+    /// the highest processed offset per partition
+    pending: HashMap<i32, i64>,
 }
 
 impl Loop<'_> {
@@ -558,20 +497,16 @@ impl Loop<'_> {
         }
     }
 
-    /// Takes in a prefix that advanced: remembers what to commit and report
-    fn advanced(&mut self, partition: i32, advance: Advance) {
-        self.to_commit.insert(partition, advance.offset + 1);
-        let pending = self.pending.entry(partition).or_insert(PendingProgress { offset: advance.offset, upto: HashMap::new() });
-        pending.offset = pending.offset.max(advance.offset);
-        for (sale, ms) in advance.processed_upto {
-            let slot = pending.upto.entry(sale).or_insert(ms);
-            *slot = (*slot).max(ms);
-        }
+    /// Takes in a prefix that advanced up to `offset`: remembers what to commit and report
+    fn advanced(&mut self, partition: i32, offset: i64) {
+        self.to_commit.insert(partition, offset + 1);
+        let pending = self.pending.entry(partition).or_insert(offset);
+        *pending = (*pending).max(offset);
     }
 
-    /// (1) commits the offsets, then (2) writes `processed_upto` and the
-    /// queue-position progress together (`cache::record_progress`), for
-    /// everything that advanced. A failed Redis write stays pending for the
+    /// (1) commits the offsets, then (2) writes the
+    /// queue-position progress (`cache::record_progress`) for everything that
+    /// advanced. A failed Redis write stays pending for the
     /// next flush; the values are cumulative.
     async fn flush(&mut self, mode: CommitMode) {
         if !self.to_commit.is_empty() {
@@ -589,17 +524,8 @@ impl Loop<'_> {
         }
         let partitions: Vec<i32> = self.pending.keys().copied().collect();
         for partition in partitions {
-            let pending = &self.pending[&partition];
-            let upto: Vec<(i32, i64)> = pending.upto.iter().map(|(&sale, &ms)| (sale, ms)).collect();
-            let written = cache::record_progress(
-                &mut self.inventory,
-                &mut self.read_cache,
-                self.topic,
-                partition,
-                pending.offset,
-                &upto,
-            )
-            .await;
+            let offset = self.pending[&partition];
+            let written = cache::record_progress(&mut self.read_cache, self.topic, partition, offset).await;
             match written {
                 Ok(()) => {
                     self.pending.remove(&partition);
@@ -616,10 +542,10 @@ impl Loop<'_> {
     /// Takes in a handler's report. Returns whether a prefix advanced.
     fn finished(&mut self, finished: Finished) -> bool {
         self.live = self.live.saturating_sub(1);
-        let Finished::Completed { partition, offset, done } = finished else { return false };
+        let Finished::Completed { partition, offset } = finished else { return false };
         // No state: the partition was revoked; the message will be redelivered
         let Some(state) = self.partitions.get_mut(&partition) else { return false };
-        let advance = state.progress.finish(offset, done);
+        let advance = state.progress.finish(offset);
         self.update_pause(partition);
         match advance {
             Some(advance) => {
@@ -637,7 +563,7 @@ impl Loop<'_> {
 /// `PROCESSOR_CONCURRENCY` in flight per partition; a full partition is
 /// paused, not the whole consumer) and finish in any order. Auto-commit is off:
 /// when the contiguous prefix of a partition grows, the offset after it is
-/// committed, `processed_upto` is raised and the queue-position progress is
+/// committed and the queue-position progress is
 /// written. On revocation the partition's tracking is dropped; its unfinished
 /// messages are redelivered to the next owner, which is safe. On shutdown no
 /// more messages are fetched, in-flight ones get a bounded time to finish, and
@@ -645,7 +571,6 @@ impl Loop<'_> {
 pub async fn run(
     config: &Config,
     processor: Arc<Processor>,
-    inventory: RedisConn,
     read_cache: ReadCache,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), KafkaError> {
@@ -671,7 +596,6 @@ pub async fn run(
         consumer: &consumer,
         topic: &config.checkout_topic,
         concurrency: config.processor_concurrency.max(1),
-        inventory,
         read_cache,
         partitions: HashMap::new(),
         live: 0,
@@ -735,7 +659,7 @@ pub async fn run(
                 match event {
                     None => {
                         log::error!("Undecodable message at partition {partition} offset {offset}; skipped");
-                        if let Some(advance) = partition_state.progress.finish(offset, None) {
+                        if let Some(advance) = partition_state.progress.finish(offset) {
                             state.advanced(partition, advance);
                             state.flush(CommitMode::Async).await;
                         }
@@ -755,11 +679,7 @@ pub async fn run(
                             let finished = match processor.handle_with_retry(&event, &shutdown).await {
                                 Some(outcome) => {
                                     log::debug!("{}: {outcome:?}", event.ticket);
-                                    Finished::Completed {
-                                        partition,
-                                        offset,
-                                        done: Some(Done { sale: event.sale, checkout_ms: event.checkout_ms }),
-                                    }
+                                    Finished::Completed { partition, offset }
                                 }
                                 None => Finished::Aborted,
                             };
@@ -794,10 +714,6 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    fn done(sale: i32, checkout_ms: i64) -> Option<Done> {
-        Some(Done { sale, checkout_ms })
-    }
-
     #[test]
     fn only_the_contiguous_prefix_advances() {
         let mut p = PartitionProgress::default();
@@ -807,17 +723,17 @@ mod tests {
         assert_eq!(p.in_flight(), 5);
 
         // 12 and 11 finish first: nothing is committable while 10 is open
-        assert_eq!(p.finish(12, done(1, 300)), None);
-        assert_eq!(p.finish(11, done(1, 200)), None);
+        assert_eq!(p.finish(12), None);
+        assert_eq!(p.finish(11), None);
         assert_eq!((p.in_flight(), p.tracked()), (3, 5));
 
-        // 10 finishes: the prefix 10..=12 completes, reported as the last message of the sale
-        assert_eq!(p.finish(10, done(1, 100)), Some(Advance { offset: 12, processed_upto: vec![(1, 300)] }));
+        // 10 finishes: the prefix 10..=12 completes
+        assert_eq!(p.finish(10), Some(12));
         assert_eq!((p.in_flight(), p.tracked()), (2, 2));
 
         // 14 is done but 13 is not
-        assert_eq!(p.finish(14, done(1, 500)), None);
-        assert_eq!(p.finish(13, done(1, 400)), Some(Advance { offset: 14, processed_upto: vec![(1, 500)] }));
+        assert_eq!(p.finish(14), None);
+        assert_eq!(p.finish(13), Some(14));
         assert_eq!((p.in_flight(), p.tracked()), (0, 0));
     }
 
@@ -828,30 +744,11 @@ mod tests {
         p.start(9); // 6..=8 never delivered (e.g. control records)
         p.start(9); // a repeat changes nothing
         assert_eq!(p.in_flight(), 2);
-        assert_eq!(p.finish(9, None), None);
-        assert_eq!(p.finish(5, None), Some(Advance { offset: 9, processed_upto: vec![] }));
+        assert_eq!(p.finish(9), None);
+        assert_eq!(p.finish(5), Some(9));
         // Finishing an untracked or already-finished offset does nothing
-        assert_eq!(p.finish(5, None), None);
-        assert_eq!(p.finish(77, done(1, 1)), None);
-    }
-
-    #[test]
-    fn processed_upto_is_reported_per_sale_and_never_decreases() {
-        let mut p = PartitionProgress::default();
-        for offset in 0..6 {
-            p.start(offset);
-        }
-        // Two sales share the partition; checkout times are not monotonic in it
-        let mut reported = Vec::new();
-        reported.extend(p.finish(0, done(1, 1_000)).unwrap().processed_upto);
-        reported.extend(p.finish(1, done(2, 5_000)).unwrap().processed_upto);
-        reported.extend(p.finish(2, done(1, 2_000)).unwrap().processed_upto);
-        assert_eq!(reported, vec![(1, 1_000), (2, 5_000), (1, 2_000)]);
-
-        // The next messages are earlier in time (published out of order): lower values are not reported
-        assert_eq!(p.finish(3, done(1, 1_500)), Some(Advance { offset: 3, processed_upto: vec![] }));
-        assert_eq!(p.finish(4, done(2, 4_900)), Some(Advance { offset: 4, processed_upto: vec![] }));
-        assert_eq!(p.finish(5, done(1, 2_100)), Some(Advance { offset: 5, processed_upto: vec![(1, 2_100)] }));
+        assert_eq!(p.finish(5), None);
+        assert_eq!(p.finish(77), None);
     }
 
     #[tokio::test]

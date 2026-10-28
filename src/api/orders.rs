@@ -2,10 +2,10 @@
 //!
 //! The answer comes from the read cache. If that entry is missing (the write
 //! after a transition was lost, or the entry expired) it falls back to the
-//! hold in the inventory Redis, then to the order in PostgreSQL, so a lost
-//! cache write never shows a winner the wrong thing. `PENDING` (waiting in
-//! Kafka) comes only from the cache or the hold: the order row does not exist
-//! yet, and it is never stored in PostgreSQL.
+//! order in PostgreSQL, so a lost cache write never shows a winner the wrong
+//! thing. `PENDING` (waiting in Kafka) comes only from the cache: the order row
+//! does not exist yet, and it is never stored in PostgreSQL. A ticket with
+//! neither a cache entry nor an order is `404` (docs/FAILURE_CASES.md, case 3).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -18,7 +18,7 @@ use serde::Serialize;
 use crate::{
     actions,
     auth::AuthUser,
-    cache::{self, ReadCache, RedisConn},
+    cache::{self, ReadCache},
     config::Config,
     db::DbPool,
     error::ApiError,
@@ -75,12 +75,6 @@ struct StatusResponse {
     expires_at: Option<String>,
 }
 
-impl StatusResponse {
-    fn bare(status: OrderStatus) -> Self {
-        Self { status, position: None, payment_url: None, expires_at: None }
-    }
-}
-
 /// The queue position of a `PENDING` ticket: how many messages of its
 /// partition the processors still have to finish up to and including this
 /// one, `offset - processed_offset`, where `processed_offset` is the highest
@@ -123,7 +117,6 @@ async fn order_status(
     user: AuthUser,
     path: web::Path<String>,
     pool: web::Data<DbPool>,
-    redis: web::Data<RedisConn>,
     read_cache: web::Data<ReadCache>,
     progress: web::Data<ProgressCache>,
     config: web::Data<Config>,
@@ -131,7 +124,7 @@ async fn order_status(
     let ticket = path.into_inner();
     let not_found = || ApiError::NotFound("no such ticket".into());
     let forbidden = || ApiError::Forbidden("this ticket belongs to someone else".into());
-    let sale = cache::ticket_sale(&ticket).ok_or_else(not_found)?;
+    cache::ticket_sale(&ticket).ok_or_else(not_found)?;
 
     // 1. The read cache
     let mut cache_con = read_cache.get_ref().clone();
@@ -156,30 +149,7 @@ async fn order_status(
         }));
     }
 
-    // 2. The hold. It knows the state but not the payment link, and it can be
-    // behind: a paid hold stays AWAITING_PAYMENT until the expiration worker
-    // settles it, so AWAITING_PAYMENT is never answered from the hold; the
-    // order row has the truth. A hold the worker released (EXPIRED,
-    // FAILED) is final and answers here; one it closed after a payment (or a
-    // guard failure) is deleted, so the lookup falls through to PostgreSQL.
-    let mut con = redis.get_ref().clone();
-    let mut from_hold = None;
-    if let Some(hold) = cache::read_hold(&mut con, sale, &ticket).await? {
-        if hold.user != user.id {
-            return Err(forbidden());
-        }
-        match OrderStatus::parse(&hold.state) {
-            Some(status @ (OrderStatus::Pending | OrderStatus::Failed | OrderStatus::Expired)) => {
-                return Ok(respond(StatusResponse::bare(status)));
-            }
-            // Used only if there is no order row yet
-            Some(OrderStatus::AwaitingPayment) => from_hold = Some(StatusResponse::bare(OrderStatus::AwaitingPayment)),
-            // Hold states nobody writes any more: PostgreSQL answers
-            Some(OrderStatus::Confirmed | OrderStatus::Refunded) | None => {}
-        }
-    }
-
-    // 3. PostgreSQL
+    // 2. PostgreSQL
     let lookup = ticket.clone();
     let order = web::block(move || {
         let mut conn = pool.get()?;
@@ -189,7 +159,7 @@ async fn order_status(
     match order {
         Some(order) if order.user_id != user.id => Err(forbidden()),
         Some(order) => Ok(respond(order_response(order))),
-        None => from_hold.map(respond).ok_or_else(not_found),
+        None => Err(not_found()),
     }
 }
 

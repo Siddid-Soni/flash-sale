@@ -21,7 +21,7 @@ use diesel::prelude::*;
 use common::sale::{clear_inbox, drain, Awaiting, SaleFixture};
 use flash_sale::{
     actions::{self, orders::Settlement},
-    cache::{self, HoldState, MaxScore, ReleaseOutcome, ReleasedAs},
+    cache,
     inbox::{Handled, InboxWorker},
     models::{OrderState, OrderStatus},
     payment::{
@@ -51,7 +51,6 @@ async fn assert_consistent(fx: &SaleFixture) {
 async fn assert_confirmed(fx: &SaleFixture, a: &Awaiting, event_id: &str) {
     let order = fx.order(&a.event.ticket).unwrap();
     assert_eq!(order.status, OrderState::Confirmed);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT", "the worker settles the hold");
     let status = fx.status(&a.event.ticket).await.unwrap();
     assert_eq!((status.status, status.user), (OrderStatus::Confirmed, a.event.user));
     assert!(fx.inbox_row(event_id).unwrap().processed_at.is_some());
@@ -81,7 +80,7 @@ async fn a_payment_in_time_confirms_the_order() {
     assert_confirmed(&fx, &a, &wire.event.id).await;
     assert_eq!(fx.product().sold, 1);
     assert_eq!(fx.stock().await, 2, "the unit stays taken");
-    assert_eq!(fx.expiry_len().await, 1, "the hold waits for the worker");
+    assert_eq!(fx.user_live(a.event.user).await.as_deref(), Some(a.event.ticket.as_str()), "a buyer stays marked");
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "PAID");
     let row = fx.inbox_row(&wire.event.id).unwrap();
     assert_eq!(row.last_error, None);
@@ -93,24 +92,40 @@ async fn a_payment_in_time_confirms_the_order() {
     fx.cleanup().await;
 }
 
-/// PostgreSQL's clock decides: a payment after the deadline is refunded even
-/// though the hold was never released
+/// The inbox never decides a deadline: a payment for an order that is overdue
+/// but not yet expired is left in the inbox and retried. Only once the worker
+/// has expired the order (and returned the unit) is it refunded, moving no stock.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_payment_after_the_deadline_but_before_the_release_is_refunded() {
+async fn a_payment_after_the_deadline_but_before_the_worker_is_left_for_the_retry() {
     let (_guard, fx) = setup(3).await;
+    let _due = common::sale::due_guard().await;
     let a = fx.awaiting().await;
-    fx.make_due(&a.event.ticket).await;
+    fx.make_due(&a.event.ticket);
     let wire = fx.pay(&a).await;
     fx.store(&wire);
+    assert_eq!(settle_by_hand(&fx, &a), Settlement::Postponed, "nothing is decided");
 
+    let worker = fx.inbox_worker();
+    assert_eq!(drain(&worker).await, 1);
+
+    // Untouched: the event is still unprocessed, the order awaits, the payment stands
+    assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_none());
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::AwaitingPayment);
+    assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "PAID");
+    assert_eq!((fx.product().sold, fx.stock().await), (0, 2));
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment);
+    // The worker that postponed it passes it over for a moment instead of spinning on it
+    assert_eq!(drain(&worker).await, 0);
+
+    // The worker expires the order and returns the unit; the retry refunds
+    assert!(fx.expire_due().await >= 1);
+    assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Expired);
+    assert_eq!(fx.stock().await, 3);
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
 
     assert_refunded(&fx, &a, &wire.event.id).await;
     assert_eq!(fx.product().sold, 0);
-    // The hold is still the worker's: it will find the order REFUNDED and return the unit
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
-    assert_eq!(fx.expiry_len().await, 1);
-    assert_eq!(fx.stock().await, 2);
+    assert_eq!(fx.stock().await, 3, "the worker returned the unit once; the refund adds none");
     assert_consistent(&fx).await;
     fx.cleanup().await;
 }
@@ -118,33 +133,21 @@ async fn a_payment_after_the_deadline_but_before_the_release_is_refunded() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_payment_after_the_worker_expired_the_order_is_refunded() {
     let (_guard, fx) = setup(3).await;
+    let _due = common::sale::due_guard().await;
     let a = fx.awaiting().await;
-    // The deadline passed and the expiration worker expired the order and released the hold ...
-    fx.make_due(&a.event.ticket).await;
-    let expired = actions::orders::expire_due(&mut fx.env.pool.get().unwrap(), std::slice::from_ref(&a.event.ticket)).unwrap();
-    assert_eq!(expired, vec![a.event.ticket.clone()]);
-    let released = cache::release_hold(
-        &mut fx.env.redis.clone(),
-        fx.sale,
-        &a.event.ticket,
-        HoldState::AwaitingPayment,
-        MaxScore::Now,
-        ReleasedAs::Expired,
-        false,
-    )
-    .await
-    .unwrap();
-    assert_eq!(released, ReleaseOutcome::Released);
-    // ... but the provider's session was still open when the user paid
+    // The provider's session was still open when the user paid ...
     let wire = fx.pay(&a).await;
+    // ... but the deadline had passed, and the expiration worker expired the order and returned the unit
+    fx.make_due(&a.event.ticket);
+    assert!(fx.expire_due().await >= 1);
+    assert_eq!(fx.user_live(a.event.user).await, None);
     fx.store(&wire);
 
     assert_eq!(drain(&fx.inbox_worker()).await, 1);
 
     assert_refunded(&fx, &a, &wire.event.id).await;
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "EXPIRED", "the released hold is left as it is");
     assert_eq!(fx.product().sold, 0);
-    assert_eq!(fx.stock().await, 3, "the release already returned the unit; the refund adds none");
+    assert_eq!(fx.stock().await, 3, "the worker already returned the unit; the refund adds none");
     assert_consistent(&fx).await;
     fx.cleanup().await;
 }
@@ -165,9 +168,8 @@ async fn a_failed_guard_rolls_back_and_refunds() {
 
     assert_refunded(&fx, &a, &wire.event.id).await;
     assert_eq!(fx.product().sold, 3, "sold was not raised");
-    // Redis is not touched: the worker drops the hold when it is due
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
-    assert_eq!(fx.expiry_len().await, 1);
+    // Redis is not touched: the unit was never sold, and no stock moves
+    assert_eq!(fx.stock().await, 2);
     fx.cleanup().await;
 }
 
@@ -182,7 +184,6 @@ async fn a_cancelled_payment_needs_no_action() {
 
     assert!(fx.inbox_row(&wire.event.id).unwrap().processed_at.is_some());
     assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::AwaitingPayment);
-    assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT", "the hold runs out by itself");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment);
     fx.cleanup().await;
 }
@@ -239,8 +240,11 @@ async fn a_payment_without_an_order_or_on_a_foreign_session_is_refunded() {
 async fn a_crash_after_the_decision_before_the_refund_converges() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    fx.make_due(&a.event.ticket).await;
+    let _due = common::sale::due_guard().await;
+    // The user paid before the worker expired the session; the event arrives later
     let wire = fx.pay(&a).await;
+    fx.make_due(&a.event.ticket);
+    fx.expire_due().await;
     fx.store(&wire);
 
     assert_eq!(settle_by_hand(&fx, &a), Settlement::Refund);
@@ -260,8 +264,11 @@ async fn a_crash_after_the_decision_before_the_refund_converges() {
 async fn a_crash_after_the_refund_before_the_row_is_marked_converges() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    fx.make_due(&a.event.ticket).await;
+    let _due = common::sale::due_guard().await;
+    // The user paid before the worker expired the session; the event arrives later
     let wire = fx.pay(&a).await;
+    fx.make_due(&a.event.ticket);
+    fx.expire_due().await;
     fx.store(&wire);
 
     assert_eq!(settle_by_hand(&fx, &a), Settlement::Refund);
@@ -329,8 +336,11 @@ async fn a_crash_after_a_guard_failure_converges() {
 async fn a_failing_event_is_recorded_backed_off_and_retried() {
     let (_guard, fx) = setup(3).await;
     let a = fx.awaiting().await;
-    fx.make_due(&a.event.ticket).await;
+    let _due = common::sale::due_guard().await;
+    // The user paid before the worker expired the session; the event arrives later
     let wire = fx.pay(&a).await;
+    fx.make_due(&a.event.ticket);
+    fx.expire_due().await;
     fx.store(&wire);
 
     let failing = Arc::new(FailingRefund { inner: fx.env.shared_provider(), fail: AtomicBool::new(true) });
@@ -343,7 +353,7 @@ async fn a_failing_event_is_recorded_backed_off_and_retried() {
     assert!(row.last_error.unwrap().contains("provider is down"));
     assert_eq!(fx.order(&a.event.ticket).unwrap().status, OrderState::Refunded, "the decision stands");
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "PAID");
-    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::AwaitingPayment, "not told before the refund");
+    assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Expired, "not told before the refund");
 
     // Backing off: this processor passes the event over for now
     failing.fail.store(false, Ordering::SeqCst);

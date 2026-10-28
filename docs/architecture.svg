@@ -128,9 +128,9 @@
     <text x="875" y="232">status:&lt;ticket&gt;</text>
     <text x="1150" y="478">consumers + webhook</text>
     <text x="1420" y="478">orders · inbox · sold guard</text>
-    <text x="1420" y="232">release unpaid / leaked</text>
+    <text x="1420" y="232">expire unpaid orders</text>
     <text x="1175" y="636">Stripe-shaped (fake)</text>
-    <text x="680" y="668" text-anchor="start">stock · holds · Lua (AOF)</text>
+    <text x="680" y="668" text-anchor="start">stock · user_live · Lua (AOF)</text>
   </g>
 
   <!-- ===================== link labels ===================== -->
@@ -143,12 +143,12 @@
     <text x="700" y="120">status write / read</text>
     <text x="1017" y="364">consume</text>
     <text x="1285" y="364">order · confirm</text>
-    <text x="850" y="590">link_ready.lua</text>
+    <text x="850" y="590">progress</text>
     <text x="1130" y="534" text-anchor="end">session · refund</text>
     <text x="1222" y="534" text-anchor="start" fill="#c2410c">signed webhook</text>
     <text x="1046" y="120">payment link · result</text>
     <text x="1250" y="120">expired / failed</text>
     <text x="1430" y="282" text-anchor="start">expire (guarded)</text>
-    <text x="1100" y="742" fill="#6d28d9">release.lua: return unpaid stock · settle paid holds</text>
+    <text x="1100" y="742" fill="#6d28d9">return_unit.lua: return unpaid stock, once</text>
   </g>
 </svg>
