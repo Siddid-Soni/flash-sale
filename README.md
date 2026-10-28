@@ -22,7 +22,7 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 
 ![Architecture](docs/architecture.svg)
 
-Orange is the case-study path: checkout and status run on Redis and Kafka only, and the Order Service reaches PostgreSQL only on two rare paths (purple). The site service serves everything outside the requirements (sessions, sale details, list, search, admin) behind the edge cache. The payment provider is outside our gateway: the browser opens its page directly, our services call its API outbound, and only its webhook enters through the gateway. The order processor never touches inventory keys; the expiration worker, polling PostgreSQL, is the only component that returns stock.
+The Order Service serves only checkout and status, on Redis and Kafka; it reaches PostgreSQL only on two rare paths (dashed: the status fallback and the `FAILED` claim when a publish fails). The site service serves everything outside the case-study requirements (sessions, sale details, list, search, admin) behind the edge cache. The payment provider is outside our gateway: the browser opens its page directly, the processors call its API outbound, and only its signed webhook (orange) enters through the gateway. The processors never touch inventory keys; the expiration workers, polling PostgreSQL, are the only component that returns stock (violet).
 
 ### Request flow
 
