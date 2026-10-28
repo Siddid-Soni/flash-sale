@@ -70,7 +70,6 @@ async fn a_signed_success_is_stored_and_confirms_the_order_at_once() {
     // The payment path writes no inventory key: the worker settles the hold
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
     assert_eq!(fx.expiry_len().await, 1);
-    assert_eq!(fx.sold_counter().await, 0);
     assert_eq!(fx.stock().await, 2);
     fx.cleanup().await;
 }
@@ -141,7 +140,6 @@ async fn a_late_payment_is_refunded_on_receipt() {
     assert_eq!(fx.fake().session(&a.session.id).await.unwrap().unwrap().state, "REFUNDED");
     assert_eq!(fx.status(&a.event.ticket).await.unwrap().status, OrderStatus::Refunded);
     assert_eq!(fx.product().sold, 0);
-    assert_eq!(fx.sold_counter().await, 0);
     // The hold is still the worker's: it is due, and it will return the unit
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
     assert_eq!(fx.stock().await, 2);

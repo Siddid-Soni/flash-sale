@@ -74,8 +74,9 @@ create_sale() {
 
 # wait_converged SALE TIMEOUT_SECS: no AWAITING_PAYMENT orders, no holds queued, the
 # sale's payment inbox events and the provider's webhook outbox drained. Waiting for
-# holds:expiry to be empty includes the paid holds: the expiration worker counts a sale in
-# sold:{sale} only when it settles the hold at its deadline, so sold:{sale} is final after this.
+# holds:expiry to be empty includes the paid holds: the expiration worker closes them at their
+# deadline and releases the unpaid ones, so stock:{sale} is final after this (sales are counted
+# only in PostgreSQL, products.sold).
 wait_converged() {
   local sale=$1 limit=$2 t=0 live pend exp inbox outbox
   while [ "$t" -lt "$limit" ]; do

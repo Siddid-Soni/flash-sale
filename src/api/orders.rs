@@ -159,8 +159,9 @@ async fn order_status(
     // 2. The hold. It knows the state but not the payment link, and it can be
     // behind: a paid hold stays AWAITING_PAYMENT until the expiration worker
     // settles it, so AWAITING_PAYMENT is never answered from the hold; the
-    // order row has the truth. A hold the worker settled (CONFIRMED, or
-    // REFUNDED after a guard failure) or released is final and answers here.
+    // order row has the truth. A hold the worker released (EXPIRED,
+    // FAILED) is final and answers here; one it closed after a payment (or a
+    // guard failure) is deleted, so the lookup falls through to PostgreSQL.
     let mut con = redis.get_ref().clone();
     let mut from_hold = None;
     if let Some(hold) = cache::read_hold(&mut con, sale, &ticket).await? {
@@ -168,18 +169,13 @@ async fn order_status(
             return Err(forbidden());
         }
         match OrderStatus::parse(&hold.state) {
-            Some(
-                status @ (OrderStatus::Pending
-                | OrderStatus::Confirmed
-                | OrderStatus::Refunded
-                | OrderStatus::Failed
-                | OrderStatus::Expired),
-            ) => {
+            Some(status @ (OrderStatus::Pending | OrderStatus::Failed | OrderStatus::Expired)) => {
                 return Ok(respond(StatusResponse::bare(status)));
             }
             // Used only if there is no order row yet
             Some(OrderStatus::AwaitingPayment) => from_hold = Some(StatusResponse::bare(OrderStatus::AwaitingPayment)),
-            None => {}
+            // Hold states nobody writes any more: PostgreSQL answers
+            Some(OrderStatus::Confirmed | OrderStatus::Refunded) | None => {}
         }
     }
 

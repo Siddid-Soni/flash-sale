@@ -38,8 +38,9 @@ fn validate(body: &NewSale) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Creates a sale: the product row (`sold = 0`), then its counters in Redis
-/// (`stock:{id}`, `sold:{id}`, `sale_start:{id}`) in one atomic pipeline.
+/// Creates a sale: the product row (`sold = 0`), then its keys in Redis
+/// (`stock:{id}`, `sale_start:{id}`) in one atomic pipeline. Redis does not
+/// count sales; `products.sold` is the record.
 /// PostgreSQL goes first so the sale id exists before Redis refers to it; if
 /// Redis then fails the answer is `500` and the row stays without stock (the
 /// sale reads as sold out), which the operator can ignore and recreate.

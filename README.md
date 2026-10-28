@@ -11,13 +11,13 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 | Client | Preact app: countdown, buy button (locks on the first click), queue and payment states, status polling every 2 s | `web/` |
 | Gateway | NGINX on `:8000`: serves the frontend, balances `/v1/` over three replicas, rate limits, bot filter, hides `/v1/admin/`, caches sale details for 1 s, sends `/fake-pay/` to the provider and the webhook (from the provider's address only) to the order processors | `gateway/` |
 | Order Service x3 | Stateless HTTP API: guest sessions, sale details, checkout, order status, admin | `src/bin/order_service.rs`, `src/api/` |
-| Redis (inventory) | Stock counter, holds, pending and expiry queues, processor progress; append-only file on | `scripts/*.lua`, `src/cache.rs` |
+| Redis (inventory) | Stock counter and holds only (plus the pending and expiry queues and processor progress); it does not count sales, PostgreSQL is the record of those. Append-only file on | `scripts/*.lua`, `src/cache.rs` |
 | Redis (read cache) | `status:<ticket>`, what clients poll. The same instance locally (`READ_CACHE_URL`) | `src/cache.rs` |
 | Kafka | Topic `orders.checkout` (6 partitions): checkout events from the Order Service to the processors | `src/queue.rs` |
 | Order Processor | Turns each checkout event into an order and a payment link; serves the provider's webhook (`POST /v1/payments/webhook` on `:8081`) and confirms or refunds a paid order at once; retries unprocessed payment events from the inbox | `src/bin/order_processor.rs`, `src/processor.rs`, `src/inbox.rs` |
-| Expiration Worker | At each payment deadline, asks PostgreSQL what became of the hold: releases the unpaid ones, counts the paid ones in `sold:{sale}`. Also releases leaked holds. The only place stock is returned (besides immediate compensation) | `src/expiry.rs` |
+| Expiration Worker | At each payment deadline, asks PostgreSQL what became of the hold: releases the unpaid ones, closes the paid ones (deletes the hold; the sale was counted in `products.sold` when the payment was confirmed). Also releases leaked holds. The only place stock is returned (besides immediate compensation) | `src/expiry.rs` |
 | Fake payment provider | A service of its own (`fake_payment_provider`, fixed address `172.28.0.50`), Stripe-like: the payment page `/fake-pay/{id}`, an HTTP API to create a session (idempotent), expire and refund, and signed webhooks with retries. Owns the `fakepay:*` Redis keys | `src/bin/fake_payment_provider.rs`, `src/payment/` |
-| PostgreSQL 16 | Durable record: `users`, `products`, `orders`, `payment_inbox` | `migrations/` |
+| PostgreSQL 16 | Durable record, and the only place sales are counted (`products.sold`): `users`, `products`, `orders`, `payment_inbox` | `migrations/` |
 
 ![Architecture: the hot path](docs/architecture.svg)
 
@@ -30,7 +30,7 @@ The diagram shows only the hot path: checkout, status polling, the order pipelin
 3. The Order Service publishes the checkout event to Kafka (`acks=all`, idempotent producer), stores `status:<ticket>` and answers `202 {queue_ticket_id, status_url}`. If the publish fails, the hold is released at once and the answer is `503`.
 4. An order processor creates the payment session, inserts the order directly as `AWAITING_PAYMENT` (with the session, link and deadline in one `INSERT`) and moves the hold to `AWAITING_PAYMENT` (the 5-minute payment window starts here, not at checkout). `PENDING`, the state while the message waits in Kafka, exists only in the hold and the read cache, never in PostgreSQL. The client, polling the status endpoint, gets `payment_url` and goes to pay.
 5. The provider sends a signed webhook. It reaches an order processor through the gateway (only from the provider's address, and only with a valid signature). The processor stores the event in `payment_inbox` and decides at once, in one PostgreSQL transaction: `UPDATE orders SET status = 'CONFIRMED' WHERE ... AND status = 'AWAITING_PAYMENT' AND payment_session_id = $2 AND expires_at > now()` together with `UPDATE products SET sold = sold + 1 WHERE id = $1 AND sold < total_inventory`. The payment path writes no inventory key in Redis, only the read-cache status. If the order cannot be confirmed (the deadline passed on PostgreSQL's clock, the order is already `EXPIRED` or `FAILED`, or the guard refused), the same transaction marks it `REFUNDED` and the processor refunds through the provider; the inbox row is marked processed only when that worked, and the inbox loop retries anything unfinished.
-6. The Expiration Worker looks at each hold at its payment deadline and asks PostgreSQL (`UPDATE orders SET status = 'EXPIRED' ... AND status = 'AWAITING_PAYMENT' AND expires_at <= now()`, the mirror image of the confirmation; the row lock and the one clock give exactly one winner). An expired order's unit goes back to stock; a `CONFIRMED` order's hold is closed and counted in `sold:{sale}` (the only place it is counted, so `sold:{sale}` follows `products.sold` up to one payment window later); a `REFUNDED` one is released, or dropped without stock if PostgreSQL had no unit for it. It also returns the stock of holds whose Kafka message can no longer arrive.
+6. The Expiration Worker looks at each hold at its payment deadline and asks PostgreSQL (`UPDATE orders SET status = 'EXPIRED' ... AND status = 'AWAITING_PAYMENT' AND expires_at <= now()`, the mirror image of the confirmation; the row lock and the one clock give exactly one winner). An expired order's unit goes back to stock; a `CONFIRMED` order's hold is closed (deleted; no stock returned, and Redis counts no sale: `products.sold` in PostgreSQL is the only count); a `REFUNDED` one is released, or closed the same way, without stock, if PostgreSQL had no unit for it. It also returns the stock of holds whose Kafka message can no longer arrive.
 
 ## Quick start
 
@@ -148,7 +148,7 @@ Measured on one machine (20 cores) with everything on it: the load generator, NG
 - Exactly 500 units reserved; outcome 265 `CONFIRMED`, 224 `EXPIRED` (stock returned), 11 `REFUNDED` (paid at the deadline and lost the race to expiry, by design).
 - 0 rate-limit answers, 0 server errors, 0 network failures.
 - Checkout to payment link: p50 1.3 s, p95 2.4 s, max 2.8 s.
-- Checks passed: `products.sold` = `sold:{sale}` = `CONFIRMED` orders, never above 500; no user with two live orders; every abandoned hold released and its stock returned.
+- Checks passed: `products.sold` = `CONFIRMED` orders, never above 500; `stock` = 500 - `products.sold` once everything has settled; no user with two live orders; every abandoned hold released and its stock returned.
 
 ### Flash sale: 10,000 users within 10 s, 500 units (`load/flash.sh 10000`)
 

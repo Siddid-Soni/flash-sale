@@ -75,7 +75,7 @@ async fn creating_a_sale_stores_the_product_and_loads_redis() {
 
     // The keys, with the literal hash tag, and the start time in epoch ms
     assert_eq!(redis_get(&env, format!("stock:{{{id}}}")).await.as_deref(), Some("500"));
-    assert_eq!(redis_get(&env, format!("sold:{{{id}}}")).await.as_deref(), Some("0"));
+    assert_eq!(redis_get(&env, format!("sold:{{{id}}}")).await, None, "Redis does not count sales");
     assert_eq!(redis_get(&env, cache::sale_start_key(id)).await.as_deref(), Some("1893528000000"));
 }
 

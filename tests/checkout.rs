@@ -336,8 +336,9 @@ async fn status_falls_back_to_the_hold_and_then_to_postgres() {
 }
 
 /// A paid hold stays AWAITING_PAYMENT in Redis until the expiration worker
-/// settles it, so the status must not be answered from the hold then: the
-/// order row says CONFIRMED. A hold the worker has settled answers by itself.
+/// closes it, so the status must not be answered from the hold then: the
+/// order row says CONFIRMED. Once the worker has closed the hold (deleted it),
+/// the status falls through to PostgreSQL, which answers.
 #[actix_web::test]
 async fn a_paid_hold_the_worker_has_not_settled_reports_confirmed_from_postgres() {
     let env = common::env().await;
@@ -378,9 +379,8 @@ async fn a_paid_hold_the_worker_has_not_settled_reports_confirmed_from_postgres(
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(body, json!({ "status": "CONFIRMED" }), "no payment link for a paid order");
 
-    // Once the worker has settled the hold, it answers without PostgreSQL
-    let _: () = redis.hset(cache::hold_key(sale, &ticket), "state", "CONFIRMED").await.unwrap();
-    diesel::delete(orders::table.filter(orders::queue_ticket_id.eq(&ticket))).execute(&mut conn).unwrap();
+    // Once the worker has closed the hold it is gone, and PostgreSQL still answers
+    let _: () = redis.del(cache::hold_key(sale, &ticket)).await.unwrap();
     let body: Value = test::call_and_read_body_json(&app, status_request(&ticket, &owner).to_request()).await;
     assert_eq!(body, json!({ "status": "CONFIRMED" }));
     cleanup(&env, sale).await;

@@ -16,7 +16,7 @@
 #     the users who pay late in that window (after waiting longer than the window in the
 #     queue) are all CONFIRMED;
 #   - the backlog was real (some link came later than the window after checkout);
-#   - the usual consistency checks (sold counters, one order per user, stock, no 5xx).
+#   - the usual consistency checks (products.sold = CONFIRMED orders, one order per user, stock, no 5xx).
 #
 # Starts the app profile with PAYMENT_WINDOW_SECS=30, PROCESSOR_MAX_PER_SEC=$RATE and
 # GATEWAY_TRUST_XFF=1, and restores the defaults at the end. Do not run `cargo test` while
@@ -68,7 +68,7 @@ UNLINKED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND statu
 LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'AWAITING_PAYMENT'")
 BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none') FROM (SELECT status::text, count(*) AS n FROM orders WHERE product_id = $SALE GROUP BY status ORDER BY status) s")
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
-R_SOLD=$(rcli GET "sold:{$SALE}"); R_STOCK=$(rcli GET "stock:{$SALE}")
+R_STOCK=$(rcli GET "stock:{$SALE}")
 HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
 DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
 LEAKED_LOG=$(docker compose --profile app logs --no-log-prefix --since "$T0" expiration-worker 2>&1 </dev/null | grep -c 'leaked holds' || true)
@@ -88,7 +88,6 @@ check_cond "every user got the full payment window (time left to pay when the li
   "least time left ${MIN_LEFT} ms of ${WINDOW_MS} ms" $([ "$MIN_LEFT" != null ] && [ "$MIN_LEFT" -ge $((WINDOW_MS - SLACK)) ] && echo 0 || echo 1)
 check "payers who paid in the last half of the window all ended CONFIRMED (in time but not CONFIRMED)" "$(j .payments.in_time_not_confirmed)" 0
 check "CONFIRMED orders equal payments accepted in time (the generator pays only in time here)" "$CONFIRMED" "$(( $(j .payments.in_time) + $(j .payments.boundary) ))"
-check "products.sold equals sold:{sale}" "$P_SOLD" "$R_SOLD"
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
 check "orders still AWAITING_PAYMENT" "$LIVE" 0

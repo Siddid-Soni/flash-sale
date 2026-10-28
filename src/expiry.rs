@@ -1,5 +1,5 @@
 //! The expiration worker's logic (roadmap steps 22-24): give back the stock of
-//! holds that will never be paid or processed, count the holds that were paid,
+//! holds that will never be paid or processed, close the holds that were paid,
 //! and tidy up the orders.
 //!
 //! Three passes, each a method of `Expirer` that the binary calls on a timer
@@ -12,11 +12,11 @@
 //!   of the payment's confirmation, see `crate::inbox`), then a read of the
 //!   status of the others. Per ticket: an order the batch expired (or that is
 //!   already `EXPIRED`) is released with `release.lua`, which returns the unit
-//!   to stock; a `CONFIRMED` order is settled with `settle_hold.lua`, which
-//!   counts the sale in `sold:{sale}` (the only place it is counted) and
-//!   returns no stock; a `REFUNDED` one (the payment came too late, or the
-//!   guard failed) is released, or, if PostgreSQL has no unit left for it,
-//!   dropped without stock or count; an order still `AWAITING_PAYMENT` (the
+//!   to stock; a `CONFIRMED` order is closed with `settle_hold.lua`, which
+//!   deletes the hold and changes nothing else (sales are counted only in
+//!   PostgreSQL, `products.sold`; no stock is returned); a `REFUNDED` one (the
+//!   payment came too late, or the guard failed) is released, or, if
+//!   PostgreSQL has no unit left for it, closed the same way without stock; an order still `AWAITING_PAYMENT` (the
 //!   Redis clock is ahead of PostgreSQL's) is left for the next pass; a ticket
 //!   with no order is left and logged.
 //! - `leaked_pass` (step 23): `PENDING` holds that no message can still reach,
@@ -58,7 +58,7 @@ use rdkafka::{
 
 use crate::{
     actions,
-    cache::{self, HoldState, MaxScore, ReadCache, RedisConn, ReleaseOutcome, ReleasedAs, SettleAs, StatusUpdate},
+    cache::{self, HoldState, MaxScore, ReadCache, RedisConn, ReleaseOutcome, ReleasedAs, StatusUpdate},
     config::Config,
     db::DbPool,
     models::{Order, OrderState, OrderStatus},
@@ -247,9 +247,9 @@ struct Released {
 pub struct Pass {
     /// Holds this call released: the unit went back to stock
     pub released: usize,
-    /// Paid holds this call settled: counted in `sold:{sale}`
+    /// Paid holds this call closed (the unit is sold; no stock moved)
     pub confirmed: usize,
-    /// Holds this call closed without stock or count (the PostgreSQL guard refused the payment)
+    /// Holds this call closed without stock (the PostgreSQL guard refused the payment)
     pub dropped: usize,
     /// A batch came back full and made progress: another pass is due at once
     pub more: bool,
@@ -496,7 +496,7 @@ impl Expirer {
                 OrderState::Expired => pass.released += usize::from(self.release_unpaid(sale, ticket).await?),
                 OrderState::Confirmed => {
                     let mut con = self.inventory.clone();
-                    pass.confirmed += usize::from(cache::settle_hold(&mut con, sale, ticket, SettleAs::Confirmed).await?);
+                    pass.confirmed += usize::from(cache::settle_hold(&mut con, sale, ticket).await?);
                 }
                 OrderState::Refunded => {
                     let product = order.product_id;
@@ -506,10 +506,10 @@ impl Expirer {
                     } else {
                         log::error!(
                             "The payment of {ticket} was refunded because PostgreSQL has no unit of product {product} left, \
-                             although Redis held one for it; the hold is dropped without returning stock"
+                             although Redis held one for it; the hold is closed without returning stock"
                         );
                         let mut con = self.inventory.clone();
-                        pass.dropped += usize::from(cache::settle_hold(&mut con, sale, ticket, SettleAs::Dropped).await?);
+                        pass.dropped += usize::from(cache::settle_hold(&mut con, sale, ticket).await?);
                     }
                 }
                 // PostgreSQL's clock says the deadline is not here yet: try again later

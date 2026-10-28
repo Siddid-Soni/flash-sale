@@ -48,12 +48,6 @@ pub fn stock_key(sale: i32) -> String {
     format!("stock:{{{sale}}}")
 }
 
-/// Units sold. Counted only by `settle_hold.lua`, when the expiration worker
-/// finds a due hold whose order PostgreSQL confirmed
-pub fn sold_key(sale: i32) -> String {
-    format!("sold:{{{sale}}}")
-}
-
 /// Opening time in epoch milliseconds, compared with Redis `TIME` by `checkout.lua`
 pub fn sale_start_key(sale: i32) -> String {
     format!("sale_start:{{{sale}}}")
@@ -71,7 +65,8 @@ pub fn idem_key(sale: i32, user: i32, key: &str) -> String {
 
 /// Hash with `state`, `user`, `checkout_ms`, `idem` (the idempotency key the
 /// order is stored with), later `payment_session`. A paid hold stays
-/// `AWAITING_PAYMENT` until the expiration worker settles it.
+/// `AWAITING_PAYMENT` until the expiration worker closes it (a paid hold is
+/// deleted then; a released one is kept for a day).
 pub fn hold_key(sale: i32, ticket: &str) -> String {
     format!("hold:{{{sale}}}:{ticket}")
 }
@@ -106,8 +101,8 @@ pub fn status_key(ticket: &str) -> String {
     format!("status:{ticket}")
 }
 
-/// Loads a new sale's counters in one atomic pipeline: the stock to sell, no
-/// units sold, and the opening time (epoch ms).
+/// Loads a new sale's keys in one atomic pipeline: the stock to sell and the
+/// opening time (epoch ms). Sales are counted only in PostgreSQL.
 pub async fn init_sale(
     con: &mut RedisConn,
     sale: i32,
@@ -117,7 +112,6 @@ pub async fn init_sale(
     redis::pipe()
         .atomic()
         .set(stock_key(sale), total_inventory)
-        .set(sold_key(sale), 0)
         .set(sale_start_key(sale), sale_start.timestamp_millis())
         .query_async(con)
         .await
@@ -318,7 +312,7 @@ pub async fn release_hold(
 /// A hold as stored in `hold:{sale}:{ticket}`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hold {
-    /// `PENDING`, `AWAITING_PAYMENT`, `CONFIRMED`, `REFUNDED`, `FAILED` or `EXPIRED`
+    /// `PENDING`, `AWAITING_PAYMENT`, `FAILED` or `EXPIRED`
     pub state: String,
     pub user: i32,
     pub checkout_ms: i64,
@@ -384,42 +378,15 @@ pub async fn link_ready(
 static SETTLE_SCRIPT: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(include_str!("../scripts/settle_hold.lua")));
 
-/// How a due hold that PostgreSQL did not expire is settled in Redis
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettleAs {
-    /// The order is `CONFIRMED`: count the unit in `sold:{sale}`, hold `CONFIRMED`
-    Confirmed,
-    /// The payment was refunded after the PostgreSQL guard refused it: count
-    /// nothing, hold `REFUNDED`
-    Dropped,
-}
-
-impl SettleAs {
-    fn as_str(self) -> &'static str {
-        match self {
-            SettleAs::Confirmed => "confirmed",
-            SettleAs::Dropped => "dropped",
-        }
-    }
-}
-
-/// Runs `settle_hold.lua`: takes the hold out of `holds:expiry` and, in the
-/// same step, counts it (`Confirmed`) or closes it (`Dropped`). No stock is
-/// returned. Exactly one of several concurrent callers gets `true` for a hold,
-/// so `sold:{sale}` counts each sold unit once.
-pub async fn settle_hold(
-    con: &mut RedisConn,
-    sale: i32,
-    ticket: &str,
-    settle_as: SettleAs,
-) -> redis::RedisResult<bool> {
+/// Runs `settle_hold.lua` for a due hold whose order PostgreSQL settled for
+/// good (`CONFIRMED`, or `REFUNDED` with no unit for it): takes the hold out of
+/// `holds:expiry` and, in the same step, deletes it. No counter changes and no
+/// stock is returned. Exactly one of several concurrent callers gets `true`.
+pub async fn settle_hold(con: &mut RedisConn, sale: i32, ticket: &str) -> redis::RedisResult<bool> {
     let reply: String = SETTLE_SCRIPT
         .key(hold_key(sale, ticket))
         .key(holds_expiry_key(sale))
-        .key(sold_key(sale))
         .arg(ticket)
-        .arg(settle_as.as_str())
-        .arg(DAY_SECS)
         .invoke_async(con)
         .await?;
     match reply.as_str() {
@@ -565,7 +532,6 @@ mod tests {
     #[test]
     fn keys_carry_the_literal_hash_tag() {
         assert_eq!(stock_key(42), "stock:{42}");
-        assert_eq!(sold_key(42), "sold:{42}");
         assert_eq!(sale_start_key(42), "sale_start:{42}");
         assert_eq!(user_live_key(42, 7), "user_live:{42}:7");
         assert_eq!(idem_key(42, 7, "k1"), "idem:{42}:7:k1");

@@ -91,7 +91,6 @@ async fn paying_at_the_page_ends_with_a_confirmed_order_and_a_counted_sale() {
         .unwrap();
     assert_eq!(unprocessed, 0, "the event was handled on receipt, not left for the inbox loop");
     assert_eq!(fx.hold_state(ticket).await, "AWAITING_PAYMENT", "the worker settles the hold, not the payment path");
-    assert_eq!(fx.sold_counter().await, 0, "sold:{{sale}} is counted by the worker");
     assert_eq!(fx.stock().await, 2);
 
     // The deadline arrives (both clocks); the worker finds the paid order
@@ -126,15 +125,14 @@ async fn paying_at_the_page_ends_with_a_confirmed_order_and_a_counted_sale() {
     );
     let pass = worker.unpaid_pass(&[fx.sale]).await.unwrap();
     assert_eq!((pass.confirmed, pass.released), (1, 0));
-    assert_eq!(fx.hold_state(ticket).await, "CONFIRMED");
-    assert_eq!(fx.sold_counter().await, 1);
+    assert_eq!(fx.hold_state_opt(ticket).await, None, "the paid hold is gone");
     assert_eq!(fx.stock().await, 2, "no stock came back");
     assert_eq!(fx.product().sold, 1);
     let queued: i64 = fx.env.redis.clone().zcard(cache::holds_expiry_key(fx.sale)).await.unwrap();
     assert_eq!(queued, 0);
 
-    // Nothing is counted twice
+    // Nothing is closed twice
     assert_eq!(worker.unpaid_pass(&[fx.sale]).await.unwrap().confirmed, 0);
-    assert_eq!(fx.sold_counter().await, 1);
+    assert_eq!(fx.product().sold, 1);
     fx.cleanup().await;
 }

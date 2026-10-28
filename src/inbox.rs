@@ -44,9 +44,8 @@
 //!
 //! Two handlers may run the same event at once (the webhook request and the
 //! inbox loop); the row lock of the decision lets one decide and the other see
-//! the result. Stock is never returned here, and `sold:{sale}` is never touched:
-//! the expiration worker settles the hold (and counts the sale) when it finds
-//! the hold due.
+//! the result. Stock is never returned here and no inventory key is touched:
+//! the expiration worker closes the hold when it finds it due.
 //!
 //! Failure events (the user cancelled) need nothing: the hold runs out by
 //! itself. The event is just marked processed.

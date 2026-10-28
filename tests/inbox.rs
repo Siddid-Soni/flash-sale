@@ -42,11 +42,10 @@ async fn setup(stock: i32) -> (tokio::sync::MutexGuard<'static, ()>, SaleFixture
 }
 
 /// What must agree once every event is processed: the payment path counts a
-/// sale in PostgreSQL only; `sold:{sale}` is the worker's, still 0
+/// sale in PostgreSQL only (`products.sold`); Redis does not count sales
 async fn assert_consistent(fx: &SaleFixture) {
     let confirmed = fx.count_orders(OrderState::Confirmed);
     assert_eq!(fx.product().sold as i64, confirmed, "products.sold == CONFIRMED orders");
-    assert_eq!(fx.sold_counter().await, 0, "sold:{{sale}} is counted by the expiration worker");
 }
 
 async fn assert_confirmed(fx: &SaleFixture, a: &Awaiting, event_id: &str) {
@@ -166,7 +165,6 @@ async fn a_failed_guard_rolls_back_and_refunds() {
 
     assert_refunded(&fx, &a, &wire.event.id).await;
     assert_eq!(fx.product().sold, 3, "sold was not raised");
-    assert_eq!(fx.sold_counter().await, 0);
     // Redis is not touched: the worker drops the hold when it is due
     assert_eq!(fx.hold_state(&a.event.ticket).await, "AWAITING_PAYMENT");
     assert_eq!(fx.expiry_len().await, 1);

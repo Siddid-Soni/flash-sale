@@ -1,6 +1,6 @@
 //! Expiration worker: settles the holds whose payment deadline has passed
 //! (`holds:expiry`): PostgreSQL says which were paid and which were not, the
-//! unpaid ones are released and the paid ones counted in `sold:{sale}`. Also
+//! unpaid ones are released and the paid ones closed (sales are counted only in PostgreSQL). Also
 //! releases leaked holds (`holds:pending` behind processor progress), the only
 //! other place stock is returned besides immediate compensation, and sweeps up
 //! orders a crashed worker left behind. The logic is in `flash_sale::expiry`;
@@ -100,7 +100,7 @@ async fn main() {
                     log::info!("Released {released} unpaid holds");
                 }
                 if confirmed > 0 {
-                    log::info!("Counted {confirmed} paid holds as sold");
+                    log::info!("Closed {confirmed} paid holds");
                 }
                 if dropped > 0 {
                     log::warn!("Dropped {dropped} holds whose payment PostgreSQL refused");

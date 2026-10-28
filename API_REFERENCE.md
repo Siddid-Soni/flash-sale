@@ -124,7 +124,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 |---|---|---|
 | `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache or the hold). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition (a fallback answer) |
 | `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds). If the cache entry is gone and the order row does not exist yet, the answer from the hold alone has neither |
-| `CONFIRMED` | | Paid in time (PostgreSQL decided) and counted. Final. Answered from PostgreSQL while the hold is still waiting for the expiration worker |
+| `CONFIRMED` | | Paid in time (PostgreSQL decided and counted it in `products.sold`). Final. Answered from PostgreSQL: the hold is still waiting for the expiration worker, or already deleted |
 | `EXPIRED` | | The payment window ran out and the unit was returned. Final |
 | `FAILED` | | The hold was released before a payment link existed (publish failed, a leaked hold, or released while the processor worked). Final |
 | `REFUNDED` | | A payment arrived but could not be honoured (PostgreSQL's deadline had passed, the order was already `EXPIRED` or `FAILED`, or the PostgreSQL guard refused) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
@@ -187,7 +187,7 @@ That event is made up, but it is stored and a processor keeps retrying it becaus
 
 ### `POST /v1/admin/sales`
 
-Creates a product (the sale) and loads `stock:{id}`, `sold:{id}` and `sale_start:{id}` into Redis. From outside the compose network the gateway answers `403`; run it inside the gateway container.
+Creates a product (the sale) and loads `stock:{id}` and `sale_start:{id}` into Redis (Redis does not count sales; `products.sold` in PostgreSQL does). From outside the compose network the gateway answers `403`; run it inside the gateway container.
 
 ```bash
 docker compose exec -T gateway wget -qO- \
@@ -230,7 +230,7 @@ Not reachable through the gateway: the order processor and the expiration worker
 
 ## Order and hold states
 
-A ticket has one of six statuses (`status:<ticket>`, API). `PENDING` is the sixth: it exists only in the hold and the read cache, while the checkout event waits in Kafka. The order row is created later, directly as `AWAITING_PAYMENT`, so `orders.status` has the other five. The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker settles the hold.
+A ticket has one of six statuses (`status:<ticket>`, API). `PENDING` is the sixth: it exists only in the hold and the read cache, while the checkout event waits in Kafka. The order row is created later, directly as `AWAITING_PAYMENT`, so `orders.status` has the other five. The hold is the reservation in Redis (`hold:{sale}:{ticket}`) that backs it. PostgreSQL decides between a payment and the payment deadline, on its own clock; Redis follows when the expiration worker releases or closes the hold. Redis holds stock and holds only; PostgreSQL is the record of sales.
 
 ```
 checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_at)--> CONFIRMED
@@ -244,12 +244,12 @@ checkout --> PENDING --(link ready)--> AWAITING_PAYMENT --(paid before expires_a
 |---|---|---|---|
 | `PENDING` (never in PostgreSQL) | `PENDING` | An order processor (no clock runs; no order row yet) | Link ready (the order is inserted as `AWAITING_PAYMENT` first); or release: publish failed (at once), or leaked (expiration worker) |
 | `AWAITING_PAYMENT` | `AWAITING_PAYMENT` | The user to pay, until `expires_at` | Payment: the order becomes `CONFIRMED` in PostgreSQL (the hold stays `AWAITING_PAYMENT` and in `holds:expiry`); or, at `expires_at`, the expiration worker expires the order and releases the hold |
-| `CONFIRMED` | `AWAITING_PAYMENT`, then `CONFIRMED` | The expiration worker, at the deadline | The worker closes the hold and counts it in `sold:{sale}` (no stock returned). Final |
+| `CONFIRMED` | `AWAITING_PAYMENT`, then deleted | The expiration worker, at the deadline | The worker closes (deletes) the hold; no stock is returned and no counter changes (the sale is in `products.sold`). Final |
 | `EXPIRED` | `EXPIRED` | | Final (a late payment still turns it into `REFUNDED`) |
 | `FAILED` | `FAILED` | | Final (same) |
-| `REFUNDED` | `AWAITING_PAYMENT`, then `EXPIRED` (late payment) or `REFUNDED` (guard failure) | The expiration worker, at the deadline | Late payment: the worker releases the hold. Guard failure: it closes the hold without stock or count. Final |
+| `REFUNDED` | `AWAITING_PAYMENT`, then `EXPIRED` (late payment) or deleted (guard failure) | The expiration worker, at the deadline | Late payment: the worker releases the hold. Guard failure: it closes (deletes) the hold without returning stock. Final |
 
-The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`). A paid hold stays `AWAITING_PAYMENT` in Redis until the worker settles it, so the status endpoint reads the order row from PostgreSQL when the hold says `AWAITING_PAYMENT` and the read cache has no entry. `sold:{sale}` is counted only by the worker, so it follows `products.sold` up to one payment window later.
+The status shown to clients only moves forward: `PENDING` < `AWAITING_PAYMENT` < `CONFIRMED`, `EXPIRED`, `FAILED` < `REFUNDED`; a delayed write never overwrites a later state, and the first final state wins (except that `REFUNDED` replaces `EXPIRED` and `FAILED`). A paid hold stays `AWAITING_PAYMENT` in Redis until the worker closes it (deletes it), so the status endpoint reads the order row from PostgreSQL when the hold says `AWAITING_PAYMENT`, or when it is gone, and the read cache has no entry. Hold states `CONFIRMED` and `REFUNDED` do not exist.
 
 ## Gateway behaviour
 

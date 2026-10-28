@@ -160,16 +160,17 @@ impl SaleFixture {
     }
 
     pub async fn hold_state(&self, ticket: &str) -> String {
-        cache::read_hold(&mut self.env.redis.clone(), self.sale, ticket).await.unwrap().unwrap().state
+        self.hold_state_opt(ticket).await.expect("the hold should exist")
+    }
+
+    /// The hold's state, `None` when the hold does not exist (a paid hold is
+    /// deleted when the worker closes it)
+    pub async fn hold_state_opt(&self, ticket: &str) -> Option<String> {
+        cache::read_hold(&mut self.env.redis.clone(), self.sale, ticket).await.unwrap().map(|h| h.state)
     }
 
     pub async fn counter(&self, key: String) -> i64 {
         self.env.redis.clone().get::<_, Option<i64>>(key).await.unwrap().unwrap_or(0)
-    }
-
-    /// `sold:{sale}`
-    pub async fn sold_counter(&self) -> i64 {
-        self.counter(cache::sold_key(self.sale)).await
     }
 
     pub async fn stock(&self) -> i64 {

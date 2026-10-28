@@ -53,7 +53,7 @@ CONFIRMED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND stat
 REFUNDED=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'REFUNDED'")
 BY_STATUS=$(psql_ "SELECT coalesce(string_agg(status || ' ' || n, ', '), 'none') FROM (SELECT status::text, count(*) AS n FROM orders WHERE product_id = $SALE GROUP BY status ORDER BY status) s")
 P_SOLD=$(psql_ "SELECT sold FROM products WHERE id = $SALE")
-R_SOLD=$(rcli GET "sold:{$SALE}"); R_STOCK=$(rcli GET "stock:{$SALE}")
+R_STOCK=$(rcli GET "stock:{$SALE}")
 HP=$(rcli ZCARD "holds:pending:{$SALE}"); HE=$(rcli ZCARD "holds:expiry:{$SALE}")
 DOUBLE=$(psql_ "SELECT count(*) FROM (SELECT user_id FROM orders WHERE product_id = $SALE AND status IN ('AWAITING_PAYMENT','CONFIRMED') GROUP BY user_id HAVING count(*) > 1) s")
 LIVE=$(psql_ "SELECT count(*) FROM orders WHERE product_id = $SALE AND status = 'AWAITING_PAYMENT'")
@@ -67,7 +67,6 @@ check "every payment surely in time ended CONFIRMED (generator's own polling)" "
 check "every payment accepted after the link expired ended REFUNDED (generator's own polling; $LATE such)" "$(j .payments.late_not_refunded)" 0
 check "every payment at the boundary of the expiry ended CONFIRMED or REFUNDED (never lost; $BOUNDARY such)" "$(j .payments.boundary_neither_confirmed_nor_refunded)" 0
 check "CONFIRMED orders equal users the generator saw CONFIRMED" "$CONFIRMED" "$(j '.outcomes.confirmed // 0')"
-check "products.sold equals sold:{sale}" "$P_SOLD" "$R_SOLD"
 check "products.sold equals CONFIRMED orders" "$P_SOLD" "$CONFIRMED"
 check "users with two live orders" "$DOUBLE" 0
 check "orders still AWAITING_PAYMENT" "$LIVE" 0

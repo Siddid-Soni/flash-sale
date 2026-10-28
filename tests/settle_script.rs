@@ -1,6 +1,6 @@
-//! `settle_hold.lua` against a real Redis (database 15): counting a paid hold
-//! once, dropping a refused one, and the race with `release.lua`. Each test
-//! uses its own random sale id.
+//! `settle_hold.lua` against a real Redis (database 15): closing a due hold
+//! whose order PostgreSQL settled (it is deleted, nothing else changes), and
+//! the race with `release.lua`. Each test uses its own random sale id.
 
 use std::collections::HashSet;
 
@@ -8,7 +8,7 @@ use chrono::{Duration, Utc};
 use redis::AsyncCommands;
 
 use flash_sale::cache::{
-    self, CheckoutOutcome, HoldState, LinkOutcome, MaxScore, RedisConn, ReleaseOutcome, ReleasedAs, SettleAs,
+    self, CheckoutOutcome, HoldState, LinkOutcome, MaxScore, RedisConn, ReleaseOutcome, ReleasedAs,
 };
 
 async fn connect() -> RedisConn {
@@ -55,47 +55,30 @@ async fn cleanup(con: &mut RedisConn, sale: i32) {
 }
 
 #[tokio::test]
-async fn a_confirmed_hold_is_counted_once_and_returns_no_stock() {
+async fn a_settled_hold_is_deleted_and_nothing_else_changes() {
     let mut con = connect().await;
     let sale = open_sale(&mut con, 3).await;
     let ticket = awaiting(&mut con, sale, 1, 60_000).await;
     assert_eq!(get_i64(&mut con, cache::stock_key(sale)).await, 2);
 
     // The deadline is far away: settling does not look at it, PostgreSQL has decided
-    assert!(cache::settle_hold(&mut con, sale, &ticket, SettleAs::Confirmed).await.unwrap());
-    assert_eq!(state(&mut con, sale, &ticket).await, "CONFIRMED");
+    assert!(cache::settle_hold(&mut con, sale, &ticket).await.unwrap());
+    assert!(cache::read_hold(&mut con, sale, &ticket).await.unwrap().is_none(), "the hold is deleted");
     assert!(!in_expiry_set(&mut con, sale, &ticket).await);
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, 1);
     assert_eq!(get_i64(&mut con, cache::stock_key(sale)).await, 2, "the unit is sold, not free");
-    let ttl: i64 = con.ttl(cache::hold_key(sale, &ticket)).await.unwrap();
-    assert!(ttl > 0 && ttl <= cache::DAY_SECS as i64, "kept readable for a day, got ttl {ttl}");
+    let keys: Vec<String> = con.keys(format!("*{{{sale}}}*")).await.unwrap();
+    assert!(!keys.iter().any(|k| k.starts_with("sold:")), "Redis does not count sales: {keys:?}");
     let live: Option<String> = con.get(cache::user_live_key(sale, 1)).await.unwrap();
     assert_eq!(live.as_deref(), Some(ticket.as_str()), "the user bought one");
 
-    // Settling again counts nothing
-    assert!(!cache::settle_hold(&mut con, sale, &ticket, SettleAs::Confirmed).await.unwrap());
-    assert!(!cache::settle_hold(&mut con, sale, &ticket, SettleAs::Dropped).await.unwrap());
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, 1);
-    cleanup(&mut con, sale).await;
-}
-
-#[tokio::test]
-async fn a_dropped_hold_counts_nothing_and_returns_no_stock() {
-    let mut con = connect().await;
-    let sale = open_sale(&mut con, 3).await;
-    let ticket = awaiting(&mut con, sale, 1, 60_000).await;
-
-    assert!(cache::settle_hold(&mut con, sale, &ticket, SettleAs::Dropped).await.unwrap());
-    assert_eq!(state(&mut con, sale, &ticket).await, "REFUNDED");
-    assert!(!in_expiry_set(&mut con, sale, &ticket).await);
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, 0);
+    // Settling again does nothing
+    assert!(!cache::settle_hold(&mut con, sale, &ticket).await.unwrap());
     assert_eq!(get_i64(&mut con, cache::stock_key(sale)).await, 2);
-    assert!(!cache::settle_hold(&mut con, sale, &ticket, SettleAs::Dropped).await.unwrap());
     cleanup(&mut con, sale).await;
 }
 
 #[tokio::test]
-async fn only_a_hold_awaiting_payment_in_the_expiry_set_can_be_settled() {
+async fn only_a_hold_in_the_expiry_set_can_be_settled() {
     let mut con = connect().await;
     let sale = open_sale(&mut con, 5).await;
 
@@ -106,25 +89,24 @@ async fn only_a_hold_awaiting_payment_in_the_expiry_set_can_be_settled() {
             .await
             .unwrap();
     assert_eq!(outcome, ReleaseOutcome::Released);
-    assert!(!cache::settle_hold(&mut con, sale, &released, SettleAs::Confirmed).await.unwrap());
+    assert!(!cache::settle_hold(&mut con, sale, &released).await.unwrap());
     assert_eq!(state(&mut con, sale, &released).await, "EXPIRED");
 
     // PENDING: not linked yet
     let pending = cache::new_ticket(sale);
     cache::checkout(&mut con, sale, 2, "k2", &pending).await.unwrap();
-    assert!(!cache::settle_hold(&mut con, sale, &pending, SettleAs::Confirmed).await.unwrap());
+    assert!(!cache::settle_hold(&mut con, sale, &pending).await.unwrap());
     assert_eq!(state(&mut con, sale, &pending).await, "PENDING");
 
     // Unknown
     let unknown = cache::new_ticket(sale);
-    assert!(!cache::settle_hold(&mut con, sale, &unknown, SettleAs::Confirmed).await.unwrap());
+    assert!(!cache::settle_hold(&mut con, sale, &unknown).await.unwrap());
 
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, 0);
     cleanup(&mut con, sale).await;
 }
 
 #[tokio::test]
-async fn concurrent_settles_of_one_hold_count_it_once() {
+async fn concurrent_settles_of_one_hold_succeed_once() {
     let mut con = connect().await;
     let sale = open_sale(&mut con, 1).await;
     let ticket = awaiting(&mut con, sale, 1, 60_000).await;
@@ -132,7 +114,7 @@ async fn concurrent_settles_of_one_hold_count_it_once() {
     let tasks: Vec<_> = (0..16)
         .map(|_| {
             let (mut con, ticket) = (con.clone(), ticket.clone());
-            tokio::spawn(async move { cache::settle_hold(&mut con, sale, &ticket, SettleAs::Confirmed).await.unwrap() })
+            tokio::spawn(async move { cache::settle_hold(&mut con, sale, &ticket).await.unwrap() })
         })
         .collect();
     let mut settled = 0;
@@ -140,12 +122,12 @@ async fn concurrent_settles_of_one_hold_count_it_once() {
         settled += usize::from(task.await.unwrap());
     }
     assert_eq!(settled, 1);
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, 1);
     cleanup(&mut con, sale).await;
 }
 
 /// Settling and releasing racing on many holds: each ends in exactly one of
-/// CONFIRMED (counted, no stock back) or EXPIRED (stock back), never both
+/// settled (the hold is deleted, no stock back) or released (state EXPIRED,
+/// stock back), never both
 #[tokio::test]
 async fn settle_and_release_race_has_one_winner_per_hold() {
     let mut con = connect().await;
@@ -182,7 +164,7 @@ async fn settle_and_release_race_has_one_winner_per_hold() {
                 let mut settled = HashSet::new();
                 // The other direction, so both sides reach every hold first sometimes
                 for ticket in tickets.iter().rev() {
-                    if cache::settle_hold(&mut con, sale, ticket, SettleAs::Confirmed).await.unwrap() {
+                    if cache::settle_hold(&mut con, sale, ticket).await.unwrap() {
                         settled.insert(ticket.clone());
                     }
                 }
@@ -208,10 +190,12 @@ async fn settle_and_release_race_has_one_winner_per_hold() {
     assert!(released_all.is_disjoint(&settled_all), "a hold was both released and settled");
     assert_eq!(released_all.len() + settled_all.len(), HOLDS as usize, "every hold has exactly one winner");
     for ticket in &tickets {
-        let expected = if settled_all.contains(ticket) { "CONFIRMED" } else { "EXPIRED" };
-        assert_eq!(state(&mut con, sale, ticket).await, expected);
+        if settled_all.contains(ticket) {
+            assert!(cache::read_hold(&mut con, sale, ticket).await.unwrap().is_none());
+        } else {
+            assert_eq!(state(&mut con, sale, ticket).await, "EXPIRED");
+        }
     }
-    assert_eq!(get_i64(&mut con, cache::sold_key(sale)).await, settled_all.len() as i64);
     assert_eq!(get_i64(&mut con, cache::stock_key(sale)).await, released_all.len() as i64);
     cleanup(&mut con, sale).await;
 }
