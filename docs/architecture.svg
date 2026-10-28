@@ -1,154 +1,146 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1640 800" width="1640" height="800" font-family="Inter, 'Segoe UI', Helvetica, Arial, sans-serif">
-  <title>Flash sale architecture: the hot path</title>
-  <defs>
-    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
-    </marker>
-    <marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/>
-    </marker>
-    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-      <path d="M0,0 L10,5 L0,10 z" fill="#ea580c"/>
-    </marker>
-    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
-      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#0f172a" flood-opacity="0.10"/>
-    </filter>
-    <!-- a stack of three servers, centred on 0,0 -->
-    <g id="stack-indigo">
-      <rect x="-30" y="-28" width="50" height="42" rx="7" fill="#c7d2fe" stroke="#4f46e5" stroke-width="2"/>
-      <rect x="-20" y="-18" width="50" height="42" rx="7" fill="#a5b4fc" stroke="#4f46e5" stroke-width="2"/>
-      <rect x="-10" y="-8" width="50" height="42" rx="7" fill="#6366f1" stroke="#4338ca" stroke-width="2"/>
-    </g>
-    <g id="stack-rose">
-      <rect x="-30" y="-28" width="50" height="42" rx="7" fill="#fecdd3" stroke="#e11d48" stroke-width="2"/>
-      <rect x="-20" y="-18" width="50" height="42" rx="7" fill="#fda4af" stroke="#e11d48" stroke-width="2"/>
-      <rect x="-10" y="-8" width="50" height="42" rx="7" fill="#f43f5e" stroke="#be123c" stroke-width="2"/>
-    </g>
-    <g id="cylinder">
-      <path d="M-17,-15 v30 a17,6.5 0 0 0 34,0 v-30" fill="#3b82f6" stroke="#1d4ed8" stroke-width="2"/>
-      <ellipse cx="0" cy="-15" rx="17" ry="6.5" fill="#93c5fd" stroke="#1d4ed8" stroke-width="2"/>
-    </g>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" width="1120" height="840" role="img" aria-label="Flash sale architecture: the Order Service handles only checkout and status; the site service handles sessions, details, list, search and admin; the payment provider is outside the gateway; the expiration worker is the only component that returns stock.">
+  <title>Flash sale architecture</title>
+  <style>
+    .box { fill: #ffffff; stroke: #15171c; stroke-width: 1.5; }
+    .box-core { fill: #fff1e8; stroke: #d9480f; stroke-width: 2.5; }
+    .box-side { fill: #ffffff; stroke: #5b616e; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    text { font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .t-title { font-family: "IBM Plex Sans", Inter, "Segoe UI", Helvetica, Arial, sans-serif; font-weight: 700; font-size: 15px; fill: #15171c; }
+    .t-sub { font-family: "IBM Plex Sans", Inter, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #5b616e; }
+    .t-core { fill: #d9480f; font-weight: 600; font-size: 11px; letter-spacing: 0.08em; }
+    .t-side { fill: #5b616e; font-weight: 600; font-size: 11px; letter-spacing: 0.08em; }
+    .edge { fill: none; stroke: #15171c; stroke-width: 1.4; }
+    .edge-core { fill: none; stroke: #d9480f; stroke-width: 2.2; }
+    .edge-rare { fill: none; stroke: #7c5cd6; stroke-width: 1.4; stroke-dasharray: 5 4; }
+    .lbl { font-size: 11.5px; fill: #15171c; }
+    .lbl-core { font-size: 11.5px; fill: #d9480f; font-weight: 600; }
+    .lbl-rare { font-size: 11.5px; fill: #7c5cd6; }
+    .head { fill: #15171c; }
+    .head-core { fill: #d9480f; }
+    .head-rare { fill: #7c5cd6; }
+    .legend { font-family: "IBM Plex Sans", Inter, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: #5b616e; }
+  </style>
+  <rect width="1120" height="840" fill="#f3f4f6"/>
+        <defs>
+          <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head"/></marker>
+          <marker id="ac" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head-core"/></marker>
+          <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" class="head-rare"/></marker>
+        </defs>
 
-  <rect width="1640" height="800" fill="#f8fafc"/>
+        <!-- Browser and gateway -->
+        <rect class="box" x="480" y="18" width="160" height="42" rx="4"/>
+        <text class="t-title" x="560" y="44" text-anchor="middle">Browser</text>
+        <path class="edge-core" d="M560 60V98" marker-end="url(#ac)"/>
+        <path class="edge" d="M640 39H970V98" marker-end="url(#a)"/>
+        <text class="lbl" x="805" y="31" text-anchor="middle">payment page, directly</text>
 
-  <!-- ===================== links (hot path only) ===================== -->
-  <g fill="none" stroke="#475569" stroke-width="2.2">
-    <path d="M125,328 V254" marker-end="url(#arrow)"/>
-    <path d="M158,375 H276" marker-end="url(#arrow)"/>
-    <path d="M372,375 H526" marker-end="url(#arrow)"/>
-    <path d="M595,490 V576" marker-end="url(#arrow)"/>
-    <path d="M664,375 H796" marker-end="url(#arrow)"/>
-    <path d="M595,316 V130 H806" marker-end="url(#arrow)"/>
-    <path d="M954,375 H1081" marker-end="url(#arrow)"/>
-    <path d="M1219,375 H1351" marker-end="url(#arrow)"/>
-    <path d="M1140,490 V571" marker-end="url(#arrow)"/>
-    <path d="M1083,412 H1022 V600 H666" marker-end="url(#arrow)"/>
-    <path d="M1150,316 V130 H944" marker-end="url(#arrow)"/>
-    <path d="M1351,130 H1150"/>
-    <path d="M1420,240 V312" marker-end="url(#arrow)"/>
-  </g>
-  <path d="M1210,573 V492" fill="none" stroke="#ea580c" stroke-width="2.4" marker-end="url(#arrow-orange)"/>
-  <path d="M1489,130 H1597 V752 H595 V700" fill="none" stroke="#7c3aed" stroke-width="2.4" marker-end="url(#arrow-violet)"/>
+        <rect class="box" x="40" y="100" width="740" height="62" rx="4"/>
+        <text class="t-title" x="60" y="126">CDN / NGINX gateway</text>
+        <text class="t-sub" x="60" y="146">rate limits · bot filter · edge cache: list, search 5 s · details 1 s</text>
 
-  <!-- ===================== nodes ===================== -->
-  <g fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5" filter="url(#shadow)">
-    <rect x="60" y="72" width="130" height="115" rx="16"/>
-    <rect x="530" y="318" width="130" height="115" rx="16"/>
-    <rect x="530" y="580" width="130" height="115" rx="16"/>
-    <rect x="810" y="72" width="130" height="115" rx="16"/>
-    <rect x="1085" y="318" width="130" height="115" rx="16"/>
-    <rect x="1355" y="318" width="130" height="115" rx="16"/>
-    <rect x="1355" y="72" width="130" height="115" rx="16"/>
-    <rect x="1065" y="575" width="220" height="92" rx="16"/>
-    <rect x="800" y="338" width="150" height="74" rx="16"/>
-  </g>
+        <!-- Gateway to the three front services -->
+        <path class="edge" d="M170 162V238" marker-end="url(#a)"/>
+        <text class="lbl" x="180" y="204">session · details · list · search · admin</text>
+        <path class="edge-core" d="M560 162V238" marker-end="url(#ac)"/>
+        <text class="lbl-core" x="570" y="204">checkout · status</text>
 
-  <!-- CDN cloud -->
-  <g transform="translate(125,132)" fill="#f59e0b">
-    <circle cx="-14" cy="-6" r="22"/>
-    <circle cx="14" cy="-12" r="18"/>
-    <circle cx="28" cy="6" r="14"/>
-    <circle cx="-34" cy="8" r="13"/>
-    <rect x="-46" y="4" width="88" height="22" rx="11"/>
-  </g>
+        <!-- Row 2 -->
+        <rect class="box-side" x="40" y="240" width="260" height="80" rx="4"/>
+        <text class="t-side" x="56" y="260">NOT IN THE REQUIREMENTS</text>
+        <text class="t-title" x="56" y="282">Site service</text>
+        <text class="t-sub" x="56" y="302">session · details · list · search · admin</text>
 
-  <!-- client phone -->
-  <g transform="translate(125,375)">
-    <rect x="-24" y="-44" width="48" height="88" rx="9" fill="#ffffff" stroke="#334155" stroke-width="2.5"/>
-    <rect x="-17" y="-33" width="34" height="62" rx="3" fill="#e2e8f0"/>
-    <circle cx="0" cy="37" r="3" fill="#334155"/>
-  </g>
+        <rect class="box-core" x="430" y="240" width="260" height="80" rx="4"/>
+        <text class="t-core" x="446" y="260">CORE PATH</text>
+        <text class="t-title" x="446" y="282">Order Service ×3</text>
+        <text class="t-sub" x="446" y="302">checkout · status</text>
 
-  <!-- gateway -->
-  <rect x="278" y="288" width="92" height="174" rx="16" fill="#0d9488" filter="url(#shadow)"/>
-  <rect x="296" y="345" width="56" height="60" rx="8" fill="none" stroke="#ccfbf1" stroke-width="2"/>
-  <text x="324" y="382" text-anchor="middle" font-size="16" font-weight="700" fill="#ccfbf1">&lt;/&gt;</text>
+        <rect class="box-side" x="860" y="100" width="220" height="62" rx="4"/>
+        <text class="t-side" x="876" y="118">EXTERNAL</text>
+        <text class="t-title" x="876" y="138">Payment provider</text>
+        <text class="t-sub" x="876" y="155">own address, :8090 locally</text>
 
-  <use href="#stack-indigo" x="590" y="372"/>
-  <use href="#stack-indigo" x="1145" y="372"/>
-  <use href="#stack-indigo" x="1415" y="126"/>
-  <use href="#stack-rose" x="590" y="634"/>
-  <use href="#stack-rose" x="870" y="126"/>
+        <!-- Site service edges -->
+        <path class="edge" d="M200 320L258 418" marker-end="url(#a)"/>
+        <text class="lbl" x="214" y="364" text-anchor="end">read stock,</text>
+        <text class="lbl" x="214" y="380" text-anchor="end">init sale</text>
+        <path class="edge" d="M70 320V780H760V742" marker-end="url(#a)"/>
+        <text class="lbl" x="400" y="772" text-anchor="middle">users · products (own pool)</text>
 
-  <!-- kafka: two messages -->
-  <g transform="translate(875,375)" fill="#fde68a" stroke="#b45309" stroke-width="1.6">
-    <rect x="-50" y="-15" width="44" height="30" rx="3"/>
-    <rect x="6" y="-15" width="44" height="30" rx="3"/>
-    <path d="M-50,-15 L-28,2 L-6,-15 M6,-15 L28,2 L50,-15" fill="none"/>
-  </g>
+        <!-- Order Service edges -->
+        <path class="edge-core" d="M445 320L405 418" marker-end="url(#ac)"/>
+        <text class="lbl-core" x="412" y="372" text-anchor="end">checkout.lua DECR</text>
+        <path class="edge-core" d="M520 320V515H472" marker-end="url(#ac)"/>
+        <text class="lbl-core" x="514" y="398" text-anchor="end">status</text>
+        <path class="edge-core" d="M620 320V428" marker-end="url(#ac)"/>
+        <text class="lbl-core" x="628" y="380">publish</text>
+        <path class="edge-rare" d="M545 320V620H660V658" marker-end="url(#ar)"/>
+        <text class="lbl-rare" x="553" y="580">rare: status fallback,</text>
+        <text class="lbl-rare" x="553" y="596">FAILED claim</text>
 
-  <g transform="translate(1420,375)">
-    <use href="#cylinder" x="-18" y="-14"/>
-    <use href="#cylinder" x="18" y="-14"/>
-    <use href="#cylinder" x="0" y="14"/>
-  </g>
+        <!-- Row 3: Redis, Kafka, processor -->
+        <rect class="box" x="230" y="420" width="240" height="56" rx="4"/>
+        <text class="t-title" x="246" y="443">Redis inventory</text>
+        <text class="t-sub" x="246" y="463">stock · user_live · idem · start</text>
+        <rect class="box" x="230" y="490" width="240" height="60" rx="4"/>
+        <text class="t-title" x="246" y="513">Redis read cache</text>
+        <text class="t-sub" x="246" y="533">status:{ticket}</text>
 
+        <rect class="box" x="560" y="430" width="120" height="80" rx="4"/>
+        <text class="t-title" x="620" y="464" text-anchor="middle">Kafka</text>
+        <text class="t-sub" x="620" y="484" text-anchor="middle">orders.checkout</text>
 
-  <!-- ===================== names ===================== -->
-  <g fill="#0f172a" font-size="18" font-weight="600" text-anchor="middle">
-    <text x="125" y="214">CDN</text>
-    <text x="125" y="470">Client</text>
-    <text x="324" y="490">LB / Gateway</text>
-    <text x="595" y="460">Order Service</text>
-    <text x="875" y="436">Kafka</text>
-    <text x="875" y="214">Read-optimized Redis</text>
-    <text x="1150" y="460">Order Processors</text>
-    <text x="1420" y="460">PostgreSQL</text>
-    <text x="1420" y="214">Expiration Workers</text>
-    <text x="1175" y="615">Payment Provider</text>
-    <text x="680" y="648" text-anchor="start">Redis Inventory</text>
-  </g>
-  <g fill="#64748b" font-size="13" text-anchor="middle">
-    <text x="125" y="232">static app · sale details 1 s</text>
-    <text x="125" y="488">Preact</text>
-    <text x="324" y="508">NGINX · rate limits</text>
-    <text x="595" y="478">stateless ×3</text>
-    <text x="875" y="454">orders.checkout</text>
-    <text x="875" y="232">status:&lt;ticket&gt;</text>
-    <text x="1150" y="478">consumers + webhook</text>
-    <text x="1420" y="478">orders · inbox · sold guard</text>
-    <text x="1420" y="232">expire unpaid orders</text>
-    <text x="1175" y="636">Stripe-shaped (fake)</text>
-    <text x="680" y="668" text-anchor="start">stock · user_live · Lua (AOF)</text>
-  </g>
+        <rect class="box" x="820" y="420" width="260" height="100" rx="4"/>
+        <text class="t-title" x="836" y="446">Order processor</text>
+        <text class="t-sub" x="836" y="468">checkout → order + link</text>
+        <text class="t-sub" x="836" y="486">webhook → inbox → decision</text>
+        <text class="t-sub" x="836" y="504">no inventory keys</text>
 
-  <!-- ===================== link labels ===================== -->
-  <g fill="#334155" font-size="12.5" text-anchor="middle">
-    <text x="217" y="364">checkout</text>
-    <text x="217" y="394">poll status</text>
-    <text x="449" y="364">any replica</text>
-    <text x="605" y="538" text-anchor="start">checkout.lua</text>
-    <text x="730" y="364">publish</text>
-    <text x="700" y="120">status write / read</text>
-    <text x="1017" y="364">consume</text>
-    <text x="1285" y="364">order · confirm</text>
-    <text x="850" y="590">progress</text>
-    <text x="1130" y="534" text-anchor="end">session · refund</text>
-    <text x="1222" y="534" text-anchor="start" fill="#c2410c">signed webhook</text>
-    <text x="1046" y="120">payment link · result</text>
-    <text x="1250" y="120">expired / failed</text>
-    <text x="1430" y="282" text-anchor="start">expire (guarded)</text>
-    <text x="1100" y="742" fill="#6d28d9">return_unit.lua: return unpaid stock, once</text>
-  </g>
+        <path class="edge" d="M680 470H818" marker-end="url(#a)"/>
+        <text class="lbl" x="750" y="462" text-anchor="middle">consume</text>
+
+        <!-- Provider and processor -->
+        <path class="edge" d="M860 140H782" marker-end="url(#a)"/>
+        <text class="lbl" x="821" y="132" text-anchor="middle">webhook</text>
+        <path class="edge" d="M750 162V380H900V418" marker-end="url(#a)"/>
+        <text class="lbl" x="758" y="290">webhook,</text>
+        <text class="lbl" x="758" y="306">IP allow-list</text>
+        <path class="edge" d="M1010 420V164" marker-end="url(#a)"/>
+        <text class="lbl" x="1018" y="274">sessions,</text>
+        <text class="lbl" x="1018" y="290">expiry,</text>
+        <text class="lbl" x="1018" y="306">refunds</text>
+        <text class="lbl" x="1018" y="322">(outbound)</text>
+
+        <!-- Processor to read cache and PostgreSQL -->
+        <path class="edge" d="M840 520V535H472" marker-end="url(#a)"/>
+        <text class="lbl" x="700" y="528" text-anchor="middle">link · CONFIRMED · REFUNDED</text>
+        <path class="edge" d="M880 520V658" marker-end="url(#a)"/>
+        <text class="lbl" x="888" y="588">INSERT order,</text>
+        <text class="lbl" x="888" y="604">decide payment</text>
+
+        <!-- Row 4: worker and PostgreSQL -->
+        <rect class="box" x="230" y="660" width="220" height="60" rx="4"/>
+        <text class="t-title" x="246" y="686">Expiration worker</text>
+        <text class="t-sub" x="246" y="706">polls every 250 ms</text>
+
+        <rect class="box" x="620" y="660" width="300" height="80" rx="4"/>
+        <text class="t-title" x="636" y="688">PostgreSQL</text>
+        <text class="t-sub" x="636" y="710">users · products · orders</text>
+        <text class="t-sub" x="636" y="726">payment_inbox</text>
+
+        <path class="edge" d="M450 690H618" marker-end="url(#a)"/>
+        <text class="lbl" x="534" y="682" text-anchor="middle">UPDATE … EXPIRED</text>
+        <text class="lbl" x="534" y="708" text-anchor="middle">RETURNING</text>
+        <path class="edge" d="M250 660V640H212V448H228" marker-end="url(#a)"/>
+        <text class="lbl" x="204" y="560" text-anchor="end">INCR stock,</text>
+        <text class="lbl" x="204" y="576" text-anchor="end">clear user_live</text>
+        <path class="edge" d="M390 660V552" marker-end="url(#a)"/>
+        <text class="lbl" x="398" y="612">EXPIRED</text>
+        <!-- Legend -->
+        <path class="edge-core" d="M40 812H80"/>
+        <text class="legend" x="88" y="816">case-study path: checkout and status on Redis and Kafka only</text>
+        <path class="edge-rare" d="M470 812H510"/>
+        <text class="legend" x="518" y="816">rare: Order Service calls to PostgreSQL</text>
+        <rect class="box-side" x="790" y="803" width="40" height="18" rx="3"/>
+        <text class="legend" x="838" y="816">outside the requirements, or external</text>
 </svg>

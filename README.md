@@ -20,9 +20,9 @@ The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case stu
 | Fake payment provider | A service of its own (`fake_payment_provider`, fixed address `172.28.0.50`), Stripe-like: the payment page `/fake-pay/{id}`, published on its own port `localhost:8090` and outside the gateway (as a real provider is), an HTTP API to create a session (idempotent), expire and refund, and signed webhooks with retries. Owns the `fakepay:*` Redis keys | `src/bin/fake_payment_provider.rs`, `src/payment/` |
 | PostgreSQL 16 | Durable record, and the only place sales are counted (`products.sold`): `users`, `products`, `orders`, `payment_inbox` | `migrations/` |
 
-![Architecture: the hot path](docs/architecture.svg)
+![Architecture](docs/architecture.svg)
 
-The diagram shows only the hot path: checkout, status polling, the order pipeline, payment and expiry. The site service (sessions, sale details, list, search, admin) is left out.
+Orange is the case-study path: checkout and status run on Redis and Kafka only, and the Order Service reaches PostgreSQL only on two rare paths (purple). The site service serves everything outside the requirements (sessions, sale details, list, search, admin) behind the edge cache. The payment provider is outside our gateway: the browser opens its page directly, our services call its API outbound, and only its webhook enters through the gateway. The order processor never touches inventory keys; the expiration worker, polling PostgreSQL, is the only component that returns stock.
 
 ### Request flow
 
