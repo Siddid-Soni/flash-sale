@@ -1,5 +1,16 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { readSession, readTicket, safeGet, safeRemove, safeSet, writeSession, writeTicket } from './storage';
+import {
+  clearSentToPay,
+  hasSentToPay,
+  markSentToPay,
+  readSession,
+  readTicket,
+  safeGet,
+  safeRemove,
+  safeSet,
+  writeSession,
+  writeTicket,
+} from './storage';
 
 type StorageLike = {
   getItem(key: string): string | null;
@@ -80,5 +91,23 @@ describe('safe storage', () => {
 
     store.set('flash-sale.ticket:45', 'not json');
     expect(readTicket('45')).toBeNull();
+  });
+
+  it('remembers that a ticket was already sent to payment', () => {
+    const store = new Map<string, string>();
+    installStorage({
+      getItem: (key) => store.get(key) ?? null,
+      setItem: (key, value) => void store.set(key, value),
+      removeItem: (key) => void store.delete(key),
+    });
+
+    expect(hasSentToPay('42.a')).toBe(false);
+    markSentToPay('42.a');
+    expect(hasSentToPay('42.a')).toBe(true);
+    // One ticket's marker does not cover another ticket.
+    expect(hasSentToPay('42.b')).toBe(false);
+
+    clearSentToPay('42.a');
+    expect(hasSentToPay('42.a')).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  formatClock,
   formatCountdown,
   formatDelay,
   formatMoney,
@@ -55,6 +56,20 @@ describe('formatCountdown', () => {
   it('floors fractions and clamps negatives', () => {
     expect(formatCountdown(59.9)).toBe('59s');
     expect(formatCountdown(-5)).toBe('0s');
+  });
+});
+
+describe('formatClock', () => {
+  it('formats a wall-clock countdown', () => {
+    expect(formatClock(0)).toBe('00:00');
+    expect(formatClock(7)).toBe('00:07');
+    expect(formatClock(3596)).toBe('59:56');
+    expect(formatClock(3727)).toBe('01:02:07');
+  });
+
+  it('floors fractions and clamps negatives', () => {
+    expect(formatClock(59.9)).toBe('00:59');
+    expect(formatClock(-5)).toBe('00:00');
   });
 });
 

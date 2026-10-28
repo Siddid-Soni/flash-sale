@@ -110,7 +110,7 @@ async fn sale_details_body_headers_and_not_found() {
 
     let resp = test::call_service(&app, TestRequest::get().uri(&format!("/v1/sales/{id}")).to_request()).await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(resp.headers().get("Cache-Control").unwrap(), "public, max-age=1");
+    assert_eq!(resp.headers().get("Cache-Control").unwrap(), "public, max-age=1, stale-while-revalidate=5");
     let body: Value = test::read_body_json(resp).await;
     assert_eq!(
         body,
@@ -134,4 +134,38 @@ async fn sale_details_body_headers_and_not_found() {
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     let not_a_number = test::call_service(&app, TestRequest::get().uri("/v1/sales/abc").to_request()).await;
     assert_eq!(not_a_number.status(), StatusCode::NOT_FOUND);
+}
+
+#[actix_web::test]
+async fn sale_list_has_the_details_newest_start_first() {
+    let env = common::env().await;
+    let app = test_app!(env);
+    // Far in the future so it is among the 50 latest whatever other tests created
+    let mut body = sale_body();
+    body["name"] = json!("list-me");
+    body["sale_start_time"] = json!("2099-12-31T00:00:00Z");
+    let created: Value =
+        test::call_and_read_body_json(&app, create_request(Some(common::ADMIN_TOKEN), &body).to_request()).await;
+    let id = created["id"].as_i64().unwrap();
+    redis::cmd("SET").arg(format!("stock:{{{id}}}")).arg(0).query_async::<()>(&mut env.redis.clone()).await.unwrap();
+
+    let resp = test::call_service(&app, TestRequest::get().uri("/v1/sales").to_request()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get("Cache-Control").unwrap(), "public, max-age=1, stale-while-revalidate=5");
+    let list: Vec<Value> = test::read_body_json(resp).await;
+    assert!(list.len() <= 50);
+    let starts: Vec<&str> = list.iter().map(|s| s["sale_start_time"].as_str().unwrap()).collect();
+    assert!(starts.windows(2).all(|w| w[0] >= w[1]), "newest start first: {starts:?}");
+    let mine = list.iter().find(|s| s["id"] == id).expect("the new sale is listed");
+    assert_eq!(
+        *mine,
+        json!({
+            "id": id,
+            "name": "list-me",
+            "price_cents": 59_900,
+            "sale_start_time": "2099-12-31T00:00:00Z",
+            "total_inventory": 500,
+            "sold_out": true,
+        })
+    );
 }

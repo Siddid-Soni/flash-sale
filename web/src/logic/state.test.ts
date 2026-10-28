@@ -5,6 +5,7 @@ import {
   mapCheckoutResponse,
   mapStatusResponse,
   parseSale,
+  parseSales,
   screenForFinalStatus,
   statusToScreen,
 } from './state';
@@ -215,5 +216,25 @@ describe('parseSale', () => {
   it('rejects bodies without a name', () => {
     expect(parseSale(null, '1')).toBeNull();
     expect(parseSale({}, '1')).toBeNull();
+  });
+});
+
+describe('parseSales', () => {
+  it('reads each sale with its id, skipping unusable entries', () => {
+    const sales = parseSales([
+      { id: 7, name: 'Aurora X1', price_cents: 100, sale_start_time: '2026-10-28T20:00:00Z', total_inventory: 5, sold_out: true },
+      { name: 'no id' },
+      { id: 8 },
+      { id: 9, name: 'Beta', price_cents: 200, sale_start_time: '2026-10-29T20:00:00Z', total_inventory: 3, sold_out: false },
+    ]);
+    expect(sales?.map((s) => [s.id, s.name, s.soldOut])).toEqual([
+      ['7', 'Aurora X1', true],
+      ['9', 'Beta', false],
+    ]);
+  });
+
+  it('rejects a body that is not a list', () => {
+    expect(parseSales({ sales: [] })).toBeNull();
+    expect(parseSales([])).toEqual([]);
   });
 });

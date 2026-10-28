@@ -31,7 +31,7 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 |---|---|---|
 | `Location` | checkout `200`/`202`, fake payment page `303` | Status URL / where the browser goes back to |
 | `Retry-After` | `503` from checkout, every `429`, gateway `503` | Seconds to wait (always `1`) |
-| `Cache-Control` | sale details `public, max-age=1`; status `no-store`; gateway errors `no-store` | |
+| `Cache-Control` | sale list and details `public, max-age=1, stale-while-revalidate=5`; status `no-store`; gateway errors `no-store` | |
 | `X-Replica` | every Order Service response when `REPLICA_ID` is set (compose sets `1`..`3`); not on the webhook or the payment page | Which replica answered |
 | `X-Cache-Status` | `GET /v1/sales/{id}` | NGINX cache result: `MISS`, `HIT`, `UPDATING`, `STALE` |
 
@@ -40,6 +40,7 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `POST /v1/session` | none | Create a guest session |
+| `GET /v1/sales` | none | The latest sales (home page) |
 | `GET /v1/sales/{sale_id}` | none | Sale details |
 | `POST /v1/sales/{sale_id}/checkout` | user | Reserve one unit |
 | `GET /v1/orders/status/{queue_ticket_id}` | user | Poll an order |
@@ -63,6 +64,18 @@ curl -s -X POST http://localhost:8000/v1/session
 | `403` | Only if a session challenge is configured and the `X-Challenge` header fails it |
 | `429` | Gateway: more than 1 request per second per IP (burst 5) |
 
+### `GET /v1/sales`
+
+Public. The latest 50 sales, latest start time first, each with the same fields as `GET /v1/sales/{sale_id}`. Cached by the gateway like the details; read from PostgreSQL (one query) and Redis (one `MGET` for `sold_out`) on a miss.
+
+```bash
+curl -s http://localhost:8000/v1/sales
+```
+
+| Status | Body and headers |
+|---|---|
+| `200` | `[{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}, ...]` (`[]` when there are none); `Cache-Control: public, max-age=1, stale-while-revalidate=5`, `X-Cache-Status` |
+
 ### `GET /v1/sales/{sale_id}`
 
 Public. Cached by the gateway for 1 to 2 seconds (NGINX counts whole seconds) and by each replica for 1 second; the query string is ignored.
@@ -73,7 +86,7 @@ curl -si http://localhost:8000/v1/sales/1
 
 | Status | Body and headers |
 |---|---|
-| `200` | `{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}`; `Cache-Control: public, max-age=1`, `X-Cache-Status` |
+| `200` | `{"id": 1, "name": "Phone", "price_cents": 49900, "sale_start_time": "2026-10-28T20:00:00Z", "total_inventory": 500, "sold_out": false}`; `Cache-Control: public, max-age=1, stale-while-revalidate=5`, `X-Cache-Status` |
 | `404` | `{"message": "sale 9 not found"}` (a non-numeric id is also `404`) |
 
 `sold_out` is true when `stock:{sale}` is 0 or missing. It can turn false again when a hold is released and a unit returns to stock.

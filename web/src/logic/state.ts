@@ -100,6 +100,18 @@ export function parseSale(body: unknown, id: string): Sale | null {
   };
 }
 
+/** Parses `GET /v1/sales`, skipping entries without an id or a name. */
+export function parseSales(body: unknown): Sale[] | null {
+  if (!Array.isArray(body)) return null;
+  const sales: Sale[] = [];
+  for (const item of body) {
+    const id = asNumber(asRecord(item)?.id);
+    const sale = id === null ? null : parseSale(item, String(id));
+    if (sale !== null) sales.push(sale);
+  }
+  return sales;
+}
+
 /**
  * Maps a checkout response to an outcome. `retryAfterMs` is the already-parsed
  * `Retry-After` header, or `null` when the server sent none.

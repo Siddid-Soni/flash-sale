@@ -16,6 +16,15 @@ pub fn find_product(conn: &mut PgConnection, product_id: i32) -> QueryResult<Opt
     products::table.find(product_id).select(Product::as_select()).first(conn).optional()
 }
 
+/// The latest `limit` sales, by start time (newest first), for the home page
+pub fn list_sales(conn: &mut PgConnection, limit: i64) -> QueryResult<Vec<Product>> {
+    products::table
+        .select(Product::as_select())
+        .order((products::sale_start_time.desc(), products::id.desc()))
+        .limit(limit)
+        .load(conn)
+}
+
 /// Ids of the sales the expiration worker watches: those that start at or
 /// after `since` (running now, finished recently, or still to come)
 pub fn sales_starting_since(conn: &mut PgConnection, since: DateTime<Utc>) -> QueryResult<Vec<i32>> {

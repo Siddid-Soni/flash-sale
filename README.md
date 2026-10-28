@@ -50,7 +50,7 @@ docker compose exec -T gateway wget -qO- \
   http://127.0.0.1/v1/admin/sales
 ```
 
-The answer contains the sale `id`. The frontend shows sale `1` by default; open `http://localhost:8000/?sale=<id>` for another. `dev-admin-token` is `ADMIN_TOKEN` in `.env`. Pay on the fake payment page (served by the provider container through the gateway); the webhook arrives within a second or so and the order becomes `CONFIRMED`.
+The answer contains the sale `id`. `http://localhost:8000/` lists the sales; each links to its page, `http://localhost:8000/?sale=<id>`. `dev-admin-token` is `ADMIN_TOKEN` in `.env`. Pay on the fake payment page (served by the provider container through the gateway); the webhook arrives within a second or so and the order becomes `CONFIRMED`.
 
 Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
 

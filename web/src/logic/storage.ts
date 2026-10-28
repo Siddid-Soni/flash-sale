@@ -120,3 +120,20 @@ export function writeTicket(saleId: string, record: TicketRecord): void {
 export function clearTicket(saleId: string): void {
   safeRemove(ticketKey(saleId));
 }
+
+// A ticket is marked once this tab has actually been sent to the payment page.
+// Without it, returning from `/fake-pay` while the webhook is still in flight
+// would find `AWAITING_PAYMENT` and bounce the user straight back to pay.
+const sentToPayKey = (ticket: string) => `flash-sale.sent-to-pay:${ticket}`;
+
+export function hasSentToPay(ticket: string): boolean {
+  return safeGet(sentToPayKey(ticket)) === '1';
+}
+
+export function markSentToPay(ticket: string): void {
+  safeSet(sentToPayKey(ticket), '1');
+}
+
+export function clearSentToPay(ticket: string): void {
+  safeRemove(sentToPayKey(ticket));
+}

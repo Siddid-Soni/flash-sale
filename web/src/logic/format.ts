@@ -50,6 +50,18 @@ export function formatCountdown(totalSeconds: number): string {
   return `${rest}s`;
 }
 
+/** Giant wall-clock countdown: `01:03:07`, `59:56`, `00:07`. */
+export function formatClock(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+
+  if (hours > 0) return `${pad(hours)}:${pad(minutes)}:${pad(rest)}`;
+  return `${pad(minutes)}:${pad(rest)}`;
+}
+
 /** Integer cents as a currency string. */
 export function formatMoney(cents: number): string {
   if (!Number.isFinite(cents)) return '—';

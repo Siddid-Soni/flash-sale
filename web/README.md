@@ -1,7 +1,7 @@
 # Flash Sale — web
 
-The storefront for one flash sale: product page, countdown, buy button, queue
-and payment states. Preact + Vite + TypeScript, no UI, routing or state
+The storefront: a home page listing the sales, and per sale a product page,
+countdown, buy button, queue and payment states. Preact + Vite + TypeScript, no UI, routing or state
 libraries.
 
 ## Development
@@ -12,12 +12,8 @@ npm run dev
 ```
 
 Vite serves on <http://localhost:5173> and proxies `/v1` and `/fake-pay` to the
-Rust API at <http://localhost:8080>. The sale is chosen with `?sale=<id>`;
-without it the app uses `VITE_SALE_ID` (default `1`).
-
-```bash
-VITE_SALE_ID=42 npm run dev
-```
+Rust API at <http://localhost:8080>. `/` lists the latest sales
+(`GET /v1/sales`); `/?sale=<id>` is that sale's page.
 
 ## Build
 
@@ -54,6 +50,10 @@ Chrome is found, that part prints a skip message. Override the lookup with
 - Status is polled every 2 s from `GET /v1/orders/status/{ticket}` and stops on
   a final state. The ticket (and final state) is kept in `sessionStorage`, so a
   reload — or a return from `/fake-pay/...` — resumes where it left off.
+- The payment page is opened automatically at most once per ticket in a tab.
+  Coming back to `/?sale=<id>` while the payment webhook is still in flight
+  shows a "waiting for the provider" state with a link, instead of bouncing
+  straight back to `/fake-pay`.
 - The product image and the lazy checkout/status chunk are prefetched before
   the sale opens: the image with `<link rel="preload">`, the chunk with
   `import('./flow')`.

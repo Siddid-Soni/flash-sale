@@ -1,10 +1,10 @@
-//! The single page: product, countdown, buy button and the order states.
+//! The sale page (`/?sale=<id>`): product, countdown, buy button and the order states.
 //! Checkout and polling live behind `import('./flow')`; this module only has
 //! what first paint needs.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { createGuestSession, fetchSale } from './api';
-import { formatCountdown, formatDelay, formatMoney, secondsLeft } from './logic/format';
+import { formatClock, formatCountdown, formatDelay, formatMoney, secondsLeft } from './logic/format';
 import { currentSession, forgetSession, parseSessionResponse, rememberSession } from './logic/session';
 import {
   finalStatusName,
@@ -17,7 +17,7 @@ import {
   type Screen,
   type StatusUpdate,
 } from './logic/state';
-import { readTicket, writeTicket } from './logic/storage';
+import { readTicket, writeTicket, clearSentToPay, hasSentToPay, markSentToPay } from './logic/storage';
 
 type Flow = typeof import('./flow');
 
@@ -36,18 +36,18 @@ function loadFlow(): Promise<Flow> {
   return flowPromise;
 }
 
-function resolveSaleId(): string {
+/** The sale in `?sale=<id>`, or `null` for the home page. */
+export function saleIdFromUrl(): string | null {
   try {
     const fromQuery = new URLSearchParams(window.location.search).get('sale');
     if (fromQuery !== null && fromQuery.trim() !== '') return fromQuery.trim();
   } catch {
-    // A broken URL is not worth failing over; fall through to the default.
+    // A broken URL is not worth failing over; show the home page.
   }
-  const fromEnv = (import.meta.env.VITE_SALE_ID ?? '').trim();
-  return fromEnv !== '' ? fromEnv : '1';
+  return null;
 }
 
-const SALE_ID = resolveSaleId();
+const SALE_ID = saleIdFromUrl() ?? '';
 
 /** One key per purchase attempt; reused by every retry of that attempt. */
 function newIdempotencyKey(): string {
@@ -191,6 +191,7 @@ export function App() {
     setScreen(next);
 
     if (isFinalStatus(update)) {
+      clearSentToPay(ticket);
       const final = finalStatusName(update);
       if (final !== null) writeTicket(SALE_ID, { ticket, final });
     } else {
@@ -448,16 +449,43 @@ export function App() {
     };
   }, [reloadNonce, getToken, startPolling, stopPolling]);
 
-  // Send the user to the fake provider, but keep a visible link in case the
-  // redirect is blocked or the user comes back with the back button.
+  // Send the user to the fake provider once per ticket, but keep a visible
+  // link in case the redirect is blocked or the user comes back. The marker
+  // matters: the webhook is asynchronous, so on the way back from payment the
+  // status can still say AWAITING_PAYMENT for a moment. Without it the page
+  // would bounce straight back to the payment page.
   const paymentUrl = screen.kind === 'payment' ? screen.paymentUrl : '';
+  const paymentTicket = screen.kind === 'payment' ? screen.ticket : '';
+  const paymentExpiresAt = screen.kind === 'payment' ? screen.expiresAtMs : null;
+  const alreadySentToPay = paymentTicket !== '' && hasSentToPay(paymentTicket);
+
   useEffect(() => {
-    if (paymentUrl === '') return;
+    if (paymentUrl === '' || paymentTicket === '') return;
+    if (hasSentToPay(paymentTicket)) return;
+
     const timer = window.setTimeout(() => {
-      window.location.assign(paymentUrl);
+      // A stale link would only land on an expired session; wait for the
+      // status poll to report EXPIRED instead.
+      if (paymentExpiresAt !== null && Date.now() >= paymentExpiresAt) return;
+      markSentToPay(paymentTicket);
+      try {
+        window.location.assign(paymentUrl);
+      } catch {
+        // A malformed URL is not fatal: the link on the page still works.
+      }
     }, REDIRECT_DELAY_MS);
     return () => window.clearTimeout(timer);
-  }, [paymentUrl]);
+  }, [paymentUrl, paymentTicket, paymentExpiresAt]);
+
+  // Coming back through the back/forward cache must re-read the marker and
+  // restart the countdowns; the poller itself resumes on its own.
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setNow(Date.now());
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
 
   const startMs = sale?.saleStartMs ?? null;
   const secondsToStart = startMs !== null && now < startMs ? secondsLeft(startMs, now) : 0;
@@ -481,60 +509,67 @@ export function App() {
   const renderAction = () => {
     switch (screen.kind) {
       case 'loading':
-        return <p class="muted">Loading the sale…</p>;
+        return <p class="micro">Loading sale data_</p>;
 
       case 'error':
         return (
-          <div class="block block--bad" role="alert">
-            <p>{screen.message}</p>
+          <div class="panel panel--bad" role="alert">
+            <p class="panel__title">Load failed</p>
+            <p class="note">{screen.message}</p>
             <button type="button" class="button button--ghost" onClick={reload}>
-              Try again
+              Try again →
             </button>
           </div>
         );
 
       case 'ready':
         return (
-          <div class="buy-area">
+          <div class="panel" aria-busy={busy ? 'true' : 'false'}>
+            {!isOpen ? (
+              <>
+                <p class="micro">Drop in</p>
+                <p class="clock">{formatClock(secondsToStart)}</p>
+              </>
+            ) : (
+              <p class="micro micro--live">
+                <span class="pulse" aria-hidden="true" /> Status: live — one per person
+              </p>
+            )}
             <button
               type="button"
-              class="button button--buy"
+              class="button"
               onClick={beginAttempt}
               disabled={!isOpen}
               aria-busy={busy ? 'true' : 'false'}
             >
               {isOpen
-                ? 'Buy now'
+                ? 'Buy now →'
                 : secondsToStart > 0
-                  ? `Buy — opens in ${formatCountdown(secondsToStart)}`
-                  : 'Buy — opening…'}
+                  ? `Armed — ${formatCountdown(secondsToStart)}`
+                  : 'Armed — opening…'}
             </button>
-            {!isOpen && secondsToStart > 0 && startMs !== null && (
+            {!isOpen && startMs !== null && (
               <p class="note">
-                The sale opens at{' '}
+                Opens{' '}
                 <time dateTime={new Date(startMs).toISOString()}>
-                  {new Date(startMs).toLocaleTimeString([], {
+                  {new Date(startMs).toLocaleString([], {
+                    month: 'short',
+                    day: 'numeric',
                     hour: '2-digit',
                     minute: '2-digit',
                   })}
                 </time>
-                . You can leave this page open.
+                . Leave this page open.
               </p>
-            )}
-            {!isOpen && secondsToStart === 0 && (
-              <p class="note">The sale is about to open. The button unlocks in a moment.</p>
-            )}
-            {isOpen && (
-              <p class="note">One phone per person. Your unit is held for five minutes.</p>
             )}
           </div>
         );
 
       case 'reserving':
         return (
-          <div class="block" aria-busy="true">
-            <p class="state-title">
-              <span class="spinner" aria-hidden="true" /> Reserving your phone…
+          <div class="panel" aria-busy="true">
+            <p class="panel__title">
+              <span class="pulse" aria-hidden="true" /> Reserving unit…
             </p>
             {screen.note !== '' && <p class="note">{screen.note}</p>}
           </div>
@@ -542,12 +577,20 @@ export function App() {
 
       case 'queue':
         return (
-          <div class="block">
-            <p class="state-title">
-              {screen.position !== null && screen.position > 0
-                ? `You're number ${screen.position} in line`
-                : "You're in the queue"}
-            </p>
+          <div class="panel">
+            <p class="panel__title">In queue</p>
+            <div class="spec">
+              <span class="spec__label">Position</span>
+              <span class="spec__dots" aria-hidden="true" />
+              <span class="spec__value">
+                {screen.position !== null && screen.position > 0 ? screen.position : '—'}
+              </span>
+            </div>
+            <div class="spec">
+              <span class="spec__label">Ticket</span>
+              <span class="spec__dots" aria-hidden="true" />
+              <span class="spec__value spec__value--mono">{screen.ticket}</span>
+            </div>
             <p class="note">{screen.note || POLL_NOTE}</p>
           </div>
         );
@@ -555,24 +598,39 @@ export function App() {
       case 'payment': {
         const paymentSeconds =
           screen.expiresAtMs === null ? null : secondsLeft(screen.expiresAtMs, now);
+        const paymentExpired = paymentSeconds !== null && paymentSeconds <= 0;
         return (
-          <div class="block">
-            <p class="state-title">Your phone is reserved</p>
-            {paymentSeconds !== null && paymentSeconds > 0 ? (
-              <p class="note">
-                Complete payment within <strong>{formatCountdown(paymentSeconds)}</strong>.
-              </p>
-            ) : (
-              <p class="note">The payment window has closed; waiting for the final status.</p>
-            )}
-            {screen.paymentUrl !== '' ? (
+          <div class="panel panel--good">
+            <p class="panel__title">Unit reserved</p>
+            {!paymentExpired && paymentSeconds !== null && (
               <>
-                <a class="button button--buy" href={screen.paymentUrl}>
-                  Continue to payment
-                </a>
-                <p class="note">Taking you to payment… If nothing happens, use the link above.</p>
+                <p class="micro">Pay window</p>
+                <p class="clock">{formatClock(paymentSeconds)}</p>
               </>
-            ) : (
+            )}
+            {paymentExpired && (
+              <p class="note">The payment window has closed. Waiting for the final status…</p>
+            )}
+            {!paymentExpired && screen.paymentUrl !== '' && (
+              <>
+                <a
+                  class="button"
+                  href={screen.paymentUrl}
+                  onClick={() => markSentToPay(screen.ticket)}
+                >
+                  {alreadySentToPay ? 'Reopen payment →' : 'Continue to payment →'}
+                </a>
+                {alreadySentToPay ? (
+                  <p class="note">
+                    Waiting for the provider to confirm. Use the link above if you did
+                    not finish paying.
+                  </p>
+                ) : (
+                  <p class="note">Redirecting to payment… If nothing happens, use the link above.</p>
+                )}
+              </>
+            )}
+            {!paymentExpired && screen.paymentUrl === '' && (
               <p class="note">Preparing your payment link…</p>
             )}
           </div>
@@ -581,34 +639,41 @@ export function App() {
 
       case 'confirmed':
         return (
-          <div class="block block--good">
-            <p class="state-title">Order confirmed</p>
-            <p class="note">Your phone is on its way. Keep this tab for your receipt.</p>
+          <div class="panel panel--good">
+            <p class="panel__title">Order confirmed</p>
+            {ticketRef.current !== null && (
+              <div class="spec">
+                <span class="spec__label">Ticket</span>
+                <span class="spec__dots" aria-hidden="true" />
+                <span class="spec__value spec__value--mono">{ticketRef.current}</span>
+              </div>
+            )}
+            <p class="note">Your phone is secured. Keep this tab for your receipt.</p>
           </div>
         );
 
       case 'sold-out':
         return (
-          <div class="block block--bad">
-            <p class="state-title">Sold out</p>
-            <p class="note">Every phone in this drop has gone. Better luck next time.</p>
+          <div class="panel panel--bad">
+            <p class="panel__title">Sold out</p>
+            <p class="note">All {sale?.totalInventory ?? ''} units in this drop have gone.</p>
           </div>
         );
 
       case 'expired':
         return (
-          <div class="block block--bad">
-            <p class="state-title">Reservation expired</p>
+          <div class="panel panel--bad">
+            <p class="panel__title">Reservation expired</p>
             <p class="note">
-              The five-minute payment window closed, so the phone went back on sale.
+              The five-minute pay window closed, so the unit went back on sale.
             </p>
           </div>
         );
 
       case 'refunded':
         return (
-          <div class="block block--bad">
-            <p class="state-title">Payment refunded</p>
+          <div class="panel panel--bad">
+            <p class="panel__title">Payment refunded</p>
             <p class="note">
               Your payment arrived after the reservation expired, so it has been refunded.
             </p>
@@ -617,30 +682,30 @@ export function App() {
 
       case 'failed':
         return (
-          <div class="block block--bad" role="alert">
-            <p class="state-title">Something went wrong</p>
+          <div class="panel panel--bad" role="alert">
+            <p class="panel__title">Failed</p>
             <p class="note">{screen.message}</p>
             <button type="button" class="button button--ghost" onClick={beginAttempt}>
-              Start again
+              Start again →
             </button>
           </div>
         );
 
       case 'already':
         return (
-          <div class="block">
-            <p class="state-title">You already have one</p>
+          <div class="panel">
+            <p class="panel__title">Already holding</p>
             <p class="note">{screen.message}</p>
           </div>
         );
 
       case 'retry':
         return (
-          <div class="block block--bad" role="alert">
-            <p class="state-title">Still trying</p>
+          <div class="panel panel--bad" role="alert">
+            <p class="panel__title">Still trying</p>
             <p class="note">{screen.message}</p>
             <button type="button" class="button button--ghost" onClick={retrySameAttempt}>
-              Try again
+              Try again →
             </button>
             <p class="note">
               Retrying reuses the same request, so you will never be charged twice.
@@ -650,17 +715,51 @@ export function App() {
     }
   };
 
+  const statusCell = sale === null ? 'LOADING' : sale.soldOut ? 'SOLD OUT' : isOpen ? '● LIVE' : 'T-MINUS';
+
   return (
     <main class="page">
-      <header class="masthead">
-        <p class="brand">
-          <span class="dot" aria-hidden="true" /> Flash Sale
-        </p>
-        <p class="meta">{sale ? `${sale.totalInventory} units · one per person` : 'Limited drop'}</p>
-      </header>
+      <nav class="nav" aria-label="Sale">
+        <a class="nav__cell nav__brand" href="/">VOLT STORE</a>
+        <a class="nav__cell" href="/">← ALL SALES</a>
+        <p class="nav__cell">SALE #{SALE_ID}</p>
+        <p class={`nav__cell nav__status${sale?.soldOut ? ' nav__status--out' : ''}`}>{statusCell}</p>
+      </nav>
 
-      <section class="card" aria-busy={busy ? 'true' : 'false'}>
-        <div class="media">
+      <div class="kicker">
+        <p>PRECISION DROP</p>
+        <p>{sale ? `${sale.totalInventory} UNITS` : '··· UNITS'}</p>
+        <p>ONE PER PERSON</p>
+      </div>
+      <h1 class="display">{sale?.name ?? 'Flash sale'}</h1>
+
+      {sale !== null && (
+        <div class="herometa">
+          <p class="spec">
+            <span class="spec__label">Price</span>
+            <span class="spec__dots" aria-hidden="true" />
+            <span class="spec__value">{formatMoney(sale.priceCents)}</span>
+          </p>
+          <p class="spec">
+            <span class="spec__label">Units</span>
+            <span class="spec__dots" aria-hidden="true" />
+            <span class="spec__value">{sale.totalInventory}</span>
+          </p>
+          <p class="spec">
+            <span class="spec__label">Pay window</span>
+            <span class="spec__dots" aria-hidden="true" />
+            <span class="spec__value">5:00</span>
+          </p>
+        </div>
+      )}
+
+      <div class="deck">
+        <div aria-busy={busy ? 'true' : 'false'}>
+          {renderAction()}
+          {waitNote !== '' && <p class="note note--wait">{waitNote}</p>}
+        </div>
+
+        <figure class="fig">
           <img
             src="/product.svg"
             alt=""
@@ -669,27 +768,16 @@ export function App() {
             fetchpriority="high"
             decoding="async"
           />
-        </div>
-
-        <div class="info">
-          <p class="eyebrow">{sale ? 'Limited drop' : 'Loading'}</p>
-          <h1>{sale?.name ?? 'Flash sale'}</h1>
-          {sale !== null && (
-            <>
-              <p class="price">{formatMoney(sale.priceCents)}</p>
-              <p class="lede">
-                One phone per person. Reserve it here, then pay within five minutes.
-              </p>
-            </>
-          )}
-
-          <div class="action">{renderAction()}</div>
-          {waitNote !== '' && <p class="note note--wait">{waitNote}</p>}
-        </div>
-      </section>
+          <figcaption class="fig__cap">
+            <span>FIG. 01 — {sale?.name ?? 'UNIT'}</span>
+            <span>SCALE 1:1</span>
+          </figcaption>
+        </figure>
+      </div>
 
       <footer class="footer">
-        <p>Your place is kept in this browser only. Closing it does not cancel an order.</p>
+        <p>VOLT STORE — FLASH SALE</p>
+        <p>PLACE KEPT IN THIS BROWSER ONLY</p>
       </footer>
 
       <p class="visually-hidden" role="status" aria-live="polite">

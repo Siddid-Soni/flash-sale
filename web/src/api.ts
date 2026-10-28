@@ -29,6 +29,24 @@ export async function fetchSale(saleId: string): Promise<SaleResult> {
   }
 }
 
+/** `GET /v1/sales`: the latest sales for the home page. */
+export async function fetchSales(): Promise<SaleResult> {
+  try {
+    const response = await fetch('/v1/sales', {
+      headers: { Accept: 'application/json' },
+      credentials: 'same-origin',
+      cache: 'no-store',
+    });
+    const body = await readJsonResponse(response);
+    if (!response.ok) {
+      return { ok: false, message: errorMessage(body, `Could not load the sales (${response.status}).`) };
+    }
+    return { ok: true, body };
+  } catch {
+    return { ok: false, message: 'Could not reach the server. Check your connection.' };
+  }
+}
+
 /** `POST /v1/session`; throws with a readable message on failure. */
 export async function createGuestSession(): Promise<unknown> {
   let response: Response;

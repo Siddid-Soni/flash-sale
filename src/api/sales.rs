@@ -1,7 +1,8 @@
 //! Public sale details. `GET /v1/sales/{id}` is what every client loads first
 //! and the CDN caches for a second, so it must stay cheap when a stampede
 //! misses the edge: the product comes from a per-replica cache, and only
-//! `sold_out` is read from Redis (one `GET`).
+//! `sold_out` is read from Redis (one `GET`). `GET /v1/sales` lists the latest
+//! sales for the home page, edge-cached the same way.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -70,6 +71,13 @@ impl SaleCache {
     }
 }
 
+/// Edge caching for both routes: fresh for a second, then served stale for up
+/// to 5 s more while one request refreshes it in the background
+const CACHE_CONTROL: &str = "public, max-age=1, stale-while-revalidate=5";
+
+/// Sales shown on the home page
+const LIST_LIMIT: i64 = 50;
+
 #[derive(Debug, Serialize)]
 struct SaleResponse {
     id: i32,
@@ -81,7 +89,7 @@ struct SaleResponse {
 }
 
 /// Sale details for the page: name, price, start time and whether it is sold
-/// out. `Cache-Control: public, max-age=1` lets the edge absorb the load.
+/// out. `CACHE_CONTROL` lets the edge absorb the load.
 #[get("/sales/{sale_id}")]
 async fn get_sale(
     pool: web::Data<DbPool>,
@@ -104,19 +112,47 @@ async fn get_sale(
     let mut con = redis.get_ref().clone();
     let sold_out = cache::sold_out(&mut con, sale).await?;
 
-    Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, "public, max-age=1")).json(SaleResponse {
-        id: product.id,
-        name: product.name,
-        price_cents: product.price_cents,
-        sale_start_time: product.sale_start_time,
-        total_inventory: product.total_inventory,
-        sold_out,
-    }))
+    Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, CACHE_CONTROL)).json(SaleResponse::new(product, sold_out)))
 }
 
-// GET /v1/sales/{sale_id}
+/// The latest sales, newest start first, with the same fields as the details.
+/// One query and one `MGET` for the sold-out flags.
+#[get("/sales")]
+async fn list_sales(pool: web::Data<DbPool>, redis: web::Data<RedisConn>) -> Result<HttpResponse, ApiError> {
+    let products = web::block(move || {
+        let mut conn = pool.get()?;
+        Ok::<_, ApiError>(actions::products::list_sales(&mut conn, LIST_LIMIT)?)
+    })
+    .await??;
+
+    let ids: Vec<i32> = products.iter().map(|p| p.id).collect();
+    let mut con = redis.get_ref().clone();
+    let stock = cache::stock_levels(&mut con, &ids).await?;
+    let sales: Vec<SaleResponse> = products
+        .into_iter()
+        .zip(stock)
+        .map(|(product, stock)| SaleResponse::new(product, stock.unwrap_or(0) <= 0))
+        .collect();
+
+    Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, CACHE_CONTROL)).json(sales))
+}
+
+impl SaleResponse {
+    fn new(product: Product, sold_out: bool) -> Self {
+        SaleResponse {
+            id: product.id,
+            name: product.name,
+            price_cents: product.price_cents,
+            sale_start_time: product.sale_start_time,
+            total_inventory: product.total_inventory,
+            sold_out,
+        }
+    }
+}
+
+// GET /v1/sales, GET /v1/sales/{sale_id}
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(get_sale);
+    cfg.service(list_sales).service(get_sale);
 }
 
 #[cfg(test)]
