@@ -178,7 +178,7 @@ describe('final states', () => {
 });
 
 describe('parseSale', () => {
-  it('reads the roadmap contract', () => {
+  it('reads the API contract', () => {
     expect(
       parseSale(
         {

@@ -1,4 +1,4 @@
-//! Step 40: the same flash sale (BUYERS buyers racing for UNITS units, all at once) run
+//! The same flash sale (BUYERS buyers racing for UNITS units, all at once) run
 //! against five ways of decrementing stock, side by side:
 //!
 //! 1. `naive`        `SELECT stock`, then `UPDATE ... SET stock = <value read> - 1` in a

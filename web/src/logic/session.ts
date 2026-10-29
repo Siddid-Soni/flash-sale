@@ -26,7 +26,7 @@ export function jwtExpiryMs(token: string): number | null {
 }
 
 /**
- * Turns the session response into a stored session. The roadmap contract is
+ * Turns the session response into a stored session. The API contract is
  * `{token}`; an optional `expires_at` and the JWT's own `exp` are honoured
  * when present.
  */

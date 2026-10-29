@@ -1,4 +1,4 @@
-//! Simulated buyers for the Stage 9 load tests (`load/flash.sh`, `load/backlog.sh`).
+//! Simulated buyers for the load tests (`load/flash.sh`, `load/backlog.sh`).
 //!
 //! Every user is one task that behaves like the browser client:
 //!

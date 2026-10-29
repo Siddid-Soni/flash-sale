@@ -23,7 +23,7 @@ describe('jwtExpiryMs', () => {
 describe('parseSessionResponse', () => {
   const now = Date.parse('2026-10-28T20:00:00Z');
 
-  it('accepts the roadmap shape {token}', () => {
+  it('accepts the API shape {token}', () => {
     const token = fakeJwt({ exp: 1_893_456_000 });
     const session = parseSessionResponse({ token }, now);
     expect(session).toEqual({ token, expiresAtMs: 1_893_456_000_000 });

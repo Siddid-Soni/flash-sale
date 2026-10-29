@@ -67,7 +67,7 @@ pub struct Config {
     /// Checkout messages one order processor works on at once, per partition
     pub processor_concurrency: usize,
     /// Cap on checkout messages one order processor starts per second
-    /// (0 = unlimited); the Stage 9 backlog test throttles with it
+    /// (0 = unlimited); the backlog load test throttles with it
     pub processor_max_per_sec: u32,
     /// Orders the expiration worker expires per pass; a full batch is followed
     /// at once by another

@@ -14,7 +14,7 @@ struct SessionResponse {
 /// A guest session: a user row with no username or email, and a token for it.
 /// Clients create it when the sale page loads, before the sale opens, so the
 /// spike at the start does not hit this insert; the gateway rate-limits it
-/// per IP (Stage 7). The optional `X-Challenge` header goes to the configured
+/// per IP. The optional `X-Challenge` header goes to the configured
 /// `Challenge` (a no-op unless `SESSION_CHALLENGE` selects a real one).
 #[post("/session")]
 async fn create_session(

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Step 39: the backlog test. The order processors are throttled (PROCESSOR_MAX_PER_SEC) so
+# The backlog test. The order processors are throttled (PROCESSOR_MAX_PER_SEC) so
 # the checkout queue in Kafka builds a real backlog: UNITS (default 10,000) units, N users
 # (default 10,000) all checking out within ARRIVAL_SECS (10) of the sale opening, the
 # processor starting RATE (default 200) messages per second. The last link then appears
 # about N / RATE seconds after the first (50 s), longer than the payment window (30 s), so a
 # user who waited in the queue longer than the window shows that the payment timer does not
-# run while an order is queued: the deadline is set by the processor when it creates the order. The roadmap's design point is the same script with
+# run while an order is queued: the deadline is set by the processor when it creates the order. The design point is the same script with
 # N=UNITS=100000 and RATE=1000.
 #
 # Asserts (PASS/FAIL per check, non-zero exit on a FAIL, report appended to load/RESULTS.md):

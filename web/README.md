@@ -25,17 +25,23 @@ npm run build
 ```
 
 `tsc --noEmit` type-checks, then Vite writes `dist/` with hashed, immutable
-asset names and `/` as the base path (NGINX serves it, Stage 7).
+asset names and `/` as the base path. Locally the gateway image serves `dist/`; for production see "Where the
+frontend runs, and how to deploy it" in the root README.
 
 ## Browser run-through
 
+With the compose stack up (root README, Quick start):
+
 ```bash
-npm run demo                 # against the compose stack on :8000; screenshots in demo-shots/
-npm run demo -- <saleId>     # an existing sale instead of a new one
+npm run demo                 # creates a 5-unit sale opening in 12 s, buys, pays, waits for "Order confirmed"
+npm run demo -- <saleId>     # an existing sale that has not sold out, instead of a new one
 ```
 
-`scripts/demo-run.mjs` (Playwright, system Chromium at `CHROMIUM_PATH`) creates a sale through the gateway container,
-buys, pays on the fake provider's page and waits for "Order confirmed". See the root README.
+`scripts/demo-run.mjs` drives Chromium through Playwright: the countdown, the buy button, the fake provider's payment
+page, and back to "Order confirmed", saving a screenshot of each step to `demo-shots/`. It creates the sale through the
+gateway container and sends a normal browser user agent, since the gateway refuses `HeadlessChrome`. `CHROMIUM_PATH`
+(default `/usr/bin/chromium`), `DEMO_BASE_URL` (default `http://localhost:8000`) and `DEMO_OUT` (default `demo-shots`)
+change the browser, the target and where the screenshots land.
 
 ## Tests and budgets
 

@@ -1,5 +1,5 @@
-//! `POST /v1/payments/webhook`: where the payment provider reports outcomes
-//! (roadmap step 7). It is served by the **order processor**, not by the Order
+//! `POST /v1/payments/webhook`: where the payment provider reports outcomes.
+//! It is served by the **order processor**, not by the Order
 //! Service replicas, and reached through the gateway, which lets only the
 //! provider's addresses through (`gateway/payment_provider_ips.conf`).
 //!

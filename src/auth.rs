@@ -90,7 +90,7 @@ fn authenticate(req: &HttpRequest) -> Result<AuthUser, ApiError> {
 /// header to equal `ADMIN_TOKEN`, otherwise `403` before the handler runs. The
 /// comparison takes the same time wherever the strings differ, so the token
 /// cannot be guessed byte by byte (only its length is observable). NGINX also
-/// refuses `/v1/admin/` from outside the internal network (Stage 7).
+/// refuses `/v1/admin/` from outside the internal network.
 #[derive(Debug, Clone, Copy)]
 pub struct AdminAuth;
 

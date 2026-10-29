@@ -9,8 +9,8 @@
 //! decides. `SESSION_CHALLENGE=off` (the default) selects `AlwaysPass`. A real
 //! implementation (a hashcash-style proof of work whose difficulty rises with
 //! load, a Turnstile/reCAPTCHA token check) is another type implementing the
-//! trait, selected by another value in `from_config`; the roadmap lists it as
-//! deferred. The handler needs no change.
+//! trait, selected by another value in `from_config`; it is not built yet.
+//! The handler needs no change.
 
 use std::sync::Arc;
 

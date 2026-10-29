@@ -1,8 +1,8 @@
 # Gateway
 
-NGINX in front of the system (roadmap Stage 7): the only container that publishes a port for the API
+NGINX in front of the system: the only container that publishes a port for the API
 (`http://localhost:8000`). It serves the built frontend, sends checkout and order status to three Order Service
-replicas and sessions, sale details, the sale list, search and admin to the site service (Stage 12),
+replicas and sessions, sale details, the sale list, search and admin to the site service,
 rate-limits, filters bots and hides `/v1/admin/`. The payment page is not behind it: the fake provider
 publishes it on `localhost:8090`.
 
@@ -97,7 +97,7 @@ docker compose exec -T gateway wget -qO- \
 
 The same URL from the host (`curl http://localhost:8000/v1/admin/sales`) answers `403`.
 
-**Load tests (Stage 9).** The generator runs on the host, so every request reaches the gateway from the
+**Load tests.** The generator runs on the host, so every request reaches the gateway from the
 bridge address `172.28.0.1` and would share one per-IP bucket. To count simulated clients separately, start the
 gateway with
 

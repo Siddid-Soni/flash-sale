@@ -1,4 +1,4 @@
--- Reserve one unit of a sale for a user, atomically (roadmap step 43).
+-- Reserve one unit of a sale for a user, atomically.
 -- KEYS: 1 sale_start:{s}  2 idem:{s}:{user}:{key}  3 user_live:{s}:{user}
 --       4 stock:{s}
 -- ARGV: 1 new ticket  2 one day in seconds (idempotency TTL, and the least

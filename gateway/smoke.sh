@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the gateway (Stage 7, routes of the site service Stage 12). Needs the
+# Smoke test for the gateway, including the site service's routes. Needs the
 # whole stack, including the site service, the fake payment provider (published on
 # localhost:8090, outside the gateway) and the order processor:
 #     docker compose --profile app up -d --build

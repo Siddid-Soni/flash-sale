@@ -1,5 +1,5 @@
-//! The fake provider's payment page, `/fake-pay/{session_id}` (roadmap step
-//! 19), served by the `fake_payment_provider` binary. It stands in for the
+//! The fake provider's payment page, `/fake-pay/{session_id}`,
+//! served by the `fake_payment_provider` binary. It stands in for the
 //! page Stripe hosts: the user sees the amount and pays or cancels with a
 //! plain HTML form, and the browser is sent back to the sale
 //! (`{FRONTEND_URL}/?sale=<id>`, where the frontend resumes). The browser

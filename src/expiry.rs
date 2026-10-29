@@ -1,4 +1,4 @@
-//! The expiration worker's logic (roadmap steps 22 and 46): expire the unpaid
+//! The expiration worker's logic: expire the unpaid
 //! orders whose deadline has passed and give each one's unit back to stock.
 //! Driven by PostgreSQL alone: Redis keeps no timer and no per-ticket state.
 //!

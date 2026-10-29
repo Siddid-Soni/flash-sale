@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Step 40: builds and runs the overselling demonstration (load/oversell_demo) and appends
+# Builds and runs the overselling demonstration (load/oversell_demo) and appends
 # its table to load/RESULTS.md. Needs `docker compose up -d` (PostgreSQL and Redis); it
 # creates and drops its own schema (oversell_demo) and uses Redis database 13, never the
 # application's tables or keys. The app containers may be up or down.

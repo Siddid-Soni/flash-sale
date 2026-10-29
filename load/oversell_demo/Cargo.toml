@@ -1,4 +1,4 @@
-# Step 40: the overselling demonstration. A separate crate (like load/flash), run by
+# The overselling demonstration. A separate crate (like load/flash), run by
 # load/oversell_demo.sh. It uses its own PostgreSQL schema and Redis database, never the
 # application's tables or keys.
 [package]

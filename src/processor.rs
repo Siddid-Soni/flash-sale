@@ -1,4 +1,4 @@
-//! The order processor's logic (roadmap steps 15-18 and 45): turn each checkout
+//! The order processor's logic: turn each checkout
 //! event into an order and a payment link.
 //!
 //! - `Processor::handle` is the per-message work, in this order: (a) the price;
@@ -168,7 +168,7 @@ impl Processor {
 
         // b. The payment session, idempotent per ticket
         //
-        // The payment deadline ("now + 5 min" in the roadmap) is computed once,
+        // The payment deadline ("now + 5 min") is computed once,
         // in whole milliseconds, and used for the session, the order row and the
         // status entry, so the three agree. A rerun after a crash asks for a
         // new one, but the provider returns the first session and the insert

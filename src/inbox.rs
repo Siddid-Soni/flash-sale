@@ -1,6 +1,6 @@
 //! Payment events: the order processor turns each provider event into a
-//! confirmed order or a refund (roadmap steps 8, 21 and 46, redesigned so that
-//! PostgreSQL alone decides between a payment and the payment deadline).
+//! confirmed order or a refund, with
+//! PostgreSQL alone deciding between a payment and the payment deadline.
 //!
 //! `InboxWorker::handle_event` is the one place an event is acted on. It runs
 //! from two callers, so a payment is confirmed at once and still converges

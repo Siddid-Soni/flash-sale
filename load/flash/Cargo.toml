@@ -1,4 +1,4 @@
-# Load generator for the Stage 9 flash-sale tests (load/flash.sh and
+# Load generator for the flash-sale load tests (load/flash.sh and
 # load/backlog.sh run it). A separate crate, outside the main workspace, so the
 # application does not carry an HTTP client dependency. It talks HTTP only; the
 # one thing it shares with the application is the JWT format (HS256, `sub`,

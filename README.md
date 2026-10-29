@@ -50,22 +50,31 @@ A frontend deploy is then an upload and a purge of `index.html`, with no gateway
 
 ## Quick start
 
-Needs Docker with compose v2. The first build compiles the Rust binaries and the frontend, so it takes a while.
+Needs Docker with compose v2 (and Node 20+ with Chromium for the optional browser check). The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
 
 ```bash
-docker compose up -d                          # PostgreSQL 16, two Redis 7 (inventory, read cache), Kafka
-docker compose --profile app up -d --build    # + 3 Order Services, site service, order processor, expiration worker, fake payment provider (:8090), NGINX (:8000)
-```
+# Start: PostgreSQL, two Redis (inventory, read cache) and Kafka, then the app:
+# 3 Order Services, the site service, order processor, expiration worker,
+# fake payment provider (:8090) and NGINX (:8000)
+docker compose up -d
+docker compose --profile app up -d --build
 
-Open <http://localhost:8000>. There is no sale yet; create one (see [Creating sales](#creating-sales)). This one opens in one minute:
+# Check it answers
+curl -s localhost:8000/gateway-health          # ok
+curl -s localhost:8000/v1/sales                # [] on a fresh database
 
-```bash
+# Create a sale that opens in a minute; open the link it prints
 scripts/create_sale.sh
+
+# Optional: buy one end to end in a real browser (screenshots in web/demo-shots/)
+(cd web && npm install && npm run demo)
+
+# Stop the app (data kept), or remove everything including the data
+docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider
+docker compose down -v
 ```
 
-It prints the sale and its page, `http://localhost:8000/?sale=<id>`; `http://localhost:8000/` lists the sales still selling. `http://localhost:8000/` also has a search box (`GET /v1/sales/search?q=`). Pay on the fake payment page: the link in the order status is the provider's own address, `http://localhost:8090/fake-pay/...`, outside the gateway; its "Back to the sale" link returns to the frontend (`FRONTEND_URL`). The webhook arrives within a second or so and the order becomes `CONFIRMED`.
-
-Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
+<http://localhost:8000> lists the sales still selling, with a search box; each links to its page, `/?sale=<id>`. Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, its webhook arrives within a second or so and the order becomes `CONFIRMED`. `docker compose --profile app stop` alone would also stop PostgreSQL, Redis and Kafka.
 
 ## Creating sales
 
@@ -78,29 +87,7 @@ scripts/create_sale.sh "Open now" 10 19900 0      # opens immediately
 ADMIN_TOKEN=... scripts/create_sale.sh            # another admin token (default: dev-admin-token from .env)
 ```
 
-The admin route is refused from the host with `403` on purpose, so the script posts from inside the gateway container. The same request by hand:
-
-```bash
-docker compose exec -T gateway wget -qO- \
-  --header 'X-Admin-Token: dev-admin-token' --header 'Content-Type: application/json' \
-  --post-data "{\"name\":\"Phone\",\"price_cents\":49900,\"total_inventory\":500,\"sale_start_time\":\"$(date -u -d '+60 seconds' +%FT%TZ)\"}" \
-  http://127.0.0.1/v1/admin/sales
-```
-
-Without the gateway (services run with cargo), post to the site service on `:8082` directly; see [Running locally with cargo](#running-locally-with-cargo).
-
-## Browser run-through
-
-With the stack up (Quick start), one command drives the storefront in a real browser: it creates a 5-unit sale that opens in 12 seconds, waits for the countdown, buys, pays on the fake payment page and waits for "Order confirmed", saving a screenshot of each step to `web/demo-shots/`.
-
-```bash
-cd web
-npm install
-npm run demo                 # new sale
-npm run demo -- <saleId>     # or an existing sale that has not sold out
-```
-
-It uses the system Chromium (`CHROMIUM_PATH`, default `/usr/bin/chromium`) and sends a normal browser user agent, since the gateway refuses `HeadlessChrome`. `DEMO_BASE_URL` (default `http://localhost:8000`) and `DEMO_OUT` (default `demo-shots`) change where it goes and where the screenshots land.
+The admin route is refused from the host with `403` on purpose, so the script posts from inside the gateway container. Without the gateway (services run with cargo), post to the site service on `:8082` directly; see [Running locally with cargo](#running-locally-with-cargo).
 
 ## Running locally with cargo
 
@@ -121,7 +108,7 @@ curl -s -X POST http://localhost:8082/v1/admin/sales -H 'X-Admin-Token: dev-admi
   -d "{\"name\":\"Phone\",\"price_cents\":49900,\"total_inventory\":500,\"sale_start_time\":\"$(date -u -d '+60 seconds' +%FT%TZ)\"}"
 ```
 
-Frontend with hot reload: `cd web && npm install && npm run dev` (<http://localhost:5173>, proxies the site routes to `:8082` and the rest of `/v1` to `:8080`, as the gateway does; payment links point at the provider, `http://localhost:8090/fake-pay/...`, and are opened directly). Set `FRONTEND_URL=http://localhost:5173` in `.env` so the payment page sends the browser back to the Vite server. More in [web/README.md](web/README.md).
+The frontend's commands (dev server with hot reload, build, tests, size and TTI budgets, the browser run-through) are in [web/README.md](web/README.md). With the Vite dev server, set `FRONTEND_URL=http://localhost:5173` in `.env` so the payment page sends the browser back to it.
 
 ## Configuration
 
@@ -182,11 +169,9 @@ The integration tests use their own PostgreSQL database, `flash_sale_test` on th
 
 ## Benchmarks
 
-Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, the site service, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Full output, settings and checks: [load/RESULTS.md](load/RESULTS.md); how to run them: [load/README.md](load/README.md).
+Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, the site service, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. The generator runs on cores 0-9 and the whole stack on cores 10-19 (`GEN_CPUS=0-9 STACK_CPUS=10-19`), and it sends to the gateway's container address rather than through Docker's port proxy; see [load/README.md](load/README.md) for why both matter. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Every run below passed all of its checks: `products.sold` = `CONFIRMED` orders, never above 500; `stock` = 500 - `products.sold` once settled; no user with two live orders; every in-time payment `CONFIRMED`. Full output: [load/RESULTS.md](load/RESULTS.md).
 
-### Flash sale burst: 100,000 users within 3 s, 500 units (`GEN_CPUS=0-9 STACK_CPUS=10-19 ARRIVAL_SECS=3 load/flash.sh 100000`)
-
-On the current design. The generator ran on cores 0-9 and the whole stack on cores 10-19, and the generator sent to the gateway's container address rather than `localhost:8000` (see [load/README.md](load/README.md) for why both matter).
+### Flash sale burst: 100,000 users within 3 s, 500 units (`ARRIVAL_SECS=3 load/flash.sh 100000`)
 
 | Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms | Responses |
 |---|---|---|---|---|---|---|---|
@@ -195,36 +180,30 @@ On the current design. The generator ran on cores 0-9 and the whole stack on cor
 | `GET /v1/orders/status/{ticket}` | 5,937 | 263 | 0.8 | 8.1 | 71.7 | 178.7 | 200: 5,937 |
 | `POST /fake-pay/{session}/pay` | 322 | 58 | 0.7 | 1.2 | 3.4 | 6.0 | 303: 312, 410: 10 |
 
-- Exactly 500 units reserved; outcome 312 `CONFIRMED` (every payment in time), 188 `EXPIRED` (stock returned).
-- 0 rate-limit answers, 0 server errors, 0 network failures, 0 retries; every check passed.
-- At the peak the stack used about 8 of its 10 cores (NGINX 5.2, the three Order Services 2.3); Redis, Kafka and PostgreSQL barely registered.
-- Checkout to payment link: p50 7.8 s, max 9.5 s. All 500 winners arrive within 3 s and one order processor works through them; the least time left to pay when a link appeared was 27.8 s of 30.
-
-> The runs below were made at commit `c973ece`, before PostgreSQL took over the payment decision and before Redis stopped keeping holds. They went through `localhost:8000` (Docker's port proxy) without CPU pinning. Checkout and status polling only got lighter since (`checkout.lua` writes fewer keys).
+- 312 `CONFIRMED` (every payment in time), 188 `EXPIRED` (stock returned); 0 rate-limit answers, 0 server errors, 0 network failures.
+- At the peak the stack used about 8 of its 10 cores (NGINX 5.2, the three Order Services 2.3); Redis, Kafka and PostgreSQL barely registered. The ceiling was not reached.
+- Checkout to payment link: p50 7.8 s, max 9.5 s (one order processor works through 500 winners who all arrived within 3 s); the least time left to pay when a link appeared was 27.8 s of 30.
 
 ### Flash sale: 100,000 users within 10 s, 500 units (`load/flash.sh 100000`)
 
 | Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms | Responses |
 |---|---|---|---|---|---|---|---|
-| `GET /v1/sales/{id}` | 100,000 | 10,147 | 0.8 | 9.6 | 58.7 | 120.2 | 200: 100,000 |
-| `POST /v1/sales/{id}/checkout` | 100,000 | 10,153 | 1.1 | 13.4 | 78.6 | 140.8 | 202: 500, 410: 99,500 |
-| `GET /v1/orders/status/{ticket}` | 4,776 | 266 | 0.9 | 6.4 | 24.2 | 109.2 | 200: 4,776 |
-| `POST /fake-pay/{session}/pay` | 280 | 47 | 1.3 | 5.4 | 12.2 | 17.5 | 303: 276, 410: 4 |
+| `GET /v1/sales/{id}` | 100,000 | 10,101 | 0.2 | 0.4 | 0.5 | 10.8 | 200: 100,000 |
+| `POST /v1/sales/{id}/checkout` | 100,000 | 10,105 | 0.5 | 0.9 | 1.4 | 42.4 | 202: 500, 410: 99,500 |
+| `GET /v1/orders/status/{ticket}` | 6,468 | 261 | 0.7 | 1.1 | 1.2 | 3.1 | 200: 6,468 |
+| `POST /fake-pay/{session}/pay` | 314 | 58 | 0.7 | 1.1 | 1.3 | 1.6 | 303: 300, 410: 14 |
 
-- Exactly 500 units reserved; outcome 265 `CONFIRMED`, 224 `EXPIRED` (stock returned), 11 `REFUNDED` (paid at the deadline and lost the race to expiry, by design).
-- 0 rate-limit answers, 0 server errors, 0 network failures.
-- Checkout to payment link: p50 1.3 s, p95 2.4 s, max 2.8 s.
-- Checks passed: `products.sold` = `CONFIRMED` orders, never above 500; `stock` = 500 - `products.sold` once everything has settled; no user with two live orders; every expired order's unit returned (no `FAILED` orders).
+300 `CONFIRMED`, 200 `EXPIRED`; 0 errors of any kind. The checkout peak is the offered rate (100,000 users over 10 s), not a ceiling. Checkout to payment link: p50 9.7 s, max 11.7 s.
 
 ### Flash sale: 10,000 users within 10 s, 500 units (`load/flash.sh 10000`)
 
 | Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms |
 |---|---|---|---|---|---|---|
-| `GET /v1/sales/{id}` | 10,000 | 1,041 | 0.2 | 0.5 | 0.8 | 7.2 |
-| `POST /v1/sales/{id}/checkout` | 10,000 | 1,041 | 0.3 | 2.3 | 4.3 | 9.3 |
-| `GET /v1/orders/status/{ticket}` | 4,522 | 255 | 0.7 | 1.3 | 1.5 | 4.1 |
+| `GET /v1/sales/{id}` | 10,000 | 1,049 | 0.1 | 0.3 | 0.3 | 3.5 |
+| `POST /v1/sales/{id}/checkout` | 10,000 | 1,049 | 0.2 | 0.9 | 7.0 | 25.4 |
+| `GET /v1/orders/status/{ticket}` | 4,610 | 258 | 0.6 | 1.1 | 1.3 | 1.7 |
 
-Outcome 283 `CONFIRMED`, 210 `EXPIRED`, 7 `REFUNDED`; 0 errors; all checks passed.
+273 `CONFIRMED`, 216 `EXPIRED`, 11 `REFUNDED` (paid at the deadline and lost the race to expiry, by design); 0 errors.
 
 ### Backlog: processors throttled to 200 messages/s, 10,000 users and units (`load/backlog.sh`)
 
@@ -232,11 +211,23 @@ The queue takes about 50 s to drain while the payment window is 30 s, so the tes
 
 | Measure | Result |
 |---|---|
-| Slowest checkout to payment link | 43.1 s (longer than the 30 s window) |
+| Slowest checkout to payment link | 50.4 s (longer than the 30 s window) |
 | Least time left to pay when a link appeared | 27.8 s of 30 s |
 | Queued tickets given up while waiting | 0 (0 `FAILED` orders) |
-| Status polls | 237,456 at up to 5,072 req/s, p99 2.7 ms |
-| Outcome | 4,942 `CONFIRMED` (every payer), 5,058 `EXPIRED` |
+| Status polls | 275,901 at up to 5,096 req/s, p99 0.7 ms |
+| Outcome | 5,025 `CONFIRMED` (every payer), 4,975 `EXPIRED` |
+
+### Oversell demo: five ways to sell 500 units to 5,000 buyers at once (`load/oversell_demo.sh`)
+
+| Strategy | Told yes | Oversold | Seconds | p99 ms |
+|---|---|---|---|---|
+| Naive `SELECT` then `UPDATE` | 5,000 | **4,500** | 3.87 | 3,828 |
+| `SELECT ... FOR UPDATE` | 500 | no | 4.25 | 4,210 |
+| Optimistic `version` column | 500 | no | 10.64 | 10,635 |
+| `UPDATE ... WHERE stock > 0` | 500 | no | 0.55 | 549 |
+| Redis Lua script | 500 | no | 0.02 | 15.4 |
+
+With a 20 ms `lock_timeout`, `FOR UPDATE` gave 2,293 of the 5,000 buyers an error instead of an answer. The trade-offs are in [CASE_STUDY.md](CASE_STUDY.md), section 3.3.
 
 ## Repository layout
 

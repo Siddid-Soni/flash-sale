@@ -271,7 +271,7 @@ async fn set_status_only_moves_forward() {
     cleanup(&mut con, sale).await;
 }
 
-/// The roadmap's test: a flood of checkouts for 500 units. 10,000 distinct
+/// The design's test: a flood of checkouts for 500 units. 10,000 distinct
 /// users; 500 of them also fire a second request with another key, 500 retry
 /// with the same key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

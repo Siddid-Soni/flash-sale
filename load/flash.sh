@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Steps 37-38: N users (default 10,000; the design target is 100,000) arrive within
+# N users (default 10,000; the design target is 100,000) arrive within
 # ARRIVAL_SECS (10) of the sale opening and try to buy one of UNITS (500) units through
 # NGINX and three Order Service replicas. PAY_RATIO of the winners pay, a few pay too
 # late, the rest abandon. Afterwards the script waits for the system to settle and asserts
