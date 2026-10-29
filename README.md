@@ -36,7 +36,7 @@ The Order Service serves only checkout and status, on Redis and Kafka; it reache
 
 ### Where the frontend runs, and how to deploy it
 
-The frontend has no container or service of its own in this repository. It is a static build: `npm run build` in `web/` writes `web/dist` (Preact + Vite, about 17 kB gzipped, hashed file names). For local runs only, `gateway/Dockerfile` builds it and copies `web/dist` into the NGINX image, so the gateway serves the pages on `:8000` next to the API. That keeps the compose stack to one entry point, but it ties every frontend change to a gateway rebuild and puts page loads on the same NGINX that takes the checkout spike.
+Locally, the frontend is built into the gateway's Docker image: `gateway/Dockerfile` runs `npm run build` in `web/` (Preact + Vite, about 17 kB gzipped, hashed file names) and copies `web/dist` into NGINX, so the gateway serves the UI on `:8000` next to the API. There is no separate frontend container. That keeps the local stack to one entry point, but it is not how it should run in production: every frontend change would need a gateway rebuild, and page loads would land on the same NGINX that takes the checkout spike.
 
 In production it should be deployed separately, as the diagram shows (Frontend as the CDN's origin):
 
