@@ -13,14 +13,15 @@ WORK=$(mktemp -d)
 # Separate cores for the generator and the stack (PIN_CPUS=0 turns it off), so the generator
 # cannot take CPU from the system it measures: by default the first ~30% of the cores run the
 # generator, the rest the whole stack (compose override load/compose.pin.yml)
-PIN_CPUS=${PIN_CPUS:-1}
+# Linux only (taskset, and Docker's own cpuset); off elsewhere.
+if command -v taskset >/dev/null && [ "$(uname -s)" = Linux ]; then PIN_CPUS=${PIN_CPUS:-1}; else PIN_CPUS=0; fi
 # No gateway access log during a run (GATEWAY_ACCESS_LOG=1 keeps it): one line per request, through
 # Docker's log collection, is work outside what the test measures
 export GATEWAY_ACCESS_LOG=${GATEWAY_ACCESS_LOG:-0}
 # Likewise the services' own per-request log line (actix's Logger); everything else stays at info
 export RUST_LOG=${RUST_LOG:-info,actix_web::middleware::logger=warn}
 if [ "$PIN_CPUS" = 1 ]; then
-  cores=$(nproc)
+  cores=$(getconf _NPROCESSORS_ONLN)
   gen=$(( cores * 3 / 10 )); [ "$gen" -lt 1 ] && gen=1
   GEN_CPUS=${GEN_CPUS:-0-$((gen - 1))}
   export STACK_CPUS=${STACK_CPUS:-$gen-$((cores - 1))}
@@ -58,6 +59,7 @@ start_stack() {
 # Waits (up to 3 minutes) until the host has few of them.
 wait_ports_free() {
   local i tw
+  command -v ss >/dev/null || return 0   # ss is Linux's; elsewhere, no wait
   for i in $(seq 60); do
     tw=$(ss -s | sed -n 's/.*timewait \([0-9]*\).*/\1/p' | head -1)
     [ "${tw:-0}" -lt 3000 ] && return 0
@@ -76,8 +78,12 @@ restore_defaults() {
 
 # After start_stack: the addresses the generator uses. The gateway and the provider are reached
 # at their container addresses (the host routes to the compose network directly), unless
-# BASE_URL was given.
+# BASE_URL was given. Only on Linux: with Docker Desktop (macOS, Windows) the containers run in a
+# VM whose addresses the host cannot reach, so the generator goes through localhost:8000.
 target_urls() {
+  if [ -z "$GENERATOR_BASE_URL" ] && [ "$(uname -s)" != Linux ]; then
+    GENERATOR_BASE_URL=$BASE_URL
+  fi
   if [ -z "$GENERATOR_BASE_URL" ]; then
     GENERATOR_BASE_URL="http://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
       "$(docker compose ps -q gateway)")"
@@ -106,21 +112,11 @@ insert_users() {
 }
 
 # create_sale UNITS START_IN_SECS: prints the sale id. Admin routes answer 403 from the host, so the
-# call is made from inside the gateway container.
+# gateway container's create-sale command makes the call (and retries while the services start).
 create_sale() {
-  local start name resp
-  start=$(date -u -d "+$2 seconds" +%FT%TZ)
-  name="load-$(date +%s)"
-  # Retried for up to a minute: right after `up` the site service can take a while to start
-  # listening, and until then the gateway answers 502
-  local i
-  for i in $(seq 30); do
-    resp=$(docker compose exec -T gateway wget -qO- \
-      --header "X-Admin-Token: $ADMIN_TOKEN" --header 'Content-Type: application/json' \
-      --post-data "{\"name\":\"$name\",\"price_cents\":49900,\"total_inventory\":$1,\"sale_start_time\":\"$start\"}" \
-      http://127.0.0.1/v1/admin/sales </dev/null 2>/dev/null) && break
-    sleep 2
-  done
+  local resp
+  resp=$(docker compose exec -T -e ADMIN_TOKEN="$ADMIN_TOKEN" gateway \
+    create-sale "load-$(date +%s)" "$1" 49900 "$2" </dev/null 2>/dev/null) || true
   jq -er '.id' <<<"$resp" || { echo "could not create the sale: $resp" >&2; return 1; }
 }
 

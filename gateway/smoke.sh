@@ -64,11 +64,7 @@ fi
 code=$(call -X POST -H 'X-Forwarded-For: 172.28.0.7' -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' -d '{}' "$BASE/v1/admin/sales")
 [ "$code" = 403 ] && pass "admin: a forged X-Forwarded-For does not open it" || fail "admin: a forged X-Forwarded-For does not open it" "status $code"
 
-START=$(date -u -d '+25 seconds' +%Y-%m-%dT%H:%M:%SZ)
-sale_json=$(docker compose exec -T gateway wget -qO- \
-    --header "X-Admin-Token: $ADMIN_TOKEN" --header 'Content-Type: application/json' \
-    --post-data "{\"name\":\"Smoke phone\",\"price_cents\":49900,\"total_inventory\":5,\"sale_start_time\":\"$START\"}" \
-    http://127.0.0.1/v1/admin/sales 2>/dev/null)
+sale_json=$(docker compose exec -T -e ADMIN_TOKEN="$ADMIN_TOKEN" gateway create-sale "Smoke phone" 5 49900 25 2>/dev/null)
 SALE=$(echo "$sale_json" | jq -r '.id // empty' 2>/dev/null)
 if [ -n "$SALE" ]; then
     pass "admin: from inside the gateway container the sale is created (id $SALE)"

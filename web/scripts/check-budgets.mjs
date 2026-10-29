@@ -51,15 +51,21 @@ function walk(directory) {
   return files;
 }
 
+const WINDOWS = process.platform === 'win32';
+
 function which(command) {
-  const result = spawnSync('which', [command], { encoding: 'utf8' });
-  return result.status === 0 ? result.stdout.trim() : null;
+  const result = spawnSync(WINDOWS ? 'where' : 'which', [command], { encoding: 'utf8' });
+  return result.status === 0 ? result.stdout.split(/\r?\n/)[0].trim() : null;
 }
 
 /** `spawnSync`'s result shape (status, stderr), without blocking the event loop */
 function run(command, args, { timeout, env }) {
   return new Promise((resolveRun) => {
-    const child = spawn(command, args, { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    // npm's launchers on Windows are .cmd files, which only start through a shell
+    const viaShell = WINDOWS && /\.(cmd|bat)$/i.test(command);
+    const child = viaShell
+      ? spawn([command, ...args].map((arg) => `"${arg}"`).join(' '), { env, shell: true, stdio: ['ignore', 'ignore', 'pipe'] })
+      : spawn(command, args, { env, stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
     child.stderr.on('data', (chunk) => (stderr += chunk));
     const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
@@ -77,7 +83,7 @@ function run(command, args, { timeout, env }) {
 function findLighthouse() {
   const candidates = [
     process.env.LIGHTHOUSE_BIN,
-    join(PROJECT, 'node_modules', '.bin', 'lighthouse'),
+    join(PROJECT, 'node_modules', '.bin', WINDOWS ? 'lighthouse.cmd' : 'lighthouse'),
     which('lighthouse'),
   ];
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? null;
@@ -91,8 +97,19 @@ function findChrome() {
     which('chromium'),
     which('chromium-browser'),
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    ...windowsChromePaths(),
   ];
   return candidates.find((candidate) => candidate && existsSync(candidate)) ?? null;
+}
+
+/** The usual Chrome and Edge install paths on Windows (none elsewhere) */
+function windowsChromePaths() {
+  if (!WINDOWS) return [];
+  const roots = [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA];
+  return roots.filter(Boolean).flatMap((root) => [
+    join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+  ]);
 }
 
 async function serveDist() {

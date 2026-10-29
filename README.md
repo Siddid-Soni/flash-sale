@@ -50,7 +50,7 @@ A frontend deploy is then an upload and a purge of `index.html`, with no gateway
 
 ## Quick start
 
-Needs Docker with compose v2. The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
+Needs only Docker with compose v2 (Docker Desktop on Windows and macOS); the commands are the same in PowerShell, cmd and bash. The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
 
 ```bash
 # 1. Start everything. The gateway image builds the frontend (web/) and serves it,
@@ -58,10 +58,10 @@ Needs Docker with compose v2. The first build compiles the Rust binaries and the
 docker compose --profile app up -d --build
 
 # 2. Create a sale: 10 units, opening in 30 s. Prints its link
-scripts/create_sale.sh "Phone" 10 49900 30
+docker compose exec gateway create-sale "Phone" 10 49900 30
 
-# 3. Open the UI, pick the sale, buy when it opens, pay on the provider's page
-xdg-open http://localhost:8000        # macOS: open http://localhost:8000
+# 3. Open http://localhost:8000 in a browser, pick the sale, buy when it opens,
+#    pay on the provider's page
 
 # 4. Stop (add -v to delete the data too)
 docker compose --profile app down
@@ -69,18 +69,25 @@ docker compose --profile app down
 
 Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, the order becomes `CONFIRMED` within a second or so. A guest can buy one unit per sale, so open a private window to buy again. For a scripted run of the same steps in a browser, see `npm run demo` in [web/README.md](web/README.md#browser-run-through).
 
+### On Windows, macOS and Linux
+
+- **Running and using the app** (above, and [Creating sales](#creating-sales)) needs only Docker; the commands are the same everywhere.
+- **`npm run demo` and `npm run budgets`** need Node 20+ and an installed Chrome, Chromium or Edge, which they find on all three.
+- **The bash scripts** (`gateway/smoke.sh`, `load/*.sh`) need bash, curl and jq: Linux or macOS as they are, Windows through WSL2 or Git Bash. The load harness pins the generator and the stack to separate cores and reaches the containers by their own addresses only on Linux; elsewhere it runs unpinned through `localhost:8000`, which is slower, so its numbers are not comparable with the benchmarks below (measured on Linux).
+- The repository keeps shell scripts with LF line endings on every checkout (`.gitattributes`), since CRLF would break them and the gateway image.
+
 ## Creating sales
 
-`scripts/create_sale.sh [name] [units] [price_cents] [opens_in_seconds]` creates a sale and prints it with its page link. The defaults are `Phone`, 500 units, `49900` ($499.00) and 60 seconds:
+`docker compose exec gateway create-sale [name] [units] [price_cents] [opens_in_seconds]` creates a sale and prints it with its page link. The defaults are `Phone`, 500 units, `49900` ($499.00) and 60 seconds:
 
 ```bash
-scripts/create_sale.sh                            # Phone, 500 units, $499.00, opens in 60 s
-scripts/create_sale.sh "Pixel 10" 3 79900 30      # 3 units at $799.00, opens in 30 s
-scripts/create_sale.sh "Open now" 10 19900 0      # opens immediately
-ADMIN_TOKEN=... scripts/create_sale.sh            # another admin token (default: dev-admin-token from .env)
+docker compose exec gateway create-sale                          # Phone, 500 units, $499.00, opens in 60 s
+docker compose exec gateway create-sale "Pixel 10" 3 79900 30    # 3 units at $799.00, opens in 30 s
+docker compose exec gateway create-sale "Open now" 10 19900 0    # opens immediately
+docker compose exec -e ADMIN_TOKEN=... gateway create-sale       # another admin token (default: dev-admin-token from .env)
 ```
 
-The admin route is refused from the host with `403` on purpose, so the script posts from inside the gateway container. Without the gateway (services run with cargo), post to the site service on `:8082` directly; see [Running locally with cargo](#running-locally-with-cargo).
+The admin route is refused from the host with `403` on purpose, so the command ([gateway/create-sale](gateway/create-sale)) runs inside the gateway container and posts from there; that is also why it works the same on every OS. Without the gateway (services run with cargo), post to the site service on `:8082` directly; see [Running locally with cargo](#running-locally-with-cargo).
 
 ## Running locally with cargo
 
@@ -234,10 +241,10 @@ With a 20 ms `lock_timeout`, `FOR UPDATE` gave 2,293 of the 5,000 buyers an erro
 | `src/queue.rs` | Kafka producer and topic creation |
 | `src/payment/` | Provider interface and its HTTP client, the fake provider (state, API, payment page), webhook signing, webhook dispatcher |
 | `src/actions/`, `src/models.rs`, `src/schema.rs` | PostgreSQL queries (Diesel), models |
-| `scripts/` | Lua: `checkout`, `return_unit`, `set_status`, and the fake provider's `fakepay_*`; `create_sale.sh` (see [Creating sales](#creating-sales)) |
+| `scripts/` | Lua: `checkout`, `return_unit`, `set_status`, and the fake provider's `fakepay_*` |
 | `migrations/` | The schema migrations (embedded in the Order Service, run at startup) |
 | `tests/` | Integration tests against real PostgreSQL, Redis and Kafka |
-| `gateway/` | NGINX configuration, bot list, njs JWT reader, `smoke.sh` ([README](gateway/README.md)) |
+| `gateway/` | NGINX configuration, bot list, njs JWT reader, `create-sale` ([Creating sales](#creating-sales)), `smoke.sh` ([README](gateway/README.md)) |
 | `web/` | Preact + Vite storefront ([README](web/README.md)); `scripts/demo-run.mjs` drives a purchase in a real browser (`npm run demo`) |
 | `load/` | Load generator, backlog test, oversell demo, `compose.pin.yml` (CPU pinning for load runs), `RESULTS.md` ([README](load/README.md)) |
 | `docker-compose.yml`, `Dockerfile` | Infrastructure and the application image (all five binaries) |

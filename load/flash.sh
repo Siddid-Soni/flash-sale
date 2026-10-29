@@ -81,7 +81,7 @@ echo "INFO  turned away by rate limits (429): $RATE_LIMITED"
   echo
   echo "## $(date -u +'%F %H:%M') UTC: flash sale, $N users, $UNITS units"
   echo
-  echo "Users arrive uniformly within ${ARRIVAL_SECS} s of the sale opening; pay ratio $PAY_RATIO, of which ${LATE_RATIO} pay only after the link expired and ${RACE_RATIO} pay 150 ms before it, racing the expiration worker; poll every ${POLL_MS} ms; payment window ${PAYMENT_WINDOW_SECS} s; ${SESSION_SAMPLE} users got their token from POST /v1/session, the rest were signed locally. Everything on one machine ($(nproc) cores): the generator, NGINX, three Order Service replicas, one order processor, one expiration worker, PostgreSQL, Redis and Kafka in Docker. Each user has its own X-Forwarded-For (gateway started with GATEWAY_TRUST_XFF=1). Real load for 100,000 users is the same script with N=100000 (see load/README.md)."
+  echo "Users arrive uniformly within ${ARRIVAL_SECS} s of the sale opening; pay ratio $PAY_RATIO, of which ${LATE_RATIO} pay only after the link expired and ${RACE_RATIO} pay 150 ms before it, racing the expiration worker; poll every ${POLL_MS} ms; payment window ${PAYMENT_WINDOW_SECS} s; ${SESSION_SAMPLE} users got their token from POST /v1/session, the rest were signed locally. Everything on one machine ($(getconf _NPROCESSORS_ONLN) cores): the generator, NGINX, three Order Service replicas, one order processor, one expiration worker, PostgreSQL, Redis and Kafka in Docker. Each user has its own X-Forwarded-For (gateway started with GATEWAY_TRUST_XFF=1). Real load for 100,000 users is the same script with N=100000 (see load/README.md)."
   echo
   setup_note
   echo

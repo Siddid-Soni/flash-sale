@@ -1,0 +1,35 @@
+#!/bin/sh
+# Create a sale through the admin route. Runs inside the gateway container (the gateway
+# refuses /v1/admin/ from the host), so the only thing the host needs is Docker:
+#
+#   docker compose exec gateway create-sale [name] [units] [price_cents] [opens_in_seconds]
+#   docker compose exec gateway create-sale "Phone" 500 49900 60     # the defaults
+#
+# Prints the created sale as JSON on stdout and its page link on stderr.
+# ADMIN_TOKEN defaults to the development value in .env; pass another with
+# `docker compose exec -e ADMIN_TOKEN=... gateway create-sale`.
+set -eu
+
+name=${1:-Phone}
+units=${2:-500}
+price=${3:-49900}
+opens_in=${4:-60}
+token=${ADMIN_TOKEN:-dev-admin-token}
+
+start=$(date -u -d "@$(( $(date +%s) + opens_in ))" +%Y-%m-%dT%H:%M:%SZ)
+body=$(printf '{"name":"%s","price_cents":%d,"total_inventory":%d,"sale_start_time":"%s"}' \
+  "$name" "$price" "$units" "$start")
+
+# Retried for up to a minute: right after `docker compose up` the site service can take a
+# while to start listening, and until then the gateway answers 502
+attempt=1
+until sale=$(wget -qO- --header "X-Admin-Token: $token" --header 'Content-Type: application/json' \
+    --post-data "$body" http://127.0.0.1/v1/admin/sales 2>/dev/null); do
+  [ "$attempt" -ge 30 ] && { echo "could not create the sale (is the stack up?)" >&2; exit 1; }
+  attempt=$((attempt + 1))
+  sleep 2
+done
+
+echo "$sale"
+id=$(echo "$sale" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+echo "Opens at $start: http://localhost:8000/?sale=$id" >&2

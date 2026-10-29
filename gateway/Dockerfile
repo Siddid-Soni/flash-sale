@@ -19,6 +19,9 @@ FROM nginx:1.28-alpine
 COPY gateway/nginx.conf /etc/nginx/nginx.conf
 COPY gateway/jwt.js gateway/bots.conf gateway/realip.conf gateway/realip-trusted.conf gateway/payment_provider_ips.conf gateway/access_log.conf /etc/nginx/gateway/
 COPY gateway/docker-entrypoint.d/ /docker-entrypoint.d/
-RUN chmod +x /docker-entrypoint.d/25-realip.sh /docker-entrypoint.d/26-access-log.sh && rm -f /etc/nginx/conf.d/default.conf
+# The admin command for creating sales (`docker compose exec gateway create-sale`)
+COPY gateway/create-sale /usr/local/bin/create-sale
+RUN chmod +x /docker-entrypoint.d/25-realip.sh /docker-entrypoint.d/26-access-log.sh /usr/local/bin/create-sale \
+    && rm -f /etc/nginx/conf.d/default.conf
 COPY --from=web /web/dist /usr/share/nginx/html
 EXPOSE 80

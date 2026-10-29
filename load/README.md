@@ -19,10 +19,11 @@ before the sale; `SESSION_SAMPLE` (default 50) users call `POST /v1/session` for
 - The generator sends to the gateway container's own address on the compose network (the host routes there
   directly), not to `localhost:8000`: through the published port every connection also passes Docker's userland
   proxy, which used ~9 cores at 30k req/s and capped earlier runs. Payments go to the provider's container address
-  (`172.28.0.50:8090`) the same way. `BASE_URL` (and `PROVIDER_URL`) override both.
+  (`172.28.0.50:8090`) the same way. `BASE_URL` (and `PROVIDER_URL`) override both. Linux only: with Docker
+  Desktop (macOS, Windows through WSL2) the containers live in a VM, so there the generator uses `localhost:8000`.
 - The generator runs on its own cores (`taskset`) and the whole stack on the rest (`load/compose.pin.yml`, a cpuset
   per service), so the generator cannot take CPU from what it measures: by default the first ~30% of the cores
-  (`GEN_CPUS`, `0-5` on 20 cores) and the rest (`STACK_CPUS`). `PIN_CPUS=0` turns it off. The report says which.
+  (`GEN_CPUS`, `0-5` on 20 cores) and the rest (`STACK_CPUS`). `PIN_CPUS=0` turns it off; it is always off outside Linux. The report says which.
 - The replicas publish no port. The scripts start the gateway with `GATEWAY_TRUST_XFF=1` and the
   generator sends a distinct `X-Forwarded-For` (`10.x.y.z` from the user's index) and a browser-like `User-Agent`;
   otherwise every request would come from the bridge address and meet the per-IP limits by design.

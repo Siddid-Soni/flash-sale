@@ -38,9 +38,10 @@ npm run demo -- <saleId>     # an existing sale that has not sold out, instead o
 ```
 
 `scripts/demo-run.mjs` drives Chromium through Playwright: the countdown, the buy button, the fake provider's payment
-page, and back to "Order confirmed", saving a screenshot of each step to `demo-shots/`. It creates the sale through the
-gateway container and sends a normal browser user agent, since the gateway refuses `HeadlessChrome`. `CHROMIUM_PATH`
-(default `/usr/bin/chromium`), `DEMO_BASE_URL` (default `http://localhost:8000`) and `DEMO_OUT` (default `demo-shots`)
+page, and back to "Order confirmed", saving a screenshot of each step to `demo-shots/`. It creates the sale with the gateway
+container's `create-sale` command and sends a normal browser user agent, since the gateway refuses `HeadlessChrome`. It
+uses an installed Chrome, Chromium or Edge, looked up in the usual places on Linux, macOS and Windows. `CHROMIUM_PATH`
+(another browser), `DEMO_BASE_URL` (default `http://localhost:8000`) and `DEMO_OUT` (default `demo-shots`)
 change the browser, the target and where the screenshots land.
 
 ## Tests and budgets

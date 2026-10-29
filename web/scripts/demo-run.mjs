@@ -6,52 +6,50 @@
 //   npm run demo                 # new sale, opens in 12 s
 //   npm run demo -- <saleId>     # an existing sale that has not sold out
 //
-// Needs the stack up (docker compose --profile app up -d --build) and a Chromium:
-// CHROMIUM_PATH, default /usr/bin/chromium.
+// Needs the stack up (docker compose --profile app up -d --build) and an installed
+// Chrome, Chromium or Edge (found in the usual places on Linux, macOS and Windows;
+// CHROMIUM_PATH picks another).
 import { execFileSync } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import { chromium } from 'playwright-core';
 
 const BASE = process.env.DEMO_BASE_URL ?? 'http://localhost:8000';
 const OUT = process.env.DEMO_OUT ?? 'demo-shots';
-const CHROMIUM = process.env.CHROMIUM_PATH ?? '/usr/bin/chromium';
+const CHROMIUM = process.env.CHROMIUM_PATH ?? findBrowser();
 // The gateway's bot filter refuses the HeadlessChrome user agent.
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-async function createSale() {
-  // The admin route is refused from the host, so post from inside the gateway container.
-  // Retried for up to a minute: right after `docker compose up` the site service can take
-  // a while to start listening, and until then the gateway answers 502.
-  for (let attempt = 1; ; attempt++) {
-    const start = new Date(Date.now() + 12_000).toISOString().replace(/\.\d+Z$/, 'Z');
-    const body = JSON.stringify({
-      name: 'Demo Phone',
-      price_cents: 49900,
-      total_inventory: 5,
-      sale_start_time: start,
-    });
-    try {
-      const res = execFileSync(
-        'docker',
-        [
-          'compose', 'exec', '-T', 'gateway', 'wget', '-qO-',
-          '--header', 'X-Admin-Token: dev-admin-token',
-          '--header', 'Content-Type: application/json',
-          '--post-data', body,
-          'http://127.0.0.1/v1/admin/sales',
-        ],
-        { stdio: ['ignore', 'pipe', 'pipe'] },
-      );
-      return JSON.parse(res.toString()).id;
-    } catch (error) {
-      if (attempt >= 30) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-  }
+function findBrowser() {
+  const windowsRoots = [process.env.PROGRAMFILES, process.env['PROGRAMFILES(X86)'], process.env.LOCALAPPDATA];
+  const candidates = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    ...windowsRoots.filter(Boolean).flatMap((root) => [
+      join(root, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    ]),
+  ];
+  const found = candidates.find((path) => existsSync(path));
+  if (!found) throw new Error('no Chrome, Chromium or Edge found; set CHROMIUM_PATH');
+  return found;
 }
 
-const sale = process.argv[2] ?? (await createSale());
+function createSale() {
+  // The gateway's create-sale command (it retries while the services start) prints the sale as JSON
+  const out = execFileSync(
+    'docker',
+    ['compose', 'exec', '-T', 'gateway', 'create-sale', 'Demo Phone', '5', '49900', '12'],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
+  return JSON.parse(out.toString()).id;
+}
+
+const sale = process.argv[2] ?? createSale();
 mkdirSync(OUT, { recursive: true });
 let step = 0;
 const shot = async (page, name) => {
