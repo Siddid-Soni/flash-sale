@@ -50,15 +50,16 @@ A frontend deploy is then an upload and a purge of `index.html`, with no gateway
 
 ## Quick start
 
-Needs Docker with compose v2, and Node 20+ with Chromium for the demo. The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
+Needs Docker with compose v2. The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
 
 ```bash
 docker compose --profile app up -d --build    # everything: PostgreSQL, Redis, Kafka, the services, and the gateway serving the frontend on :8000
-(cd web && npm install && npm run demo)       # creates a sale, buys and pays in a real browser; screenshots in web/demo-shots/
+scripts/create_sale.sh "Phone" 10 49900 30    # a 10-unit sale opening in 30 s; prints its link
+# open http://localhost:8000, pick the sale, buy when it opens, pay on the provider's page
 docker compose --profile app down             # stop (add -v to delete the data too)
 ```
 
-To click through it yourself, create a sale with `scripts/create_sale.sh` ([Creating sales](#creating-sales)) and open <http://localhost:8000>. Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, the order becomes `CONFIRMED` within a second or so.
+Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, the order becomes `CONFIRMED` within a second or so. A guest can buy one unit per sale, so open a private window to buy again. For a scripted run of the same steps in a browser, see `npm run demo` in [web/README.md](web/README.md#browser-run-through).
 
 ## Creating sales
 
