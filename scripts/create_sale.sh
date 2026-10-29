@@ -20,9 +20,15 @@ body=$(printf '{"name":"%s","price_cents":%d,"total_inventory":%d,"sale_start_ti
   "$name" "$price" "$units" "$start")
 
 cd "$(dirname "$0")/.."
-sale=$(docker compose exec -T gateway wget -qO- \
-  --header "X-Admin-Token: $token" --header 'Content-Type: application/json' \
-  --post-data "$body" http://127.0.0.1/v1/admin/sales)
+# Retried for up to a minute: right after `docker compose up` the site service can take a
+# while to start listening, and until then the gateway answers 502
+for attempt in $(seq 30); do
+  sale=$(docker compose exec -T gateway wget -qO- \
+    --header "X-Admin-Token: $token" --header 'Content-Type: application/json' \
+    --post-data "$body" http://127.0.0.1/v1/admin/sales 2>/dev/null) && break
+  [ "$attempt" = 30 ] && { echo "could not create the sale (is the stack up?)" >&2; exit 1; }
+  sleep 2
+done
 
 echo "$sale"
 id=$(grep -oE '"id":[0-9]+' <<<"$sale" | cut -d: -f2)

@@ -50,31 +50,15 @@ A frontend deploy is then an upload and a purge of `index.html`, with no gateway
 
 ## Quick start
 
-Needs Docker with compose v2 (and Node 20+ with Chromium for the optional browser check). The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
+Needs Docker with compose v2, and Node 20+ with Chromium for the demo. The first build compiles the Rust binaries and the frontend, so it takes a few minutes.
 
 ```bash
-# Start: PostgreSQL, two Redis (inventory, read cache) and Kafka, then the app:
-# 3 Order Services, the site service, order processor, expiration worker,
-# fake payment provider (:8090) and NGINX (:8000)
-docker compose up -d
-docker compose --profile app up -d --build
-
-# Check it answers
-curl -s localhost:8000/gateway-health          # ok
-curl -s localhost:8000/v1/sales                # [] on a fresh database
-
-# Create a sale that opens in a minute; open the link it prints
-scripts/create_sale.sh
-
-# Optional: buy one end to end in a real browser (screenshots in web/demo-shots/)
-(cd web && npm install && npm run demo)
-
-# Stop the app (data kept), or remove everything including the data
-docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider
-docker compose down -v
+docker compose --profile app up -d --build    # everything: PostgreSQL, Redis, Kafka, the services, and the gateway serving the frontend on :8000
+(cd web && npm install && npm run demo)       # creates a sale, buys and pays in a real browser; screenshots in web/demo-shots/
+docker compose --profile app down             # stop (add -v to delete the data too)
 ```
 
-<http://localhost:8000> lists the sales still selling, with a search box; each links to its page, `/?sale=<id>`. Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, its webhook arrives within a second or so and the order becomes `CONFIRMED`. `docker compose --profile app stop` alone would also stop PostgreSQL, Redis and Kafka.
+To click through it yourself, create a sale with `scripts/create_sale.sh` ([Creating sales](#creating-sales)) and open <http://localhost:8000>. Buying sends you to the fake provider's payment page (`http://localhost:8090/fake-pay/...`, outside the gateway, as a real provider would be); after paying, the order becomes `CONFIRMED` within a second or so.
 
 ## Creating sales
 

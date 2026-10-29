@@ -111,10 +111,10 @@ create_sale() {
   local start name resp
   start=$(date -u -d "+$2 seconds" +%FT%TZ)
   name="load-$(date +%s)"
-  # A few tries: right after `up` recreates the site container, NGINX can still hold its old
-  # address for up to 5 s (`resolver valid=5s`) and answers 502
+  # Retried for up to a minute: right after `up` the site service can take a while to start
+  # listening, and until then the gateway answers 502
   local i
-  for i in $(seq 10); do
+  for i in $(seq 30); do
     resp=$(docker compose exec -T gateway wget -qO- \
       --header "X-Admin-Token: $ADMIN_TOKEN" --header 'Content-Type: application/json' \
       --post-data "{\"name\":\"$name\",\"price_cents\":49900,\"total_inventory\":$1,\"sale_start_time\":\"$start\"}" \

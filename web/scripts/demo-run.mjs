@@ -19,26 +19,39 @@ const CHROMIUM = process.env.CHROMIUM_PATH ?? '/usr/bin/chromium';
 const UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
 
-function createSale() {
+async function createSale() {
   // The admin route is refused from the host, so post from inside the gateway container.
-  const start = new Date(Date.now() + 12_000).toISOString().replace(/\.\d+Z$/, 'Z');
-  const body = JSON.stringify({
-    name: 'Demo Phone',
-    price_cents: 49900,
-    total_inventory: 5,
-    sale_start_time: start,
-  });
-  const res = execFileSync('docker', [
-    'compose', 'exec', '-T', 'gateway', 'wget', '-qO-',
-    '--header', 'X-Admin-Token: dev-admin-token',
-    '--header', 'Content-Type: application/json',
-    '--post-data', body,
-    'http://127.0.0.1/v1/admin/sales',
-  ]);
-  return JSON.parse(res.toString()).id;
+  // Retried for up to a minute: right after `docker compose up` the site service can take
+  // a while to start listening, and until then the gateway answers 502.
+  for (let attempt = 1; ; attempt++) {
+    const start = new Date(Date.now() + 12_000).toISOString().replace(/\.\d+Z$/, 'Z');
+    const body = JSON.stringify({
+      name: 'Demo Phone',
+      price_cents: 49900,
+      total_inventory: 5,
+      sale_start_time: start,
+    });
+    try {
+      const res = execFileSync(
+        'docker',
+        [
+          'compose', 'exec', '-T', 'gateway', 'wget', '-qO-',
+          '--header', 'X-Admin-Token: dev-admin-token',
+          '--header', 'Content-Type: application/json',
+          '--post-data', body,
+          'http://127.0.0.1/v1/admin/sales',
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      return JSON.parse(res.toString()).id;
+    } catch (error) {
+      if (attempt >= 30) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+  }
 }
 
-const sale = process.argv[2] ?? createSale();
+const sale = process.argv[2] ?? (await createSale());
 mkdirSync(OUT, { recursive: true });
 let step = 0;
 const shot = async (page, name) => {
@@ -66,12 +79,16 @@ try {
   await shot(page, 'open');
 
   await buy.click();
-  await page.getByText("You're in").waitFor({ timeout: 10_000 }).catch(() => {});
-  await shot(page, 'queued');
-  await page.getByText('Unit reserved', { exact: true }).waitFor({ timeout: 30_000 });
-  await shot(page, 'reserved');
-
-  // The frontend sends the buyer to the provider's page on its own.
+  // "You're in", then "Unit reserved", then the frontend sends the buyer to the provider's
+  // page on its own. On a quick run the first two last only a moment, so each is captured
+  // only if the page still shows it; the payment page is what the run waits for.
+  for (const [text, name] of [["You're in", 'queued'], ['Unit reserved', 'reserved']]) {
+    const seen = await Promise.race([
+      page.getByText(text, { exact: true }).waitFor({ timeout: 30_000 }).then(() => true),
+      page.waitForURL(/fake-pay/, { timeout: 30_000 }).then(() => false),
+    ]).catch(() => false);
+    if (seen && !/fake-pay/.test(page.url())) await shot(page, name);
+  }
   await page.waitForURL(/fake-pay/, { timeout: 30_000 });
   await shot(page, 'paypage');
   await page.getByRole('button', { name: /^Pay/ }).click();
