@@ -173,20 +173,14 @@ async fn checkout(
     // The event carries everything the processor needs: Redis keeps no record
     // of the ticket
     let event = CheckoutEvent { ticket: ticket.clone(), sale, user: user.id, checkout_ms, idempotency_key: key.clone() };
-    let published = match queue.publish(&event).await {
-        Ok(published) => published,
-        Err(e) => {
-            log::error!("publish of {ticket} failed, compensating: {e}");
-            return compensate(&pool, &mut con, &read_cache, sale, user.id, ticket, &key).await;
-        }
-    };
+    if let Err(e) = queue.publish(&event).await {
+        log::error!("publish of {ticket} failed, compensating: {e}");
+        return compensate(&pool, &mut con, &read_cache, sale, user.id, ticket, &key).await;
+    }
 
     // The reservation stands whether or not this write lands: the processor
-    // creates the order from the message, and until then the user just sees no
-    // place in the queue
+    // creates the order from the message and writes the next status
     let mut status = StatusUpdate::new(OrderStatus::Pending, user.id);
-    status.partition = Some(published.partition);
-    status.offset = Some(published.offset);
     status.sale = Some(sale);
     let mut cache_con = read_cache.get_ref().clone();
     if let Err(e) = cache::set_status(&mut cache_con, &ticket, &status).await {

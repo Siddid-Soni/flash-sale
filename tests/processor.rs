@@ -357,10 +357,10 @@ async fn a_transient_error_is_retried_not_skipped() {
     fx.cleanup().await;
 }
 
-/// Real Kafka: publish a few events, run the consumer loop, see the orders,
-/// the committed offsets and the progress keys
+/// Real Kafka: publish a few events, run the consumer loop, see the orders
+/// and the committed offsets
 #[tokio::test]
-async fn the_consumer_loop_processes_commits_and_reports_progress() {
+async fn the_consumer_loop_processes_and_commits() {
     let mut fx = fixture(20).await;
     fx.env.config.checkout_topic = format!("test.processor.{}", uuid::Uuid::new_v4().simple());
     fx.env.config.checkout_partitions = 3;
@@ -372,37 +372,22 @@ async fn the_consumer_loop_processes_commits_and_reports_progress() {
     let mut published = Vec::new();
     for _ in 0..9 {
         let event = fx.winner().await;
-        let at = queue.publish(&event).await.unwrap();
-        published.push((event, at));
+        queue.publish(&event).await.unwrap();
+        published.push(event);
     }
 
     let (stop, shutdown) = watch::channel(false);
     let processor = Arc::new(fx.processor());
     let run = tokio::spawn({
-        let (config, read_cache) = (config.clone(), fx.env.read_cache.clone());
-        async move { processor::run(&config, processor, read_cache, shutdown).await }
+        let config = config.clone();
+        async move { processor::run(&config, processor, shutdown).await }
     });
 
-    // Per partition: the last message by offset
-    let mut last: std::collections::BTreeMap<i32, (i64, i64)> = Default::default();
-    for (event, at) in &published {
-        let entry = last.entry(at.partition).or_insert((at.offset, event.checkout_ms));
-        if at.offset >= entry.0 {
-            *entry = (at.offset, event.checkout_ms);
-        }
-    }
-
     let deadline = tokio::time::Instant::now() + StdDuration::from_secs(60);
-    let mut read_cache = fx.env.read_cache.clone();
     loop {
-        let mut all_done = true;
-        for (event, _) in &published {
-            all_done &= fx.order(&event.ticket).is_some_and(|o| o.status == OrderState::AwaitingPayment);
-        }
-        for (&partition, &(offset, _)) in &last {
-            let progress = cache::read_progress(&mut read_cache, &config.checkout_topic, partition).await.unwrap();
-            all_done &= progress == Some(offset);
-        }
+        let all_done = published
+            .iter()
+            .all(|event| fx.order(&event.ticket).is_some_and(|o| o.status == OrderState::AwaitingPayment));
         if all_done {
             break;
         }
@@ -414,35 +399,30 @@ async fn the_consumer_loop_processes_commits_and_reports_progress() {
     tokio::time::timeout(StdDuration::from_secs(30), run).await.expect("shutdown in time").unwrap().unwrap();
 
     // Every order has its link; status entries carry it
-    for (event, _) in &published {
+    for event in &published {
         let status = fx.status(&event.ticket).await.unwrap();
         assert_eq!(status.status, OrderStatus::AwaitingPayment);
         assert!(status.payment_url.unwrap().starts_with("http://pay.test/fake-pay/"));
     }
-    // The queue-position progress per partition = the offset of the last message
-    for (&partition, &(offset, _)) in &last {
-        let progress = cache::read_progress(&mut read_cache, &config.checkout_topic, partition).await.unwrap();
-        assert_eq!(progress, Some(offset), "partition {partition}");
-    }
-    // The committed offsets are the next offsets to read
+    // The committed offsets are the next offsets to read: each partition's end
     let reader: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &config.kafka_brokers)
         .set("group.id", processor::GROUP_ID)
         .create()
         .unwrap();
     let mut wanted = TopicPartitionList::new();
-    for &partition in last.keys() {
+    for partition in 0..config.checkout_partitions {
         wanted.add_partition(&config.checkout_topic, partition);
     }
     let committed = reader.committed_offsets(wanted, StdDuration::from_secs(10)).unwrap();
-    for (&partition, &(offset, _)) in &last {
+    for partition in 0..config.checkout_partitions {
+        let (_, end) = reader.fetch_watermarks(&config.checkout_topic, partition, StdDuration::from_secs(10)).unwrap();
+        if end == 0 {
+            continue; // nothing published there, nothing to commit
+        }
         let got = committed.find_partition(&config.checkout_topic, partition).unwrap().offset();
-        assert_eq!(got, Offset::Offset(offset + 1), "partition {partition}");
+        assert_eq!(got, Offset::Offset(end), "partition {partition}");
     }
 
     fx.cleanup().await;
-    let mut con = fx.env.read_cache.0.clone();
-    for &partition in last.keys() {
-        let _: () = con.del(cache::progress_key(&config.checkout_topic, partition)).await.unwrap();
-    }
 }

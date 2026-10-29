@@ -496,3 +496,47 @@ Orders after settling: CONFIRMED 289, EXPIRED 206, REFUNDED 5. Requests turned a
 - [x] server errors (5xx) in the generator's samples (0)
 - [x] network failures in the generator's samples (0)
 
+
+## 2026-10-29 01:25 UTC: flash sale, 100000 users, 500 units
+
+Users arrive uniformly within 3 s of the sale opening; pay ratio 0.6, of which 0.05 pay only after the link expired and 0.05 pay 150 ms before it, racing the expiration worker; poll every 2000 ms; payment window 30 s; 50 users got their token from POST /v1/session, the rest were signed locally. Everything on one machine (20 cores): the generator, NGINX, three Order Service replicas, one order processor, one expiration worker, PostgreSQL, Redis and Kafka in Docker. Each user has its own X-Forwarded-For (gateway started with GATEWAY_TRUST_XFF=1). Real load for 100,000 users is the same script with N=100000 (see load/README.md).
+
+Generator target: http://172.28.0.12 (provider http://172.28.0.50:8090); generator pinned to cores 0-9, the whole stack to cores 10-19.
+
+Finished in 63.6s
+
+Outcomes:
+  confirmed: 312
+  expired: 188
+  sold_out: 99500
+
+| endpoint | requests | peak req/s | p50 ms | p95 ms | p99 ms | max ms | responses |
+|---|---|---|---|---|---|---|---|
+| POST /v1/session | 50 | 20 | 2.9 | 7.1 | 7.5 | 7.5 | 201: 50 |
+| GET /v1/sales/{id} | 100000 | 33795 | 3.1 | 43.2 | 59.7 | 104.0 | 200: 100000 |
+| POST /v1/sales/{id}/checkout | 100000 | 34314 | 6.3 | 86.0 | 119.6 | 182.5 | 202: 500, 410: 99500 |
+| GET /v1/orders/status/{ticket} | 5937 | 263 | 0.8 | 8.1 | 71.7 | 178.7 | 200: 5937 |
+| POST /fake-pay/{session}/pay | 322 | 58 | 0.7 | 1.2 | 3.4 | 6.0 | 303: 312, 410: 10 |
+
+Turned away by rate limits (429): 0; server errors (5xx): 0; network failures: 0
+Retries: 0 after 5xx, 0 after network errors; 0 waits on 429
+Checkout to payment link: 500 users, p50 7820 ms, p95 8975 ms, max 9497 ms; least time left to pay when seen: 27820 ms
+Payments accepted by the provider: 312 (surely in time 293, at the boundary 19, after expiry 0); refused by the provider: 10
+In-time payments not CONFIRMED: 0; late payments not REFUNDED: 0
+
+Orders after settling: CONFIRMED 312, EXPIRED 188. Requests turned away by rate limits (429): 0 (the generator waited `Retry-After` and retried).
+
+- [x] the system settled (no AWAITING_PAYMENT orders, inbox and outbox drained) (converged=1, orders: CONFIRMED 312, EXPIRED 188)
+- [x] CONFIRMED orders equal the payments that arrived in time, and are at most 500 (CONFIRMED 312; payments surely in time 293, at the boundary 19)
+- [x] every payment surely in time ended CONFIRMED (generator's own polling) (0)
+- [x] every payment accepted after the link expired ended REFUNDED (generator's own polling; 0 such) (0)
+- [x] every payment at the boundary of the expiry ended CONFIRMED or REFUNDED (never lost; 19 such) (0)
+- [x] CONFIRMED orders equal users the generator saw CONFIRMED (312)
+- [x] products.sold equals CONFIRMED orders (312)
+- [x] users with two live orders (0)
+- [x] orders still AWAITING_PAYMENT (0)
+- [x] stock:{sale} equals 500 minus products.sold (every unit of an expired order returned once, none of a confirmed one) (188)
+- [x] FAILED orders (no publish failed) (0)
+- [x] server errors (5xx) in the generator's samples (0)
+- [x] network failures in the generator's samples (0)
+

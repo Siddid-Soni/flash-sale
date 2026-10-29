@@ -106,9 +106,9 @@ async fn a_winner_gets_202_and_a_retry_gets_the_same_ticket_with_200() {
     assert!((Utc::now().timestamp_millis() - events[0].checkout_ms).abs() < 5_000);
     let live: Option<String> = env.redis.clone().get(cache::user_live_key(sale, user.id)).await.unwrap();
     assert_eq!(live.as_deref(), Some(ticket.as_str()));
-    // The queue position is stored with the PENDING status
+    // The PENDING status is written to the read cache
     let cached = cache::read_status(&mut env.read_cache.clone(), &ticket).await.unwrap().unwrap();
-    assert_eq!((cached.status, cached.partition, cached.offset), (OrderStatus::Pending, Some(3), Some(0)));
+    assert_eq!(cached.status, OrderStatus::Pending);
 
     // The retry: 200, the same body, no second event, no second unit
     let retry = test::call_service(&app, checkout_request(sale, &user, Some("attempt-1")).to_request()).await;
@@ -262,7 +262,7 @@ impl flash_sale::queue::CheckoutQueue for ArrivesThenFails {
     async fn publish(
         &self,
         event: &flash_sale::queue::CheckoutEvent,
-    ) -> flash_sale::queue::QueueResult<flash_sale::queue::Published> {
+    ) -> flash_sale::queue::QueueResult<()> {
         let session = format!("session-{}", uuid::Uuid::new_v4().simple());
         diesel::insert_into(orders::table)
             .values(&NewOrder {
@@ -344,8 +344,7 @@ async fn status_is_for_the_owner_only() {
     let resp = test::call_service(&app, status_request(ticket, &owner).to_request()).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers().get("Cache-Control").unwrap(), "no-store");
-    // The fake queue stored offset 0: first in its partition
-    assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "PENDING", "position": 1 }));
+    assert_eq!(test::read_body_json::<Value, _>(resp).await, json!({ "status": "PENDING" }));
 
     let resp = test::call_service(&app, status_request(ticket, &stranger).to_request()).await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -428,47 +427,3 @@ async fn status_answers_from_the_read_cache_only() {
     cleanup(&env, sale).await;
 }
 
-#[actix_web::test]
-async fn the_position_follows_processor_progress() {
-    let mut env = common::env().await;
-    // A topic of its own, so the progress key is not shared with other tests
-    env.config.checkout_topic = format!("test.position.{}", uuid::Uuid::new_v4().simple());
-    let topic = env.config.checkout_topic.clone();
-    let (_fake, queue) = common::fake_queue();
-    let app = test_app!(env, queue);
-    let sale = sale(&env, 5, 60).await;
-    let owner = guest(&env);
-
-    // The fake queue stores partition 3, offsets 0, 1, ...; make this offset 7
-    let ticket = {
-        let body: Value = test::call_and_read_body_json(&app, checkout_request(sale, &owner, Some("k")).to_request()).await;
-        body["queue_ticket_id"].as_str().unwrap().to_string()
-    };
-    let mut status = cache::StatusUpdate::new(OrderStatus::Pending, owner.id);
-    status.partition = Some(3);
-    status.offset = Some(7);
-    let mut read_cache = env.read_cache.clone();
-    cache::set_status(&mut read_cache, &ticket, &status).await.unwrap();
-
-    macro_rules! position {
-        () => {{
-            let resp = test::call_service(&app, status_request(&ticket, &owner).to_request()).await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            test::read_body_json::<Value, _>(resp).await["position"].clone()
-        }};
-    }
-
-    // No progress recorded: offset + 1
-    assert_eq!(position!(), json!(8));
-    cache::raise_to(&mut read_cache.0, &cache::progress_key(&topic, 3), 4).await.unwrap();
-    // Cached for ~500 ms per replica: still the old answer
-    assert_eq!(position!(), json!(8));
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    assert_eq!(position!(), json!(3));
-    // Progress past the ticket (stale reads): clamped to 0, not negative
-    cache::raise_to(&mut read_cache.0, &cache::progress_key(&topic, 3), 9).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    assert_eq!(position!(), json!(0));
-    let _: () = read_cache.0.del(cache::progress_key(&topic, 3)).await.unwrap();
-    cleanup(&env, sale).await;
-}

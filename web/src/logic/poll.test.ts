@@ -15,7 +15,7 @@ describe('startStatusPolling', () => {
     const updates: string[] = [];
     const fetchOnce = vi
       .fn<() => Promise<StatusUpdate>>()
-      .mockResolvedValueOnce({ kind: 'pending', position: 7 })
+      .mockResolvedValueOnce({ kind: 'pending' })
       .mockResolvedValueOnce({ kind: 'confirmed' });
 
     const stop = startStatusPolling({
@@ -46,7 +46,7 @@ describe('startStatusPolling', () => {
     const fetchOnce = vi
       .fn<() => Promise<StatusUpdate>>()
       .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce({ kind: 'pending', position: 2 });
+      .mockResolvedValueOnce({ kind: 'pending' });
 
     const stop = startStatusPolling({
       fetchOnce,
@@ -89,7 +89,7 @@ describe('startStatusPolling', () => {
     });
 
     stop();
-    resolve({ kind: 'pending', position: 1 });
+    resolve({ kind: 'pending' });
     await vi.advanceTimersByTimeAsync(50);
 
     expect(updates).toEqual([]);

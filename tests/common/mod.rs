@@ -1,6 +1,8 @@
-//! Shared setup for the integration tests: the real Postgres at `DATABASE_URL`
-//! and the Redis at `TEST_REDIS_URL` (default: database 15 of the local
-//! Redis, so a running dev server's data in database 0 is left alone).
+//! Shared setup for the integration tests: the real Postgres at
+//! `TEST_DATABASE_URL` (default: the database `flash_sale_test` on the server
+//! of `DATABASE_URL`, created on first use) and the Redis at `TEST_REDIS_URL`
+//! (default: database 15 of the local Redis), so a running dev server's data
+//! is left alone and the tests' sales never show on its home page.
 //! Start both with `docker compose up -d postgres redis`.
 //!
 //! The payment provider is real too: each test binary starts the fake
@@ -21,7 +23,7 @@ use flash_sale::{
     config::Config,
     db::{self, DbPool},
     payment::{client::HttpProvider, FakeProvider, SharedProvider},
-    queue::{CheckoutEvent, CheckoutQueue, Published, QueueError, QueueResult, SharedQueue},
+    queue::{CheckoutEvent, CheckoutQueue, QueueError, QueueResult, SharedQueue},
 };
 
 pub mod sale;
@@ -52,9 +54,35 @@ impl Env {
 /// A base URL the test provider builds its payment page links from
 pub const PAGE_BASE_URL: &str = "http://pay.test";
 
-/// A test config: the test Redis, the test secrets
+/// The test database's URL: `TEST_DATABASE_URL`, or `DATABASE_URL` with the
+/// database name replaced by `flash_sale_test`
+fn test_database_url(database_url: &str) -> String {
+    std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+        let (server, _) = database_url.rsplit_once('/').expect("DATABASE_URL should end in /<database>");
+        format!("{server}/flash_sale_test")
+    })
+}
+
+/// Creates the test database once per test binary if it does not exist yet
+fn ensure_database(url: &str) {
+    use diesel::{Connection, PgConnection, RunQueryDsl};
+    static DONE: OnceLock<()> = OnceLock::new();
+    DONE.get_or_init(|| {
+        let (server, name) = url.rsplit_once('/').expect("the test database URL should end in /<database>");
+        let mut conn = PgConnection::establish(&format!("{server}/postgres"))
+            .unwrap_or_else(|e| panic!("PostgreSQL should be reachable at {server}: {e}"));
+        // Another test binary may create it at the same moment: that is fine too
+        if let Err(e) = diesel::sql_query(format!("CREATE DATABASE \"{name}\"")).execute(&mut conn) {
+            let message = e.to_string();
+            assert!(message.contains("already exists") || message.contains("duplicate key"), "creating {name}: {message}");
+        }
+    });
+}
+
+/// A test config: the test database and Redis, the test secrets
 pub fn test_config() -> Config {
     let mut config = Config::from_env();
+    config.database_url = test_database_url(&config.database_url);
     config.redis_url = std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/15".to_string());
     config.read_cache_url = config.redis_url.clone();
     config.admin_token = ADMIN_TOKEN.to_string();
@@ -101,8 +129,11 @@ pub fn provider_url() -> String {
 
 pub async fn env() -> Env {
     let config = test_config();
+    ensure_database(&config.database_url);
     let pool = db::init_pool(&config);
-    db::run_migrations(&pool);
+    // Once per test binary: tests running them at once on a new database collide
+    static MIGRATED: OnceLock<()> = OnceLock::new();
+    MIGRATED.get_or_init(|| db::run_migrations(&pool));
     let redis = cache::connect(&config).await;
     let read_cache = cache::connect_read_cache(&config).await;
     let provider = Arc::new(FakeProvider::new(
@@ -114,8 +145,8 @@ pub async fn env() -> Env {
     Env { config, pool, redis, read_cache, provider, http }
 }
 
-/// A `CheckoutQueue` without Kafka: records what is published, hands out
-/// offsets 0, 1, 2... on partition 3, and fails while `fail` is set.
+/// A `CheckoutQueue` without Kafka: records what is published, and fails
+/// while `fail` is set.
 #[derive(Default)]
 pub struct FakeQueue {
     pub fail: AtomicBool,
@@ -134,13 +165,12 @@ impl FakeQueue {
 
 #[async_trait]
 impl CheckoutQueue for FakeQueue {
-    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<Published> {
+    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<()> {
         if self.fail.load(Ordering::SeqCst) {
             return Err(QueueError("broker down".into()));
         }
-        let mut published = self.published.lock().unwrap();
-        published.push(event.clone());
-        Ok(Published { partition: 3, offset: published.len() as i64 - 1 })
+        self.published.lock().unwrap().push(event.clone());
+        Ok(())
     }
 }
 
@@ -170,7 +200,6 @@ macro_rules! test_app {
                 .app_data(actix_web::web::Data::new($env.redis.clone()))
                 .app_data(actix_web::web::Data::new($env.read_cache.clone()))
                 .app_data(actix_web::web::Data::new($queue))
-                .app_data(actix_web::web::Data::new(flash_sale::api::orders::ProgressCache::default()))
                 .app_data($flags.clone())
                 .app_data(actix_web::web::Data::new($env.config.clone()))
                 .app_data(flash_sale::api::json_config())

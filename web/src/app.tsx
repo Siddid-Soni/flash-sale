@@ -17,11 +17,12 @@ import {
   type Screen,
   type StatusUpdate,
 } from './logic/state';
-import { readTicket, writeTicket, clearSentToPay, hasSentToPay, markSentToPay } from './logic/storage';
+import { readTicket, writeTicket, clearTicket, clearSentToPay, hasSentToPay, markSentToPay } from './logic/storage';
 
 type Flow = typeof import('./flow');
 
-const POLL_NOTE = 'We check every 2 seconds. Keep this page open.';
+const QUEUE_NOTE =
+  'A unit is held for you while we prepare your payment link. This takes a few seconds; keep this page open.';
 const REDIRECT_DELAY_MS = 1_500;
 
 /** One lazy chunk for checkout and polling, requested while the page loads. */
@@ -90,9 +91,7 @@ function describeScreen(screen: Screen, sale: Sale | null, isOpen: boolean): str
         ? 'Reserving your phone.'
         : `Reserving your phone. ${screen.note}`;
     case 'queue':
-      return screen.position !== null
-        ? `You are in the queue at position ${screen.position}.`
-        : 'You are in the queue.';
+      return 'You are in. Your payment link is being prepared.';
     case 'payment':
       return 'Your phone is reserved. Continue to payment before the link expires.';
     case 'confirmed':
@@ -257,8 +256,7 @@ export function App() {
           setScreen({
             kind: 'queue',
             ticket: outcome.ticket,
-            position: null,
-            note: 'Your request is in. Looking for your place in line…',
+            note: '',
           });
           startPolling(outcome.ticket);
           return;
@@ -281,7 +279,6 @@ export function App() {
             setScreen({
               kind: 'queue',
               ticket: ticketRef.current,
-              position: null,
               note: 'You already have an order in this sale. Checking its status…',
             });
             startPolling(ticketRef.current);
@@ -382,6 +379,21 @@ export function App() {
     [runCheckout],
   );
 
+  // After a failure, start over as a new guest: the failure may come from the
+  // session itself (a token whose user no longer exists after a database
+  // reset), and the old ticket must not be resumed on the next load.
+  const startAgain = useCallback(
+    (event: MouseEvent) => {
+      if (busyRef.current) return;
+      sessionPromiseRef.current = null;
+      forgetSession();
+      clearTicket(SALE_ID);
+      ticketRef.current = null;
+      beginAttempt(event);
+    },
+    [beginAttempt],
+  );
+
   const retrySameAttempt = useCallback(
     (event: MouseEvent) => {
       if (busyRef.current || keyRef.current === null) return;
@@ -447,8 +459,7 @@ export function App() {
         setScreen({
           kind: 'queue',
           ticket: saved.ticket,
-          position: null,
-          note: 'Resuming your place in line…',
+          note: '',
         });
         startPolling(saved.ticket);
         return;
@@ -592,20 +603,15 @@ export function App() {
       case 'queue':
         return (
           <div class="panel">
-            <p class="panel__title">In queue</p>
-            <div class="spec">
-              <span class="spec__label">Position</span>
-              <span class="spec__dots" aria-hidden="true" />
-              <span class="spec__value">
-                {screen.position !== null && screen.position > 0 ? screen.position : '—'}
-              </span>
-            </div>
+            <p class="panel__title">
+              <span class="pulse" aria-hidden="true" /> You're in
+            </p>
             <div class="spec">
               <span class="spec__label">Ticket</span>
               <span class="spec__dots" aria-hidden="true" />
               <span class="spec__value spec__value--mono">{screen.ticket}</span>
             </div>
-            <p class="note">{screen.note || POLL_NOTE}</p>
+            <p class="note">{screen.note || QUEUE_NOTE}</p>
           </div>
         );
 
@@ -699,7 +705,7 @@ export function App() {
           <div class="panel panel--bad" role="alert">
             <p class="panel__title">Failed</p>
             <p class="note">{screen.message}</p>
-            <button type="button" class="button button--ghost" onClick={beginAttempt}>
+            <button type="button" class="button button--ghost" onClick={startAgain}>
               Start again →
             </button>
           </div>

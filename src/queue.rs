@@ -38,20 +38,13 @@ pub struct CheckoutEvent {
     pub idempotency_key: String,
 }
 
-/// Where the broker stored an event. `offset` becomes the queue position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Published {
-    pub partition: i32,
-    pub offset: i64,
-}
-
 #[async_trait]
 pub trait CheckoutQueue: Send + Sync {
     /// Appends the event to the topic, keyed by its ticket, and returns once
     /// every in-sync replica has stored it. Fails when the producer gives up
     /// (`delivery.timeout.ms`), after which the caller compensates: it records
     /// the ticket as `FAILED` in PostgreSQL and returns the unit.
-    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<Published>;
+    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<()>;
 }
 
 pub type SharedQueue = Arc<dyn CheckoutQueue>;
@@ -96,13 +89,13 @@ impl KafkaQueue {
 
 #[async_trait]
 impl CheckoutQueue for KafkaQueue {
-    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<Published> {
+    async fn publish(&self, event: &CheckoutEvent) -> QueueResult<()> {
         let payload = serde_json::to_vec(event).map_err(|e| QueueError(format!("encode event: {e}")))?;
         let record = FutureRecord::to(&self.topic).key(event.ticket.as_str()).payload(&payload);
         // No waiting for room in the producer's queue: a full queue fails at
         // once (the caller compensates and answers 503)
         match self.producer.send(record, Timeout::After(Duration::ZERO)).await {
-            Ok(delivery) => Ok(Published { partition: delivery.partition, offset: delivery.offset }),
+            Ok(_delivery) => Ok(()),
             Err((e, _message)) => Err(QueueError(format!("publish to {}: {e}", self.topic))),
         }
     }

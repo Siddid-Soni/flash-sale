@@ -7,14 +7,14 @@ than it has. None of them can oversell: PostgreSQL confirms a payment only with
 `UPDATE products SET sold = sold + 1 WHERE sold < total_inventory`.
 
 Redis gates admission only (`stock:{sale}`, `user_live`, the idempotency key);
-Kafka holds the queue; PostgreSQL decides every outcome (Stage 11 of `ROADMAP.md`).
+Kafka holds the queue; PostgreSQL decides every outcome.
 
 | # | Failure | What is lost | Visible as |
 |---|---|---|---|
 | 1 | The Order Service crashes after `checkout.lua` and before the Kafka publish (or before compensating a failed publish) | One unit, for the rest of the sale. The user stays blocked by `user_live`: their checkout answers `409`. A retry with the same `Idempotency-Key` gets a ticket that never becomes an order. | `stock:{sale}` lower than `total_inventory - live orders` once the queue is drained; status `404` for that ticket |
 | 2 | The expiration worker crashes, or Redis errors, after the PostgreSQL `UPDATE ... SET status = 'EXPIRED'` commits and before `INCR stock:{sale}` | One unit, for the rest of the sale. The user stays blocked by `user_live` although their order is `EXPIRED`. | The worker logs an error with the ticket when the Redis step fails; a crash leaves no log |
-| 3 | The Order Service's write of `PENDING` to the status cache fails after a successful publish | Nothing is lost; the user cannot see their place in the queue until the processor writes the payment link | Status `404` until the processor's link write, then the normal answers (the status endpoint reads only the read cache) |
-| 4 | Redis loses data (failover without the last writes, AOF loss) | Stock and one-per-user markers since the last persisted write | See "Redis loss" under Deferred in `ROADMAP.md` |
+| 3 | The Order Service's write of `PENDING` to the status cache fails after a successful publish | Nothing is lost; the user cannot see their ticket's status until the processor writes the payment link | Status `404` until the processor's link write, then the normal answers (the status endpoint reads only the read cache) |
+| 4 | Redis loses data (failover without the last writes, AOF loss) | Stock and one-per-user markers since the last persisted write | Not handled yet. The fix: rebuild `stock:{sale}` from PostgreSQL (`total_inventory` minus `sold` minus live orders), plus a reconciliation job |
 
 ## Why no automatic recovery
 

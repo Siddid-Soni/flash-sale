@@ -21,7 +21,7 @@ export type Screen =
   | { kind: 'error'; message: string }
   | { kind: 'ready' }
   | { kind: 'reserving'; note: string }
-  | { kind: 'queue'; ticket: string; position: number | null; note: string }
+  | { kind: 'queue'; ticket: string; note: string }
   | { kind: 'payment'; ticket: string; paymentUrl: string; expiresAtMs: number | null }
   | { kind: 'confirmed' }
   | { kind: 'sold-out' }
@@ -49,7 +49,7 @@ export type CheckoutOutcome =
 
 /** A polled status, narrowed to what the page renders. */
 export type StatusUpdate =
-  | { kind: 'pending'; position: number | null }
+  | { kind: 'pending' }
   | { kind: 'awaiting-payment'; paymentUrl: string | null; expiresAtMs: number | null }
   | { kind: 'confirmed' }
   | { kind: 'expired' }
@@ -199,7 +199,7 @@ export function mapStatusResponse(status: number, body: unknown): StatusUpdate {
 
   switch (name) {
     case 'PENDING':
-      return { kind: 'pending', position: asNumber(record.position) };
+      return { kind: 'pending' };
     case 'AWAITING_PAYMENT':
       return {
         kind: 'awaiting-payment',
@@ -223,7 +223,7 @@ export function mapStatusResponse(status: number, body: unknown): StatusUpdate {
 export function statusToScreen(update: StatusUpdate, ticket: string): Screen | null {
   switch (update.kind) {
     case 'pending':
-      return { kind: 'queue', ticket, position: update.position, note: 'You are in line.' };
+      return { kind: 'queue', ticket, note: '' };
     case 'awaiting-payment':
       return {
         kind: 'payment',

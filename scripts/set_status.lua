@@ -2,7 +2,7 @@
 -- cache, which holds only status:<ticket>).
 -- KEYS: 1 status:<ticket>
 -- ARGV: 1 status  2 user id  3 TTL secs  4.. field, value, field, value ...
---       (optional fields: payment_url, expires_at, partition, offset, sale)
+--       (optional fields: payment_url, expires_at, sale)
 -- Returns 'written' or 'ignored'. An unknown status is an error.
 --
 -- Ranks: PENDING 1 < AWAITING_PAYMENT 2 < the final states 3 (CONFIRMED,

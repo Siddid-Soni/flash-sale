@@ -1,0 +1,19 @@
+# Load tests only (load/lib.sh adds this file when PIN_CPUS=1): the whole stack runs on
+# STACK_CPUS, so the load generator, pinned to the other cores with taskset, cannot take
+# CPU from the system it measures. A plain `docker compose up` never reads this file.
+x-stack-cpus: &stack-cpus
+  cpuset: ${STACK_CPUS:?set by load/lib.sh}
+
+services:
+  postgres: *stack-cpus
+  redis: *stack-cpus
+  redis-cache: *stack-cpus
+  kafka: *stack-cpus
+  order-service-1: *stack-cpus
+  order-service-2: *stack-cpus
+  order-service-3: *stack-cpus
+  site: *stack-cpus
+  gateway: *stack-cpus
+  fake-payment-provider: *stack-cpus
+  order-processor: *stack-cpus
+  expiration-worker: *stack-cpus

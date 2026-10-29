@@ -99,7 +99,7 @@ body {
 
 .display {
   margin: 10px 0 0;
-  font-size: clamp(58px, 13.5vw, 188px);
+  font-size: clamp(36px, 7vw, 96px);
   line-height: 0.92;
   font-weight: 900;
   letter-spacing: -0.035em;
@@ -366,7 +366,7 @@ a.nav__cell:hover {
 }
 
 .display--small {
-  font-size: clamp(48px, 10vw, 120px);
+  font-size: clamp(32px, 6vw, 80px);
 }
 
 .sales__msg {

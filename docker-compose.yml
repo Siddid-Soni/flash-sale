@@ -38,6 +38,10 @@ x-app-env: &app_env
   # load/backlog.sh set them); the defaults are the values in .env
   PAYMENT_WINDOW_SECS: ${PAYMENT_WINDOW_SECS:-300}
   PROCESSOR_MAX_PER_SEC: ${PROCESSOR_MAX_PER_SEC:-0}
+  # Log filter (env_logger). The load tests drop the one-line-per-request access log
+  # (actix_web::middleware::logger): tens of thousands of lines a second that are not
+  # what the test measures
+  RUST_LOG: ${RUST_LOG:-info}
 
 x-order-service: &order_service
   profiles: [app]
@@ -190,6 +194,7 @@ services:
       # 1 = take the client address from X-Forwarded-For when it comes from the
       # bridge address (load tests only; never in production)
       GATEWAY_TRUST_XFF: ${GATEWAY_TRUST_XFF:-0}
+      GATEWAY_ACCESS_LOG: ${GATEWAY_ACCESS_LOG:-1}
     ports:
       - 8000:80
     # Open files: two connections per proxied request, plus the listeners

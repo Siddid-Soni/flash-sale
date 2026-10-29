@@ -1,6 +1,5 @@
 //! The order processor's logic (roadmap steps 15-18 and 45): turn each checkout
-//! event into an order and a payment link, and report how far each Kafka
-//! partition has been processed.
+//! event into an order and a payment link.
 //!
 //! - `Processor::handle` is the per-message work, in this order: (a) the price;
 //!   (b) the payment session (the provider's idempotency key is the ticket);
@@ -19,7 +18,7 @@
 //!   stored in PostgreSQL: it exists only in the read cache, while the message
 //!   waits in Kafka.
 //! - `PartitionProgress` tracks which offsets of one partition are done and
-//!   which prefix is complete; only that prefix may be committed or reported.
+//!   which prefix is complete; only that prefix may be committed.
 //! - `run` is the Kafka consumer loop around both (see its docs).
 
 use std::collections::{BTreeMap, HashMap};
@@ -454,20 +453,16 @@ struct PartitionState {
 }
 
 /// The consumer loop's state: what is in flight, and what is still to be
-/// written to Redis
+/// committed
 struct Loop<'a> {
     consumer: &'a StreamConsumer<RebalanceContext>,
     topic: &'a str,
     concurrency: usize,
-    read_cache: ReadCache,
     partitions: HashMap<i32, PartitionState>,
     /// Handler tasks that have not reported yet
     live: usize,
     /// Next offset to commit per partition, once it advanced
     to_commit: HashMap<i32, i64>,
-    /// Progress not yet written to the read cache (new, or the write failed):
-    /// the highest processed offset per partition
-    pending: HashMap<i32, i64>,
 }
 
 impl Loop<'_> {
@@ -497,18 +492,13 @@ impl Loop<'_> {
         }
     }
 
-    /// Takes in a prefix that advanced up to `offset`: remembers what to commit and report
+    /// Takes in a prefix that advanced up to `offset`: remembers what to commit
     fn advanced(&mut self, partition: i32, offset: i64) {
         self.to_commit.insert(partition, offset + 1);
-        let pending = self.pending.entry(partition).or_insert(offset);
-        *pending = (*pending).max(offset);
     }
 
-    /// (1) commits the offsets, then (2) writes the
-    /// queue-position progress (`cache::record_progress`) for everything that
-    /// advanced. A failed Redis write stays pending for the
-    /// next flush; the values are cumulative.
-    async fn flush(&mut self, mode: CommitMode) {
+    /// Commits the offsets of everything that advanced
+    fn flush(&mut self, mode: CommitMode) {
         if !self.to_commit.is_empty() {
             let mut list = TopicPartitionList::new();
             for (&partition, &next) in &self.to_commit {
@@ -522,21 +512,6 @@ impl Loop<'_> {
                 Err(e) => log::warn!("Commit failed: {e}"),
             }
         }
-        let partitions: Vec<i32> = self.pending.keys().copied().collect();
-        for partition in partitions {
-            let offset = self.pending[&partition];
-            let written = cache::record_progress(&mut self.read_cache, self.topic, partition, offset).await;
-            match written {
-                Ok(()) => {
-                    self.pending.remove(&partition);
-                }
-                Err(e) => log::warn!("progress of partition {partition} not written: {e}"),
-            }
-        }
-    }
-
-    fn pending_writes(&self) -> bool {
-        !self.pending.is_empty()
     }
 
     /// Takes in a handler's report. Returns whether a prefix advanced.
@@ -563,15 +538,13 @@ impl Loop<'_> {
 /// `PROCESSOR_CONCURRENCY` in flight per partition; a full partition is
 /// paused, not the whole consumer) and finish in any order. Auto-commit is off:
 /// when the contiguous prefix of a partition grows, the offset after it is
-/// committed and the queue-position progress is
-/// written. On revocation the partition's tracking is dropped; its unfinished
+/// committed. On revocation the partition's tracking is dropped; its unfinished
 /// messages are redelivered to the next owner, which is safe. On shutdown no
 /// more messages are fetched, in-flight ones get a bounded time to finish, and
 /// the offsets are committed.
 pub async fn run(
     config: &Config,
     processor: Arc<Processor>,
-    read_cache: ReadCache,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), KafkaError> {
     let (rebalance_tx, mut rebalance_rx) = mpsc::unbounded_channel();
@@ -596,14 +569,10 @@ pub async fn run(
         consumer: &consumer,
         topic: &config.checkout_topic,
         concurrency: config.processor_concurrency.max(1),
-        read_cache,
         partitions: HashMap::new(),
         live: 0,
         to_commit: HashMap::new(),
-        pending: HashMap::new(),
     };
-    let mut retry_writes = tokio::time::interval(Duration::from_secs(1));
-    retry_writes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     while !*shutdown.borrow() {
         tokio::select! {
@@ -636,10 +605,9 @@ pub async fn run(
                     advanced |= state.finished(next);
                 }
                 if advanced {
-                    state.flush(CommitMode::Async).await;
+                    state.flush(CommitMode::Async);
                 }
             }
-            _ = retry_writes.tick(), if state.pending_writes() => state.flush(CommitMode::Async).await,
             received = consumer.recv() => {
                 let message = match received {
                     Ok(message) => message,
@@ -661,7 +629,7 @@ pub async fn run(
                         log::error!("Undecodable message at partition {partition} offset {offset}; skipped");
                         if let Some(advance) = partition_state.progress.finish(offset) {
                             state.advanced(partition, advance);
-                            state.flush(CommitMode::Async).await;
+                            state.flush(CommitMode::Async);
                         }
                     }
                     Some(event) => {
@@ -706,7 +674,7 @@ pub async fn run(
     if state.live > 0 {
         log::warn!("{} messages still in flight; they will be redelivered", state.live);
     }
-    state.flush(CommitMode::Sync).await;
+    state.flush(CommitMode::Sync);
     Ok(())
 }
 

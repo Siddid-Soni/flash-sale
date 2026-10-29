@@ -5,6 +5,7 @@
 mod common;
 
 use actix_web::{http::StatusCode, test::{self, TestRequest}};
+use chrono::{Duration, Utc};
 use diesel::prelude::*;
 use serde_json::{json, Value};
 
@@ -15,8 +16,15 @@ fn sale_body() -> Value {
         "name": "Smartphone",
         "price_cents": 59_900,
         "total_inventory": 500,
-        "sale_start_time": "2030-01-01T20:00:00Z",
+        "sale_start_time": "2025-01-01T20:00:00Z",
     })
+}
+
+/// A start time one second ago, whole seconds (as the API prints it): a sale
+/// that has opened and is newer than any other test's, so it is among the 50
+/// latest the list returns
+fn just_now() -> String {
+    (Utc::now() - Duration::seconds(1)).format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn create_request(token: Option<&str>, body: &Value) -> TestRequest {
@@ -38,7 +46,7 @@ async fn admin_routes_need_the_admin_token() {
 
     // Other tests create sales too, so look for this one by name
     let body = json!({ "name": "should-not-exist", "price_cents": 100, "total_inventory": 1,
-                       "sale_start_time": "2030-01-01T00:00:00Z" });
+                       "sale_start_time": "2025-01-01T00:00:00Z" });
 
     for token in [None, Some("wrong"), Some(""), Some("test-admin-token-and-more"), Some("test-admin-toke")] {
         let resp = test::call_service(&app, create_request(token, &body).to_request()).await;
@@ -77,7 +85,7 @@ async fn creating_a_sale_stores_the_product_and_loads_redis() {
     // The keys, with the literal hash tag, and the start time in epoch ms
     assert_eq!(redis_get(&env, format!("stock:{{{id}}}")).await.as_deref(), Some("500"));
     assert_eq!(redis_get(&env, format!("sold:{{{id}}}")).await, None, "Redis does not count sales");
-    assert_eq!(redis_get(&env, cache::sale_start_key(id)).await.as_deref(), Some("1893528000000"));
+    assert_eq!(redis_get(&env, cache::sale_start_key(id)).await.as_deref(), Some("1735761600000"));
 }
 
 #[actix_web::test]
@@ -85,10 +93,10 @@ async fn invalid_sales_are_rejected() {
     let env = common::env().await;
     let app = site_app!(env);
     let cases = [
-        json!({ "name": "  ", "price_cents": 100, "total_inventory": 5, "sale_start_time": "2030-01-01T00:00:00Z" }),
-        json!({ "name": "x", "price_cents": 0, "total_inventory": 5, "sale_start_time": "2030-01-01T00:00:00Z" }),
-        json!({ "name": "x", "price_cents": 100, "total_inventory": 0, "sale_start_time": "2030-01-01T00:00:00Z" }),
-        json!({ "name": "x", "price_cents": 100, "total_inventory": -3, "sale_start_time": "2030-01-01T00:00:00Z" }),
+        json!({ "name": "  ", "price_cents": 100, "total_inventory": 5, "sale_start_time": "2025-01-01T00:00:00Z" }),
+        json!({ "name": "x", "price_cents": 0, "total_inventory": 5, "sale_start_time": "2025-01-01T00:00:00Z" }),
+        json!({ "name": "x", "price_cents": 100, "total_inventory": 0, "sale_start_time": "2025-01-01T00:00:00Z" }),
+        json!({ "name": "x", "price_cents": 100, "total_inventory": -3, "sale_start_time": "2025-01-01T00:00:00Z" }),
         json!({ "name": "x", "price_cents": 100, "total_inventory": 5, "sale_start_time": "not a time" }),
         json!({ "name": "x", "price_cents": 100 }),
     ];
@@ -119,7 +127,7 @@ async fn sale_details_body_headers_and_not_found() {
             "id": id,
             "name": "Smartphone",
             "price_cents": 59_900,
-            "sale_start_time": "2030-01-01T20:00:00Z",
+            "sale_start_time": "2025-01-01T20:00:00Z",
             "total_inventory": 500,
             "sold_out": false,
         })
@@ -141,10 +149,11 @@ async fn sale_details_body_headers_and_not_found() {
 async fn sale_list_has_the_details_newest_start_first() {
     let env = common::env().await;
     let app = site_app!(env);
-    // Far in the future so it is among the 50 latest whatever other tests created
+    // Started a second ago, so it is among the 50 latest whatever other tests created
+    let start = just_now();
     let mut body = sale_body();
     body["name"] = json!("list-me");
-    body["sale_start_time"] = json!("2099-12-31T00:00:00Z");
+    body["sale_start_time"] = json!(start);
     let created: Value =
         test::call_and_read_body_json(&app, create_request(Some(common::ADMIN_TOKEN), &body).to_request()).await;
     let id = created["id"].as_i64().unwrap();
@@ -164,7 +173,7 @@ async fn sale_list_has_the_details_newest_start_first() {
             "id": id,
             "name": "list-me",
             "price_cents": 59_900,
-            "sale_start_time": "2099-12-31T00:00:00Z",
+            "sale_start_time": start,
             "total_inventory": 500,
             "sold_out": true,
         })
@@ -216,9 +225,9 @@ async fn search_matches_names_in_any_case_with_the_list_shape() {
     let env = common::env().await;
     let app = site_app!(env);
     let token = unique_token();
-    let old = create_named!(app, &format!("Blue PHONE {token}"), "2090-01-01T00:00:00Z");
-    let new = create_named!(app, &format!("Red phone {token}"), "2090-06-01T00:00:00Z");
-    create_named!(app, &format!("Laptop {token}"), "2090-03-01T00:00:00Z");
+    let old = create_named!(app, &format!("Blue PHONE {token}"), "2020-01-01T00:00:00Z");
+    let new = create_named!(app, &format!("Red phone {token}"), "2020-06-01T00:00:00Z");
+    create_named!(app, &format!("Laptop {token}"), "2020-03-01T00:00:00Z");
     redis::cmd("SET").arg(format!("stock:{{{old}}}")).arg(0).query_async::<()>(&mut env.redis.clone()).await.unwrap();
 
     // Case does not matter on either side; surrounding blanks are trimmed
@@ -231,7 +240,7 @@ async fn search_matches_names_in_any_case_with_the_list_shape() {
     assert_eq!(found[0]["sold_out"], false);
     assert_eq!(found[0]["price_cents"], 59_900);
     assert_eq!(found[0]["total_inventory"], 500);
-    assert_eq!(found[0]["sale_start_time"], "2090-06-01T00:00:00Z");
+    assert_eq!(found[0]["sale_start_time"], "2020-06-01T00:00:00Z");
 
     // A part of the name, and nothing found
     assert!(!ids(&search!(app, "lap").2).contains(&old));
@@ -243,12 +252,12 @@ async fn search_treats_wildcards_and_backslashes_as_text() {
     let env = common::env().await;
     let app = site_app!(env);
     let token = unique_token();
-    let percent = create_named!(app, &format!("100% cotton {token}"), "2091-01-01T00:00:00Z");
-    let decoy_percent = create_named!(app, &format!("100x cotton {token}"), "2091-01-02T00:00:00Z");
-    let underscore = create_named!(app, &format!("a_b {token}"), "2091-01-03T00:00:00Z");
-    let decoy_underscore = create_named!(app, &format!("axb {token}"), "2091-01-04T00:00:00Z");
-    let backslash = create_named!(app, &format!("c\\d {token}"), "2091-01-05T00:00:00Z");
-    let decoy_backslash = create_named!(app, &format!("cd {token}"), "2091-01-06T00:00:00Z");
+    let percent = create_named!(app, &format!("100% cotton {token}"), "2021-01-01T00:00:00Z");
+    let decoy_percent = create_named!(app, &format!("100x cotton {token}"), "2021-01-02T00:00:00Z");
+    let underscore = create_named!(app, &format!("a_b {token}"), "2021-01-03T00:00:00Z");
+    let decoy_underscore = create_named!(app, &format!("axb {token}"), "2021-01-04T00:00:00Z");
+    let backslash = create_named!(app, &format!("c\\d {token}"), "2021-01-05T00:00:00Z");
+    let decoy_backslash = create_named!(app, &format!("cd {token}"), "2021-01-06T00:00:00Z");
 
     assert_eq!(ids(&search!(app, &format!("100% cotton {token}")).2), vec![percent]);
     assert_eq!(ids(&search!(app, &format!("a_b {token}")).2), vec![underscore]);
@@ -263,10 +272,32 @@ async fn search_treats_wildcards_and_backslashes_as_text() {
 }
 
 #[actix_web::test]
+async fn a_sale_with_every_unit_paid_for_is_not_listed() {
+    let env = common::env().await;
+    let app = site_app!(env);
+    let token = unique_token();
+    let over = create_named!(app, &format!("over {token}"), just_now());
+    let reserved = create_named!(app, &format!("reserved {token}"), just_now());
+    let mut conn = env.pool.get().unwrap();
+    diesel::update(products::table.find(over as i32))
+        .set(products::sold.eq(products::total_inventory))
+        .execute(&mut conn)
+        .unwrap();
+    // Stock at 0 with units only reserved: still selling (shown sold out)
+    redis::cmd("SET").arg(format!("stock:{{{reserved}}}")).arg(0).query_async::<()>(&mut env.redis.clone()).await.unwrap();
+
+    let list: Vec<Value> = test::call_and_read_body_json(&app, TestRequest::get().uri("/v1/sales").to_request()).await;
+    assert!(!ids(&list).contains(&over), "a sale that is over is not listed");
+    assert!(ids(&list).contains(&reserved));
+    let (_, _, found) = search!(app, &token);
+    assert_eq!(ids(&found), vec![reserved]);
+}
+
+#[actix_web::test]
 async fn an_empty_search_answers_like_the_list() {
     let env = common::env().await;
     let app = site_app!(env);
-    let id = create_named!(app, "empty-search", "2099-12-31T12:00:00Z");
+    let id = create_named!(app, "empty-search", just_now());
 
     for uri in ["/v1/sales/search", "/v1/sales/search?q=", "/v1/sales/search?q=%20%20%09", "/v1/sales/search?x=1"] {
         let resp = test::call_service(&app, TestRequest::get().uri(uri).to_request()).await;
@@ -287,14 +318,14 @@ async fn search_returns_at_most_fifty_and_cuts_long_queries() {
     let token = unique_token();
     let mut created = Vec::new();
     for i in 0..51 {
-        created.push(create_named!(app, &format!("many {token} {i}"), &format!("2092-01-01T00:{i:02}:00Z")));
+        created.push(create_named!(app, &format!("many {token} {i}"), &format!("2022-01-01T00:{i:02}:00Z")));
     }
     let (_, _, found) = search!(app, &format!("many {token}"));
     assert_eq!(found.len(), 50);
     assert_eq!(ids(&found), created[1..].iter().rev().copied().collect::<Vec<_>>(), "the oldest of 51 is left out");
 
     // Only the first 64 characters of the text are used, so a longer one still finds the name
-    let long = create_named!(app, &format!("{}b", "a".repeat(64)), "2093-01-01T00:00:00Z");
+    let long = create_named!(app, &format!("{}b", "a".repeat(64)), "2023-01-01T00:00:00Z");
     assert!(ids(&search!(app, &"a".repeat(80)).2).contains(&long));
 }
 
@@ -303,7 +334,7 @@ async fn the_order_service_no_longer_serves_the_site_routes() {
     let env = common::env().await;
     let orders = test_app!(env);
     let site = site_app!(env);
-    let id = create_named!(site, "moved", "2099-01-01T00:00:00Z");
+    let id = create_named!(site, "moved", just_now());
 
     for (method, uri) in [
         ("POST", "/v1/session".to_string()),

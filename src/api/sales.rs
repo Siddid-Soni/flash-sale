@@ -2,7 +2,7 @@
 //! client loads first and the CDN caches for a second, so it must stay cheap
 //! when a stampede misses the edge: the product comes from a per-process cache,
 //! and only `sold_out` is read from Redis (one `GET`). `GET /v1/sales` lists the
-//! latest sales for the home page and `GET /v1/sales/search?q=` finds them by
+//! latest sales still selling for the home page and `GET /v1/sales/search?q=` finds them by
 //! name; both are edge-cached for a few seconds.
 
 use std::collections::HashMap;
@@ -123,7 +123,8 @@ async fn get_sale(
     Ok(HttpResponse::Ok().insert_header((header::CACHE_CONTROL, CACHE_CONTROL)).json(SaleResponse::new(product, sold_out)))
 }
 
-/// The latest sales, newest start first, with the same fields as the details.
+/// The latest sales still selling (not every unit paid for), newest start
+/// first, with the same fields as the details.
 /// One query and one `MGET` for the sold-out flags.
 #[get("/sales")]
 async fn list_sales(pool: web::Data<DbPool>, redis: web::Data<RedisConn>) -> Result<HttpResponse, ApiError> {

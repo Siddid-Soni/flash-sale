@@ -3,8 +3,29 @@
 
 ADMIN_TOKEN=$(sed -n 's/^ADMIN_TOKEN=//p' .env | head -1)
 JWT_SECRET=$(sed -n 's/^JWT_SECRET=//p' .env | head -1)
+# Where the generator sends its requests. Unset, it is the gateway container's own address
+# (see target_urls): through localhost:8000 every connection would also pass Docker's
+# userland port proxy, which took ~9 cores at 30k req/s and capped the runs.
+GENERATOR_BASE_URL=${BASE_URL:-}
 BASE_URL=${BASE_URL:-http://localhost:8000}
 WORK=$(mktemp -d)
+
+# Separate cores for the generator and the stack (PIN_CPUS=0 turns it off), so the generator
+# cannot take CPU from the system it measures: by default the first ~30% of the cores run the
+# generator, the rest the whole stack (compose override load/compose.pin.yml)
+PIN_CPUS=${PIN_CPUS:-1}
+# No gateway access log during a run (GATEWAY_ACCESS_LOG=1 keeps it): one line per request, through
+# Docker's log collection, is work outside what the test measures
+export GATEWAY_ACCESS_LOG=${GATEWAY_ACCESS_LOG:-0}
+# Likewise the services' own per-request log line (actix's Logger); everything else stays at info
+export RUST_LOG=${RUST_LOG:-info,actix_web::middleware::logger=warn}
+if [ "$PIN_CPUS" = 1 ]; then
+  cores=$(nproc)
+  gen=$(( cores * 3 / 10 )); [ "$gen" -lt 1 ] && gen=1
+  GEN_CPUS=${GEN_CPUS:-0-$((gen - 1))}
+  export STACK_CPUS=${STACK_CPUS:-$gen-$((cores - 1))}
+  export COMPOSE_FILE=docker-compose.yml:load/compose.pin.yml
+fi
 
 psql_() { docker compose exec -T postgres psql -U actix -d flash_sale -tAc "$1" </dev/null; }
 rcli() { docker compose exec -T redis redis-cli "$@" </dev/null; }
@@ -45,11 +66,36 @@ wait_ports_free() {
   done
 }
 
-# Back to the defaults: compose recreates what differs (the gateway trusts no X-Forwarded-For again)
+# Back to the defaults: compose recreates what differs (the gateway trusts no X-Forwarded-For
+# again, no container is pinned to cores)
 restore_defaults() {
-  echo "Restoring default settings (gateway without X-Forwarded-For trust)"
-  env -u PAYMENT_WINDOW_SECS -u PROCESSOR_MAX_PER_SEC -u GATEWAY_TRUST_XFF \
+  echo "Restoring default settings (gateway without X-Forwarded-For trust, access logs on, no CPU pinning)"
+  env -u PAYMENT_WINDOW_SECS -u PROCESSOR_MAX_PER_SEC -u GATEWAY_TRUST_XFF -u GATEWAY_ACCESS_LOG -u RUST_LOG -u COMPOSE_FILE -u STACK_CPUS \
     docker compose --profile app up -d >/dev/null 2>&1 || true
+}
+
+# After start_stack: the addresses the generator uses. The gateway and the provider are reached
+# at their container addresses (the host routes to the compose network directly), unless
+# BASE_URL was given.
+target_urls() {
+  if [ -z "$GENERATOR_BASE_URL" ]; then
+    GENERATOR_BASE_URL="http://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+      "$(docker compose ps -q gateway)")"
+    PROVIDER_URL=${PROVIDER_URL:-http://172.28.0.50:8090}
+  fi
+  export PROVIDER_URL=${PROVIDER_URL:-http://localhost:8090}
+  echo "Generator targets $GENERATOR_BASE_URL (provider $PROVIDER_URL)"
+}
+
+# run_generator: the load generator with the common settings, on its own cores when pinned
+run_generator() {
+  local pin=()
+  if [ "$PIN_CPUS" = 1 ]; then
+    pin=(taskset -c "$GEN_CPUS")
+    echo "Generator on cores $GEN_CPUS, stack on cores $STACK_CPUS"
+  fi
+  SALE_ID=$SALE USERS_FILE=$WORK/users JWT_SECRET=$JWT_SECRET BASE_URL=$GENERATOR_BASE_URL \
+    REPORT_JSON=$WORK/report.json "${pin[@]}" ./load/flash/target/release/flash-load | tee "$WORK/report.txt"
 }
 
 # insert_users N FILE: N guest users straight into Postgres (no session call needed;
@@ -65,10 +111,16 @@ create_sale() {
   local start name resp
   start=$(date -u -d "+$2 seconds" +%FT%TZ)
   name="load-$(date +%s)"
-  resp=$(docker compose exec -T gateway wget -qO- \
-    --header "X-Admin-Token: $ADMIN_TOKEN" --header 'Content-Type: application/json' \
-    --post-data "{\"name\":\"$name\",\"price_cents\":49900,\"total_inventory\":$1,\"sale_start_time\":\"$start\"}" \
-    http://127.0.0.1/v1/admin/sales </dev/null)
+  # A few tries: right after `up` recreates the site container, NGINX can still hold its old
+  # address for up to 5 s (`resolver valid=5s`) and answers 502
+  local i
+  for i in $(seq 10); do
+    resp=$(docker compose exec -T gateway wget -qO- \
+      --header "X-Admin-Token: $ADMIN_TOKEN" --header 'Content-Type: application/json' \
+      --post-data "{\"name\":\"$name\",\"price_cents\":49900,\"total_inventory\":$1,\"sale_start_time\":\"$start\"}" \
+      http://127.0.0.1/v1/admin/sales </dev/null 2>/dev/null) && break
+    sleep 2
+  done
   jq -er '.id' <<<"$resp" || { echo "could not create the sale: $resp" >&2; return 1; }
 }
 
@@ -104,4 +156,11 @@ check() {
 check_cond() {
   if [ "$3" = 0 ]; then CHECKS+="- [x] $1 ($2)"$'\n'; echo "PASS  $1 ($2)"
   else CHECKS+="- [ ] **FAILED** $1: $2"$'\n'; echo "FAIL  $1: $2"; FAIL=1; fi
+}
+
+# One line for the report: how the generator reached the stack and which cores each had
+setup_note() {
+  local pin="no CPU pinning"
+  [ "$PIN_CPUS" = 1 ] && pin="generator pinned to cores $GEN_CPUS, the whole stack to cores $STACK_CPUS"
+  echo "Generator target: $GENERATOR_BASE_URL (provider $PROVIDER_URL); $pin."
 }

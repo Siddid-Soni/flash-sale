@@ -1,13 +1,12 @@
-//! Redis connections and the keys stored in Redis (see ROADMAP.md, Redis Keys).
+//! Redis connections and the keys stored in Redis (see the README, Architecture).
 //!
 //! There are two roles. The inventory Redis (`REDIS_URL`) gates admission only:
 //! stock, the one-per-user marker, idempotency keys and the sale's opening
 //! time; every inventory Lua script runs there and
 //! touches only inventory keys. Kafka is the queue and PostgreSQL decides every
 //! outcome, so Redis keeps no per-ticket state. The read cache (`READ_CACHE_URL`, the same
-//! instance locally) holds only `status:<ticket>`, what clients poll, and
-//! `progress:<topic>:<partition>`, what turns an offset into a queue position,
-//! so polling can never slow down checkout.
+//! instance locally) holds only `status:<ticket>`, what clients poll, so polling
+//! can never slow down checkout.
 //!
 //! Keys for one sale carry the literal hash tag `{sale}`, e.g. `stock:{42}`,
 //! so a script's keys stay in one slot if Redis is clustered.
@@ -66,17 +65,8 @@ pub fn idem_key(sale: i32, user: i32, key: &str) -> String {
     format!("idem:{{{sale}}}:{user}:{key}")
 }
 
-/// Processor progress for one partition in the *read cache*: the highest
-/// offset below which every message has been processed (a plain string, no
-/// hash tag). With `status:<ticket>` it is the only other key the read cache
-/// holds: the status endpoint turns a ticket's offset and this into a queue
-/// position, so polling never reads the inventory Redis.
-pub fn progress_key(topic: &str, partition: i32) -> String {
-    format!("progress:{topic}:{partition}")
-}
-
 /// Read-cache hash with `status`, `user`, `payment_url`, `expires_at` (RFC 3339,
-/// UTC), `partition`, `offset`, `sale`. Not tagged: it lives in the read cache, which no script shares keys with.
+/// UTC), `sale`. Not tagged: it lives in the read cache, which no script shares keys with.
 pub fn status_key(ticket: &str) -> String {
     format!("status:{ticket}")
 }
@@ -205,36 +195,6 @@ pub async fn return_unit(
     Ok(())
 }
 
-static SET_MAX_SCRIPT: LazyLock<redis::Script> =
-    LazyLock::new(|| redis::Script::new(include_str!("../scripts/set_max.lua")));
-
-/// Raises the integer at `key` to `value` and never lowers it (`set_max.lua`).
-/// Returns whether it changed. For `progress` keys, which
-/// several replicas write and which must only move forward.
-pub async fn raise_to(con: &mut RedisConn, key: &str, value: i64) -> redis::RedisResult<bool> {
-    let changed: i64 = SET_MAX_SCRIPT.key(key).arg(value).invoke_async(con).await?;
-    Ok(changed == 1)
-}
-
-/// Reports that the contiguous prefix of `partition` is processed up to and
-/// including `offset`: writes `progress:<topic>:<partition>` to the read cache,
-/// which turns a ticket's offset into a queue position. It only ever rises.
-pub async fn record_progress(
-    read_cache: &mut ReadCache,
-    topic: &str,
-    partition: i32,
-    offset: i64,
-) -> redis::RedisResult<()> {
-    raise_to(&mut read_cache.0, &progress_key(topic, partition), offset).await?;
-    Ok(())
-}
-
-/// The highest offset of `partition` up to which everything is processed;
-/// `None` if no processor has recorded progress yet
-pub async fn read_progress(cache: &mut ReadCache, topic: &str, partition: i32) -> redis::RedisResult<Option<i64>> {
-    redis::cmd("GET").arg(progress_key(topic, partition)).query_async(&mut cache.0).await
-}
-
 static SET_STATUS_SCRIPT: LazyLock<redis::Script> =
     LazyLock::new(|| redis::Script::new(include_str!("../scripts/set_status.lua")));
 
@@ -247,14 +207,12 @@ pub struct StatusUpdate {
     pub payment_url: Option<String>,
     /// RFC 3339, UTC
     pub expires_at: Option<String>,
-    pub partition: Option<i32>,
-    pub offset: Option<i64>,
     pub sale: Option<i32>,
 }
 
 impl StatusUpdate {
     pub fn new(status: OrderStatus, user: i32) -> Self {
-        Self { status, user, payment_url: None, expires_at: None, partition: None, offset: None, sale: None }
+        Self { status, user, payment_url: None, expires_at: None, sale: None }
     }
 }
 
@@ -266,8 +224,6 @@ pub async fn set_status(cache: &mut ReadCache, ticket: &str, update: &StatusUpda
     let optional = [
         ("payment_url", update.payment_url.clone()),
         ("expires_at", update.expires_at.clone()),
-        ("partition", update.partition.map(|v| v.to_string())),
-        ("offset", update.offset.map(|v| v.to_string())),
         ("sale", update.sale.map(|v| v.to_string())),
     ];
     for (field, value) in optional {
@@ -290,8 +246,6 @@ pub struct CachedStatus {
     pub user: i32,
     pub payment_url: Option<String>,
     pub expires_at: Option<String>,
-    pub partition: Option<i32>,
-    pub offset: Option<i64>,
 }
 
 /// Reads `status:<ticket>` from the read cache; `None` if missing (never
@@ -306,8 +260,6 @@ pub async fn read_status(cache: &mut ReadCache, ticket: &str) -> redis::RedisRes
         user,
         payment_url: fields.get("payment_url").cloned(),
         expires_at: fields.get("expires_at").cloned(),
-        partition: fields.get("partition").and_then(|v| v.parse().ok()),
-        offset: fields.get("offset").and_then(|v| v.parse().ok()),
     }))
 }
 
@@ -331,7 +283,6 @@ mod tests {
         assert_eq!(user_live_key(42, 7), "user_live:{42}:7");
         assert_eq!(idem_key(42, 7, "k1"), "idem:{42}:7:k1");
         assert_eq!(status_key("42.abc"), "status:42.abc");
-        assert_eq!(progress_key("orders.checkout", 3), "progress:orders.checkout:3");
     }
 
     #[test]

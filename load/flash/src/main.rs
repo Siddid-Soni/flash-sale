@@ -41,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -106,18 +106,26 @@ struct Ctx {
     session_sample: usize,
     view_sale: bool,
     margin: i64,
-    samples: Mutex<Vec<Sample>>,
-    /// Why requests failed at the network level, with counts
-    error_kinds: Mutex<BTreeMap<String, usize>>,
     done: AtomicUsize,
     retries_5xx: AtomicU64,
     retries_network: AtomicU64,
     waits_429: AtomicU64,
 }
 
+/// What one user's requests recorded. Each user task owns its own, so recording a
+/// response takes no lock; `main` merges them once every user has finished.
+#[derive(Default)]
+struct Log {
+    samples: Vec<Sample>,
+    /// Why requests failed at the network level, with counts
+    errors: BTreeMap<String, usize>,
+}
+
 /// What happened to one user
 #[derive(Default, Serialize)]
 struct UserRec {
+    #[serde(skip)]
+    log: Log,
     outcome: &'static str,
     /// Milliseconds from the first checkout attempt to the first poll that showed the link
     link_ms: Option<u64>,
@@ -146,8 +154,9 @@ impl Ctx {
     }
 
     /// Sends the request (a clone per attempt is the caller's business), records
-    /// status and latency, and returns the reply. Status 0 = network failure.
-    async fn call(&self, ep: Ep, request: reqwest::RequestBuilder) -> Reply {
+    /// status and latency in the user's `log`, and returns the reply. Status 0 =
+    /// network failure.
+    async fn call(&self, log: &mut Log, ep: Ep, request: reqwest::RequestBuilder) -> Reply {
         let sent = Instant::now();
         let result = async {
             let response = request.send().await?;
@@ -170,11 +179,11 @@ impl Ctx {
                     cause = next;
                 }
                 let kind = format!("{}{}", if e.is_timeout() { "timeout: " } else if e.is_connect() { "connect: " } else { "" }, cause);
-                *self.error_kinds.lock().unwrap().entry(kind).or_default() += 1;
+                *log.errors.entry(kind).or_default() += 1;
                 Reply { status: 0, retry_after: None, body: Vec::new() }
             }
         };
-        self.samples.lock().unwrap().push(Sample {
+        log.samples.push(Sample {
             ep,
             status: reply.status,
             micros: sent.elapsed().as_micros() as u64,
@@ -218,7 +227,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
     // Token: signed locally, or (for a sample of users) a real guest session
     let bearer = if index < ctx.session_sample {
         sleep_ms(fastrand::u64(0..=3000)).await;
-        let reply = ctx.call(Ep::Session, ctx.client.post(ctx.url("/v1/session")).header("X-Forwarded-For", &ip)).await;
+        let reply = ctx.call(&mut rec.log, Ep::Session, ctx.client.post(ctx.url("/v1/session")).header("X-Forwarded-For", &ip)).await;
         let body: Value = serde_json::from_slice(&reply.body).unwrap_or_default();
         match body["token"].as_str() {
             Some(token) if reply.status == 201 => format!("Bearer {token}"),
@@ -236,7 +245,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
     sleep_until(arrival.into()).await;
 
     if ctx.view_sale {
-        ctx.call(Ep::Sale, ctx.get(&format!("/v1/sales/{}", ctx.sale), &ip, None)).await;
+        ctx.call(&mut rec.log, Ep::Sale, ctx.get(&format!("/v1/sales/{}", ctx.sale), &ip, None)).await;
     }
 
     // Checkout: one key for every attempt
@@ -256,7 +265,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
                 .header("Authorization", &bearer)
                 .header("Idempotency-Key", &key)
                 .header("Content-Length", "0");
-            let reply = ctx.call(Ep::Checkout, request).await;
+            let reply = ctx.call(&mut rec.log, Ep::Checkout, request).await;
             match reply.status {
                 200 | 202 => {
                     let body: Value = serde_json::from_slice(&reply.body).unwrap_or_default();
@@ -327,7 +336,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
             if !paid && Instant::now() >= *at {
                 paid = true;
                 let sent_utc = Utc::now();
-                let reply = pay(ctx, url).await;
+                let reply = pay(ctx, &mut rec.log, url).await;
                 let received_utc = Utc::now();
                 if reply.status == 303 {
                     let e = expires.expect("expiry known when paying");
@@ -350,7 +359,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
         }
         next_poll = Instant::now() + Duration::from_millis(poll * 9 / 10 + fastrand::u64(0..=poll / 5));
 
-        let reply = ctx.call(Ep::Status, ctx.get(&status_path, &ip, Some(&bearer))).await;
+        let reply = ctx.call(&mut rec.log, Ep::Status, ctx.get(&status_path, &ip, Some(&bearer))).await;
         match reply.status {
             200 => {}
             429 => {
@@ -416,7 +425,7 @@ async fn user_inner(ctx: &Ctx, index: usize, user_id: i64, open_at: Instant) -> 
 }
 
 /// POSTs the fake provider's pay form; the redirect is not followed
-async fn pay(ctx: &Ctx, payment_url: &str) -> Reply {
+async fn pay(ctx: &Ctx, log: &mut Log, payment_url: &str) -> Reply {
     // The URL names the provider's published address; `PROVIDER_URL` replaces the host when the
     // generator reaches the provider some other way
     let path = payment_url.find("/fake-pay/").map(|i| &payment_url[i..]).unwrap_or(payment_url);
@@ -427,7 +436,7 @@ async fn pay(ctx: &Ctx, payment_url: &str) -> Reply {
             .post(format!("{}{path}/pay", ctx.provider))
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Content-Length", "0");
-        let reply = ctx.call(Ep::Pay, request).await;
+        let reply = ctx.call(log, Ep::Pay, request).await;
         let retryable = reply.status == 0 || reply.status >= 500 || reply.status == 429;
         if !retryable || attempt >= 5 {
             return reply;
@@ -492,6 +501,9 @@ async fn main() {
     let client = reqwest::Client::builder()
         .user_agent(BROWSER_UA)
         .pool_max_idle_per_host(users.len().clamp(64, 20_000))
+        // Dropped before the gateway closes them (`keepalive_timeout 30s`), so a reused
+        // connection is never already closed
+        .pool_idle_timeout(Duration::from_secs(25))
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -530,8 +542,6 @@ async fn main() {
         session_sample: opt("SESSION_SAMPLE", "0").parse().unwrap(),
         view_sale: opt("VIEW_SALE", "1") != "0",
         margin: opt("MARGIN_MS", "1500").parse().unwrap(),
-        samples: Mutex::new(Vec::new()),
-        error_kinds: Mutex::new(BTreeMap::new()),
         done: AtomicUsize::new(0),
         retries_5xx: AtomicU64::new(0),
         retries_network: AtomicU64::new(0),
@@ -603,7 +613,15 @@ async fn main() {
         }
     }
 
-    let samples = std::mem::take(&mut *ctx.samples.lock().unwrap());
+    // Every user's log, merged now that no task is writing
+    let mut samples = Vec::with_capacity(records.iter().map(|r| r.log.samples.len()).sum());
+    let mut error_kinds: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &mut records {
+        samples.append(&mut r.log.samples);
+        for (kind, n) in std::mem::take(&mut r.log.errors) {
+            *error_kinds.entry(kind).or_default() += n;
+        }
+    }
     let mut endpoints = serde_json::Map::new();
     let (mut total429, mut total5xx, mut net) = (0usize, 0usize, 0usize);
     println!("\nFinished in {:.1}s\n\nOutcomes:", elapsed.as_secs_f64());
@@ -656,7 +674,7 @@ async fn main() {
         ctx.retries_network.load(Ordering::Relaxed),
         ctx.waits_429.load(Ordering::Relaxed),
     );
-    for (cause, n) in ctx.error_kinds.lock().unwrap().iter() {
+    for (cause, n) in &error_kinds {
         println!("  network failure: {cause}: {n}");
     }
     println!(
@@ -683,7 +701,7 @@ async fn main() {
         "rate_limited_429": total429,
         "server_errors_5xx": total5xx,
         "network_failures": net,
-        "network_failure_causes": &*ctx.error_kinds.lock().unwrap(),
+        "network_failure_causes": &error_kinds,
         "retries_after_5xx": ctx.retries_5xx.load(Ordering::Relaxed),
         "retries_after_network_error": ctx.retries_network.load(Ordering::Relaxed),
         "waits_on_429": ctx.waits_429.load(Ordering::Relaxed),

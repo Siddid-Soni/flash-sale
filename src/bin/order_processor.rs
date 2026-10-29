@@ -1,5 +1,5 @@
 //! Order processor: consumes `orders.checkout`, creates each order and its
-//! payment session, publishes the payment link and reports progress (see
+//! payment session and publishes the payment link (see
 //! `flash_sale::processor`); serves the payment provider's webhook
 //! (`POST /v1/payments/webhook` on `PROCESSOR_HTTP_ADDR`), which confirms or
 //! refunds a paid order at once; and, alongside, retries the payment events
@@ -79,7 +79,7 @@ async fn main() {
 
     let inbox_loop = tokio::spawn(inbox.run(shutdown.clone()));
 
-    if let Err(e) = processor::run(&config, processor, read_cache, shutdown).await {
+    if let Err(e) = processor::run(&config, processor, shutdown).await {
         log::error!("Order processor stopped: {e}");
         std::process::exit(1);
     }

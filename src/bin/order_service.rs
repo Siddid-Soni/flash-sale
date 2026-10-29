@@ -14,7 +14,7 @@ use std::time::Duration;
 use actix_web::{middleware, web, App, HttpServer};
 
 use flash_sale::{
-    api::{self, checkout::SoldOutFlags, orders::ProgressCache},
+    api::{self, checkout::SoldOutFlags},
     cache,
     config::Config,
     db,
@@ -48,8 +48,6 @@ async fn main() -> std::io::Result<()> {
     log::info!("Connected to Redis ({connections} connections each to inventory and read cache)");
     let next_connection = Arc::new(AtomicUsize::new(0));
 
-    let progress_cache = web::Data::new(ProgressCache::default());
-
     // One flag set and one refresher task per replica, shared by all workers
     let sold_out = web::Data::new(SoldOutFlags::default());
     actix_web::rt::spawn(api::checkout::run_refresher(sold_out.clone(), redis[0].clone()));
@@ -69,7 +67,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(redis[i].clone()))
             .app_data(web::Data::new(read_cache[i].clone()))
             .app_data(checkout_queue.clone())
-            .app_data(progress_cache.clone())
             .app_data(sold_out.clone())
             .app_data(config.clone())
             .app_data(api::json_config())

@@ -50,9 +50,9 @@ SALE=$(create_sale "$UNITS" 25)
 echo "Sale $SALE"
 
 wait_ports_free
+target_urls
 echo "Running the generator"
-SALE_ID=$SALE USERS_FILE=$WORK/users JWT_SECRET=$JWT_SECRET BASE_URL=$BASE_URL REPORT_JSON=$WORK/report.json \
-  ./load/flash/target/release/flash-load | tee "$WORK/report.txt"
+run_generator
 
 echo "Waiting for the system to settle"
 CONVERGED=0
@@ -97,6 +97,8 @@ echo "INFO  turned away by rate limits (429): $(j .rate_limited_429)"
   echo "## $(date -u +'%F %H:%M') UTC: backlog, $N users, $UNITS units, processor throttled to $RATE/s"
   echo
   echo "All users check out within ${ARRIVAL_SECS} s of the sale opening; the processor starts $RATE messages per second, so the queue needs about ${EXPECTED_DRAIN} s to drain. Payment window ${PAYMENT_WINDOW_SECS} s; ${PAY_RATIO} of the users pay, 55-70 % of the window after their link appeared; poll every ${POLL_MS} ms. One machine, one order processor, three replicas behind NGINX (gateway started with GATEWAY_TRUST_XFF=1). The design point is N=UNITS=100000 at 1,000/s (same script)."
+  echo
+  setup_note
   echo
   sed -n '/^Finished/,/^JSON summary/p' "$WORK/report.txt" | grep -v '^JSON summary'
   echo

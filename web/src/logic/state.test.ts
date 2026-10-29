@@ -80,15 +80,9 @@ describe('mapCheckoutResponse', () => {
 });
 
 describe('mapStatusResponse', () => {
-  it('maps PENDING with a queue position', () => {
-    expect(mapStatusResponse(200, { status: 'PENDING', position: 7 })).toEqual({
-      kind: 'pending',
-      position: 7,
-    });
-    expect(mapStatusResponse(200, { status: 'pending' })).toEqual({
-      kind: 'pending',
-      position: null,
-    });
+  it('maps PENDING', () => {
+    expect(mapStatusResponse(200, { status: 'PENDING' })).toEqual({ kind: 'pending' });
+    expect(mapStatusResponse(200, { status: 'pending' })).toEqual({ kind: 'pending' });
   });
 
   it('maps AWAITING_PAYMENT with the payment link and expiry', () => {
@@ -136,11 +130,10 @@ describe('mapStatusResponse', () => {
 
 describe('statusToScreen', () => {
   it('maps a queue update and keeps the ticket', () => {
-    expect(statusToScreen({ kind: 'pending', position: 3 }, '42.a')).toEqual({
+    expect(statusToScreen({ kind: 'pending' }, '42.a')).toEqual({
       kind: 'queue',
       ticket: '42.a',
-      position: 3,
-      note: 'You are in line.',
+      note: '',
     });
   });
 
@@ -173,7 +166,7 @@ describe('final states', () => {
     expect(finalStatusName({ kind: 'expired' })).toBe('EXPIRED');
     expect(finalStatusName({ kind: 'failed', message: 'x' })).toBe('FAILED');
     expect(finalStatusName({ kind: 'refunded' })).toBe('REFUNDED');
-    expect(finalStatusName({ kind: 'pending', position: 1 })).toBeNull();
+    expect(finalStatusName({ kind: 'pending' })).toBeNull();
   });
 
   it('restores a screen from a stored final status', () => {
@@ -249,7 +242,7 @@ describe('stopsPolling', () => {
     expect(stopsPolling({ kind: 'confirmed' }, true, null, 0)).toBe(true);
     expect(stopsPolling({ kind: 'refunded' }, true, null, 0)).toBe(true);
     expect(stopsPolling(expired, false, 0, 0)).toBe(true);
-    expect(stopsPolling({ kind: 'pending', position: 3 }, true, null, 0)).toBe(false);
+    expect(stopsPolling({ kind: 'pending' }, true, null, 0)).toBe(false);
   });
 
   it('keeps a payer polling on EXPIRED for the refund grace period', () => {

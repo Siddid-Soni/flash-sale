@@ -231,14 +231,10 @@ async fn set_status_only_moves_forward() {
 
     assert_eq!(cache::read_status(&mut cache_con, &ticket).await.unwrap(), None);
 
-    let pending = write(OrderStatus::Pending, |u| {
-        u.partition = Some(2);
-        u.offset = Some(41);
-        u.sale = Some(9);
-    });
+    let pending = write(OrderStatus::Pending, |u| u.sale = Some(9));
     assert!(cache::set_status(&mut cache_con, &ticket, &pending).await.unwrap());
     let cached = cache::read_status(&mut cache_con, &ticket).await.unwrap().unwrap();
-    assert_eq!((cached.status, cached.user, cached.partition, cached.offset), (OrderStatus::Pending, 7, Some(2), Some(41)));
+    assert_eq!((cached.status, cached.user), (OrderStatus::Pending, 7));
     let ttl: i64 = con.ttl(cache::status_key(&ticket)).await.unwrap();
     assert!((86_300..=86_400).contains(&ttl), "ttl {ttl}");
 

@@ -9,7 +9,7 @@
  * against 1.5 s. Lighthouse is deliberately NOT a dependency: the check is
  * skipped, with a clear message, when the tools are absent.
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -54,6 +54,24 @@ function walk(directory) {
 function which(command) {
   const result = spawnSync('which', [command], { encoding: 'utf8' });
   return result.status === 0 ? result.stdout.trim() : null;
+}
+
+/** `spawnSync`'s result shape (status, stderr), without blocking the event loop */
+function run(command, args, { timeout, env }) {
+  return new Promise((resolveRun) => {
+    const child = spawn(command, args, { env, stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => (stderr += chunk));
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      resolveRun({ status: null, stderr: String(error) });
+    });
+    child.on('close', (status) => {
+      clearTimeout(timer);
+      resolveRun({ status, stderr });
+    });
+  });
 }
 
 function findLighthouse() {
@@ -160,7 +178,9 @@ async function checkLighthouse() {
   const reportPath = join(tmpdir(), `flash-sale-lighthouse-${process.pid}.json`);
 
   try {
-    const result = spawnSync(
+    // Not spawnSync: it would block this process's event loop, and with it the
+    // server above that Lighthouse is loading the page from
+    const result = await run(
       lighthouse,
       [
         `http://127.0.0.1:${port}/`,

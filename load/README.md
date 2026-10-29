@@ -16,7 +16,14 @@ before the sale; `SESSION_SAMPLE` (default 50) users call `POST /v1/session` for
 
 ## How load reaches the system
 
-- Port 8000 only (the replicas publish no port). The scripts start the gateway with `GATEWAY_TRUST_XFF=1` and the
+- The generator sends to the gateway container's own address on the compose network (the host routes there
+  directly), not to `localhost:8000`: through the published port every connection also passes Docker's userland
+  proxy, which used ~9 cores at 30k req/s and capped earlier runs. Payments go to the provider's container address
+  (`172.28.0.50:8090`) the same way. `BASE_URL` (and `PROVIDER_URL`) override both.
+- The generator runs on its own cores (`taskset`) and the whole stack on the rest (`load/compose.pin.yml`, a cpuset
+  per service), so the generator cannot take CPU from what it measures: by default the first ~30% of the cores
+  (`GEN_CPUS`, `0-5` on 20 cores) and the rest (`STACK_CPUS`). `PIN_CPUS=0` turns it off. The report says which.
+- The replicas publish no port. The scripts start the gateway with `GATEWAY_TRUST_XFF=1` and the
   generator sends a distinct `X-Forwarded-For` (`10.x.y.z` from the user's index) and a browser-like `User-Agent`;
   otherwise every request would come from the bridge address and meet the per-IP limits by design.
 - The sale is created from inside the gateway container (`docker compose exec -T gateway wget ...`), because
@@ -41,13 +48,26 @@ of the machine than of the design. Knobs: `ARRIVAL_SECS`, `PAY_RATIO`, `LATE_RAT
 
 ## Known local limits
 
-- **Ephemeral ports.** Clients on one host have about 28,000 local ports; connections of a finished run stay in
-  `TIME_WAIT` for a minute. A 100,000-user run started right after another one saw ~3,300 connection failures (retried
-  with the same key, so correctness held, but the check "zero network failures" failed). The scripts wait for the
-  `TIME_WAIT` count to fall under 3,000 before starting the generator.
-- **Docker's userland proxy** sits between the host and the gateway's published port, and the generator's own CPU use
-  adds to the load on the machine; client-side latencies include both. Against a real deployment the generator would
-  run on several machines.
+- **Ephemeral ports.** Clients on one host have about 28,000 local ports by default (`32768-60999`), and closed
+  connections stay in `TIME_WAIT` for a minute. A burst of 100,000 users in 3 s needs more connections than that:
+  without the settings below the generator fails with `Cannot assign requested address (os error 99)`. The default
+  `tcp_tw_reuse = 2` reuses `TIME_WAIT` ports for loopback only, and the generator's connections cross the Docker
+  bridge. Before a large run (they reset on reboot):
+
+  ```bash
+  sudo sysctl -w net.ipv4.ip_local_port_range="10000 65535" net.ipv4.tcp_tw_reuse=1
+  ```
+
+  The range starts at 10000 so no outgoing connection takes a port a local service listens on (5432, 6379, 8000...).
+  The scripts also wait for the `TIME_WAIT` count to fall under 3,000 before starting the generator.
+- **Anything polling Docker.** Tools that stream container stats (`lazydocker`, `docker stats`, a dashboard) kept
+  `dockerd` and `containerd` at about 2 cores even with the stack idle. Those daemons are not pinned, so they ran on
+  the generator's cores and starved it. Close them during a run.
+- **Generator cores.** With 6 cores (the default split on 20) and a 3 s burst of 100,000 users the generator could
+  not keep up; with 10 (`GEN_CPUS=0-9 STACK_CPUS=10-19`) the run was clean: 34k checkouts/s, 0 network failures. The
+  stack used about 8 of its 10 cores.
+- **One machine.** Even pinned, the generator shares the host's memory bandwidth, kernel and network stack with the
+  stack. Against a real deployment it would run on several machines.
 - **One processor, one worker, one Redis, one broker**: no failover is exercised. The checkout-to-link time in the flash
   test (about 1-3 s) is the processor's single pass, not a capacity limit of the design.
 - **Pay timing.** The classification "surely in time / boundary / after expiry" uses a margin (`MARGIN_MS`, 1.5 s)

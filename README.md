@@ -2,18 +2,19 @@
 
 A backend and storefront for a flash sale: 500 smartphones go on sale at a fixed time, more than 100,000 requests reach checkout in the first 10 seconds, and exactly 500 units are sold, never more. Winners get an answer in milliseconds (`202 Accepted` and a queue ticket), everyone else gets `410 Gone` just as fast, and the slow parts (Kafka, order processing, payment, PostgreSQL) only ever see the roughly 500 winners. Stock is reserved by one atomic Lua script in Redis; PostgreSQL has a conditional `UPDATE` as a second line of defence. Redis gates admission only; Kafka is the queue; PostgreSQL decides every outcome.
 
-The design is in [ROADMAP.md](ROADMAP.md). How it answers the placement case study is in [CASE_STUDY.md](CASE_STUDY.md). The HTTP API is in [API_REFERENCE.md](API_REFERENCE.md).
+The design is described below. How it answers the placement case study is in [CASE_STUDY.md](CASE_STUDY.md). The HTTP API is in [API_REFERENCE.md](API_REFERENCE.md).
 
 ## Architecture
 
 | Component | What it does | Code |
 |---|---|---|
-| Client | Preact app: countdown, buy button (locks on the first click), queue and payment states, status polling every 2 s | `web/` |
+| Frontend (static) | The storefront as static files: Vite builds the Preact app into `web/dist` (47.5 kB raw, 16.7 kB gzipped, hashed and immutable). It is the CDN's origin; in compose the gateway image bundles it and NGINX serves it, standing in for a CDN in front of a storage bucket | `web/`, `gateway/Dockerfile` |
+| Client | The browser running that app: countdown, buy button (locks on the first click), queue and payment states, status polling every 2 s | `web/src/` |
 | Gateway | NGINX on `:8000`: serves the frontend, sends checkout and status to three Order Service replicas (least connections, failover) and sessions, sale details, the list, search and admin to the site service, rate limits, bot filter, hides `/v1/admin/`, caches the site's sale routes at the edge (details 1 s, list and search 5 s), sends the webhook (from the provider's address only) to the order processors. The payment page is not behind it | `gateway/` |
 | Order Service x3 | Stateless HTTP API of the case study and nothing else: `POST /v1/sales/{id}/checkout` and `GET /v1/orders/status/{ticket}`. Status is answered from the read cache only; its one PostgreSQL use is the `FAILED` claim when a Kafka publish fails | `src/bin/order_service.rs`, `src/api/checkout.rs`, `src/api/orders.rs` |
 | Site service | Everything else the storefront needs, so it can never take capacity, connections or database time from checkout: guest sessions, sale details, the sale list, search by name, admin sale creation. One replica with its own small PostgreSQL pool; reads Redis only for `sold_out`, writes it only when a sale is created | `src/bin/site.rs`, `src/api/` |
 | Redis (inventory) | Admission only: `stock:{sale}`, `user_live:{sale}:{user}`, the idempotency key and `sale_start:{sale}`; no per-ticket state, and it does not count sales, PostgreSQL is the record of those. Append-only file on | `scripts/*.lua`, `src/cache.rs` |
-| Redis (read cache) | `status:<ticket>` and queue progress, what clients poll. Its own instance (`redis-cache`, host port 6380; `READ_CACHE_URL`), with AOF and `noeviction`: the status endpoint reads only this | `src/cache.rs` |
+| Redis (read cache) | `status:<ticket>`, what clients poll. Its own instance (`redis-cache`, host port 6380; `READ_CACHE_URL`), with AOF and `noeviction`: the status endpoint reads only this | `src/cache.rs` |
 | Kafka | Topic `orders.checkout` (6 partitions): checkout events from the Order Service to the processors | `src/queue.rs` |
 | Order Processor | Turns each checkout event into an order and a payment link; serves the provider's webhook (`POST /v1/payments/webhook` on `:8081`) and confirms or refunds a paid order at once; retries unprocessed payment events from the inbox | `src/bin/order_processor.rs`, `src/processor.rs`, `src/inbox.rs` |
 | Expiration Worker | Driven by PostgreSQL: expires the unpaid orders whose `expires_at` has passed in one batch `UPDATE`, then returns each order's unit to stock (`INCR stock`, clear `user_live`) once, and writes `EXPIRED` to the read cache and expires the payment session. The only place stock is returned (besides the Order Service's compensation for a failed publish) | `src/expiry.rs` |
@@ -33,6 +34,20 @@ The Order Service serves only checkout and status, on Redis and Kafka; it reache
 5. The provider sends a signed webhook. It reaches an order processor through the gateway (only from the provider's address, and only with a valid signature). The processor stores the event in `payment_inbox` and decides at once, in one PostgreSQL transaction: `UPDATE orders SET status = 'CONFIRMED' WHERE ... AND status = 'AWAITING_PAYMENT' AND payment_session_id = $2 AND expires_at > now()` together with `UPDATE products SET sold = sold + 1 WHERE id = $1 AND sold < total_inventory`. The payment path writes no inventory key in Redis, only the read-cache status. If the order cannot be confirmed (it is already `EXPIRED` or `FAILED`, or the guard refused an in-time payment), the same transaction marks it `REFUNDED` and the processor refunds through the provider; the inbox row is marked processed only when that worked, and the inbox loop retries anything unfinished. The inbox never decides a deadline: a payment for an order still `AWAITING_PAYMENT` after its `expires_at` stays in the inbox and is retried until the expiration worker has expired the order, then refunded with no stock moved.
 6. The Expiration Worker is driven by PostgreSQL: each tick one statement (`UPDATE orders SET status = 'EXPIRED' ... WHERE status = 'AWAITING_PAYMENT' AND expires_at <= now() ... FOR UPDATE SKIP LOCKED RETURNING ...`, the mirror image of the confirmation; the row lock and the one clock give exactly one winner) expires a batch. For each order returned it runs `return_unit.lua` once, without retry: `INCR stock`, and `user_live` is deleted if it still names the ticket. A Redis error is logged with the ticket and the unit is lost for the rest of the sale ([docs/FAILURE_CASES.md](docs/FAILURE_CASES.md)). Then it writes `EXPIRED` to the read cache and expires the payment session. A `CONFIRMED` order is never touched, so its unit stays taken. Several workers can run at once.
 
+### Where the frontend runs, and how to deploy it
+
+The frontend has no container or service of its own in this repository. It is a static build: `npm run build` in `web/` writes `web/dist` (Preact + Vite, about 17 kB gzipped, hashed file names). For local runs only, `gateway/Dockerfile` builds it and copies `web/dist` into the NGINX image, so the gateway serves the pages on `:8000` next to the API. That keeps the compose stack to one entry point, but it ties every frontend change to a gateway rebuild and puts page loads on the same NGINX that takes the checkout spike.
+
+In production it should be deployed separately, as the diagram shows (Frontend as the CDN's origin):
+
+1. **Build** in CI: `cd web && npm ci && npm run build`.
+2. **Upload** `web/dist` to object storage (S3, GCS, R2...): first `assets/` with `Cache-Control: public, max-age=31536000, immutable` (the names are content hashes, so a file never changes), then `index.html` and `product.svg` with `Cache-Control: no-cache`, so the new page only goes live once every asset it names is there.
+3. **Put a CDN in front** of the bucket and of the gateway on one domain, routing by path: `/`, `/assets/*`, `/product.svg` to the bucket; `/v1/*` to the gateway. One origin for the browser means no CORS and the session token works as it does now. The CDN can also cache the site routes (sale details 1 s, the list and search 5 s, as NGINX does here); checkout and status pass through uncached.
+4. **Configure** `PUBLIC_BASE_URL` and `FRONTEND_URL` as that domain, so the payment page sends buyers back to it.
+5. **Drop** the `web` build stage and the `COPY --from=web` line from `gateway/Dockerfile`, and the static `location`s from `gateway/nginx.conf`: the gateway then serves only the API.
+
+A frontend deploy is then an upload and a purge of `index.html`, with no gateway restart, and a flood of page loads before the sale is absorbed at the edge instead of by the gateway.
+
 ## Quick start
 
 Needs Docker with compose v2. The first build compiles the Rust binaries and the frontend, so it takes a while.
@@ -42,7 +57,28 @@ docker compose up -d                          # PostgreSQL 16, two Redis 7 (inve
 docker compose --profile app up -d --build    # + 3 Order Services, site service, order processor, expiration worker, fake payment provider (:8090), NGINX (:8000)
 ```
 
-Open <http://localhost:8000>. There is no sale yet; create one from inside the gateway container (the host is refused with `403` on purpose). This opens in one minute:
+Open <http://localhost:8000>. There is no sale yet; create one (see [Creating sales](#creating-sales)). This one opens in one minute:
+
+```bash
+scripts/create_sale.sh
+```
+
+It prints the sale and its page, `http://localhost:8000/?sale=<id>`; `http://localhost:8000/` lists the sales still selling. `http://localhost:8000/` also has a search box (`GET /v1/sales/search?q=`). Pay on the fake payment page: the link in the order status is the provider's own address, `http://localhost:8090/fake-pay/...`, outside the gateway; its "Back to the sale" link returns to the frontend (`FRONTEND_URL`). The webhook arrives within a second or so and the order becomes `CONFIRMED`.
+
+Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
+
+## Creating sales
+
+`scripts/create_sale.sh [name] [units] [price_cents] [opens_in_seconds]` creates a sale and prints it with its page link. The defaults are `Phone`, 500 units, `49900` ($499.00) and 60 seconds:
+
+```bash
+scripts/create_sale.sh                            # Phone, 500 units, $499.00, opens in 60 s
+scripts/create_sale.sh "Pixel 10" 3 79900 30      # 3 units at $799.00, opens in 30 s
+scripts/create_sale.sh "Open now" 10 19900 0      # opens immediately
+ADMIN_TOKEN=... scripts/create_sale.sh            # another admin token (default: dev-admin-token from .env)
+```
+
+The admin route is refused from the host with `403` on purpose, so the script posts from inside the gateway container. The same request by hand:
 
 ```bash
 docker compose exec -T gateway wget -qO- \
@@ -51,9 +87,20 @@ docker compose exec -T gateway wget -qO- \
   http://127.0.0.1/v1/admin/sales
 ```
 
-The answer contains the sale `id`. `http://localhost:8000/` lists the sales; each links to its page, `http://localhost:8000/?sale=<id>`. `dev-admin-token` is `ADMIN_TOKEN` in `.env`. `http://localhost:8000/` also has a search box (`GET /v1/sales/search?q=`). Pay on the fake payment page: the link in the order status is the provider's own address, `http://localhost:8090/fake-pay/...`, outside the gateway; its "Back to the sale" link returns to the frontend (`FRONTEND_URL`). The webhook arrives within a second or so and the order becomes `CONFIRMED`.
+Without the gateway (services run with cargo), post to the site service on `:8082` directly; see [Running locally with cargo](#running-locally-with-cargo).
 
-Stop only the application with `docker compose --profile app stop gateway order-service-1 order-service-2 order-service-3 site order-processor expiration-worker fake-payment-provider` (`--profile app stop` alone also stops PostgreSQL, Redis and Kafka). `docker compose down -v` also removes the data.
+## Browser run-through
+
+With the stack up (Quick start), one command drives the storefront in a real browser: it creates a 5-unit sale that opens in 12 seconds, waits for the countdown, buys, pays on the fake payment page and waits for "Order confirmed", saving a screenshot of each step to `web/demo-shots/`.
+
+```bash
+cd web
+npm install
+npm run demo                 # new sale
+npm run demo -- <saleId>     # or an existing sale that has not sold out
+```
+
+It uses the system Chromium (`CHROMIUM_PATH`, default `/usr/bin/chromium`) and sends a normal browser user agent, since the gateway refuses `HeadlessChrome`. `DEMO_BASE_URL` (default `http://localhost:8000`) and `DEMO_OUT` (default `demo-shots`) change where it goes and where the screenshots land.
 
 ## Running locally with cargo
 
@@ -89,7 +136,7 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `BIND_ADDR` | `127.0.0.1:8080` | Where the Order Service listens (`0.0.0.0:8080` in containers) |
 | `SITE_BIND_ADDR` | `127.0.0.1:8082` | Where the site service listens (`0.0.0.0:8082` in containers) |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | Inventory Redis: stock, `user_live`, idempotency keys, sale start times. The fake provider keeps its `fakepay:*` keys in it too (and nothing else touches them) |
-| `READ_CACHE_URL` | `REDIS_URL` | Read cache Redis: `status:<ticket>` and queue progress. Its own instance in compose (`redis-cache`, `redis://127.0.0.1:6380` from the host); must not evict |
+| `READ_CACHE_URL` | `REDIS_URL` | Read cache Redis: `status:<ticket>`. Its own instance in compose (`redis-cache`, `redis://127.0.0.1:6380` from the host); must not evict |
 | `REDIS_CONNECTIONS` | `8` | Redis connections per Order Service (each multiplexes many requests) |
 | `KAFKA_BROKERS` | `localhost:9092` | Bootstrap servers |
 | `CHECKOUT_TOPIC` | `orders.checkout` | Topic for checkout events |
@@ -117,10 +164,11 @@ Every binary reads its environment (and `.env`) through `src/config.rs`. A varia
 | `HTTP_MAX_CONNECTIONS` | `25000` | Connections accepted per worker thread |
 | `HTTP_BACKLOG` | `4096` | Listen queue length, so a burst waits instead of being refused |
 | `HTTP_KEEP_ALIVE_SECS` | `75` | Idle keep-alive time; keep it above the gateway's upstream `keepalive_timeout` (60 s) |
-| `RUST_LOG` | `info` | Log level (`env_logger`) |
+| `RUST_LOG` | `info` | Log level (`env_logger`); compose passes it on, and the load scripts set `info,actix_web::middleware::logger=warn` (no line per request) |
 | `TEST_REDIS_URL` | `redis://127.0.0.1:6379/15` | Redis database used by `cargo test` only |
+| `TEST_DATABASE_URL` | `flash_sale_test` on the server of `DATABASE_URL` | PostgreSQL database used by `cargo test` only (created on first use) |
 
-Two more switches belong to compose, not to the binaries: `GATEWAY_TRUST_XFF=1` makes the gateway take the client address from `X-Forwarded-For` (load tests only), and `PAYMENT_WINDOW_SECS` / `PROCESSOR_MAX_PER_SEC` can be set in the shell when running `docker compose` because `docker-compose.yml` passes them on.
+More switches belong to compose, not to the binaries: `GATEWAY_TRUST_XFF=1` makes the gateway take the client address from `X-Forwarded-For` (load tests only), `GATEWAY_ACCESS_LOG=0` turns off the gateway's access log (load tests only), and `PAYMENT_WINDOW_SECS` / `PROCESSOR_MAX_PER_SEC` can be set in the shell when running `docker compose` because `docker-compose.yml` passes them on.
 
 ## Tests
 
@@ -130,13 +178,29 @@ cargo test               # integration tests in tests/, unit tests in src/
 cargo clippy --all-targets
 ```
 
-The integration tests use Redis database 15 and create a unique Kafka topic per run (it stays on the local broker). Do not run `cargo test` while the application containers are up: they share PostgreSQL's connections, the payment inbox and the Kafka consumer group (an order processor would handle the tests' payment events, a worker would expire their orders), and the expiry lag test fails. The frontend has its own checks: `cd web && npm test && npm run budgets`. The tests start the fake provider's API and payment page on a free port of their own, so nothing but PostgreSQL, Redis and Kafka needs to run. `gateway/smoke.sh` checks the gateway end to end against the running stack (including that the webhook is refused from the host and a full purchase through the provider and the order processor); it creates a 5-unit sale and briefly stops `order-service-2` to test failover.
+The integration tests use their own PostgreSQL database, `flash_sale_test` on the same server (created on first use; `TEST_DATABASE_URL` overrides it), Redis database 15 (`TEST_REDIS_URL`) and a unique Kafka topic per run (it stays on the local broker), so their sales never show on the dev home page. Do not run `cargo test` while the application containers are up: they share PostgreSQL's connections, the payment inbox and the Kafka consumer group (an order processor would handle the tests' payment events, a worker would expire their orders), and the expiry lag test fails. The frontend has its own checks: `cd web && npm test && npm run budgets`. The tests start the fake provider's API and payment page on a free port of their own, so nothing but PostgreSQL, Redis and Kafka needs to run. `gateway/smoke.sh` checks the gateway end to end against the running stack (including that the webhook is refused from the host and a full purchase through the provider and the order processor); it creates a 5-unit sale and briefly stops `order-service-2` to test failover.
 
 ## Benchmarks
 
 Measured on one machine (20 cores) with everything on it: the load generator, NGINX, three Order Service replicas, the site service, one order processor, one expiration worker, PostgreSQL 16, Redis 7 and Kafka in Docker. Each simulated user has its own `X-Forwarded-For` (gateway started with `GATEWAY_TRUST_XFF=1`), a browser User-Agent and its own token. 60% of winners pay (5% of those deliberately at the deadline or after it), the rest abandon; the payment window is 30 s so abandoned stock comes back during the run. Full output, settings and checks: [load/RESULTS.md](load/RESULTS.md); how to run them: [load/README.md](load/README.md).
 
-> These runs were made at commit `c973ece`, before PostgreSQL took over the payment decision and before Redis stopped keeping holds (Stage 11). Checkout and status polling, the parts these numbers stress, only got lighter since (`checkout.lua` writes fewer keys); the load tests have not been rerun on the new design.
+### Flash sale burst: 100,000 users within 3 s, 500 units (`GEN_CPUS=0-9 STACK_CPUS=10-19 ARRIVAL_SECS=3 load/flash.sh 100000`)
+
+On the current design. The generator ran on cores 0-9 and the whole stack on cores 10-19, and the generator sent to the gateway's container address rather than `localhost:8000` (see [load/README.md](load/README.md) for why both matter).
+
+| Endpoint | Requests | Peak req/s | p50 ms | p95 ms | p99 ms | Max ms | Responses |
+|---|---|---|---|---|---|---|---|
+| `GET /v1/sales/{id}` | 100,000 | 33,795 | 3.1 | 43.2 | 59.7 | 104.0 | 200: 100,000 |
+| `POST /v1/sales/{id}/checkout` | 100,000 | 34,314 | 6.3 | 86.0 | 119.6 | 182.5 | 202: 500, 410: 99,500 |
+| `GET /v1/orders/status/{ticket}` | 5,937 | 263 | 0.8 | 8.1 | 71.7 | 178.7 | 200: 5,937 |
+| `POST /fake-pay/{session}/pay` | 322 | 58 | 0.7 | 1.2 | 3.4 | 6.0 | 303: 312, 410: 10 |
+
+- Exactly 500 units reserved; outcome 312 `CONFIRMED` (every payment in time), 188 `EXPIRED` (stock returned).
+- 0 rate-limit answers, 0 server errors, 0 network failures, 0 retries; every check passed.
+- At the peak the stack used about 8 of its 10 cores (NGINX 5.2, the three Order Services 2.3); Redis, Kafka and PostgreSQL barely registered.
+- Checkout to payment link: p50 7.8 s, max 9.5 s. All 500 winners arrive within 3 s and one order processor works through them; the least time left to pay when a link appeared was 27.8 s of 30.
+
+> The runs below were made at commit `c973ece`, before PostgreSQL took over the payment decision and before Redis stopped keeping holds. They went through `localhost:8000` (Docker's port proxy) without CPU pinning. Checkout and status polling only got lighter since (`checkout.lua` writes fewer keys).
 
 ### Flash sale: 100,000 users within 10 s, 500 units (`load/flash.sh 100000`)
 
@@ -174,19 +238,6 @@ The queue takes about 50 s to drain while the payment window is 30 s, so the tes
 | Status polls | 237,456 at up to 5,072 req/s, p99 2.7 ms |
 | Outcome | 4,942 `CONFIRMED` (every payer), 5,058 `EXPIRED` |
 
-### Oversell demo: five ways to sell 500 units to 5,000 concurrent buyers (`load/oversell_demo.sh`)
-
-PostgreSQL strategies share a pool of 50 connections (latency includes waiting for one); default isolation (`READ COMMITTED`).
-
-| Strategy | Told yes | Oversold | Seconds | Buyers/s | p99 ms | Notes |
-|---|---|---|---|---|---|---|
-| Naive `SELECT` then `UPDATE` | 5,000 | **4,500** | 4.24 | 1,179 | 4,201 | lost updates: the store recorded only 116 decrements |
-| `SELECT ... FOR UPDATE` | 500 | no | 4.61 | 1,086 | 4,566 | row-lock waits up to 528 ms |
-| `FOR UPDATE`, `lock_timeout` 20 ms | 500 | no | 2.53 | 1,976 | 2,505 | 2,313 buyers gave up on lock timeouts |
-| Optimistic `version` column | 500 | no | 10.26 | 487 | 10,257 | 12,800 retries |
-| `UPDATE ... WHERE stock > 0` | 500 | no | 0.57 | 8,787 | 565 | one statement, one hot row |
-| Redis Lua script | 500 | no | 0.02 | 208,225 | 19.8 | what checkout uses |
-
 ## Repository layout
 
 | Path | Contents |
@@ -194,22 +245,21 @@ PostgreSQL strategies share a pool of 50 connections (latency includes waiting f
 | `src/bin/` | The five binaries: `order_service`, `site`, `order_processor`, `expiration_worker`, `fake_payment_provider` |
 | `src/api/` | HTTP routes (`checkout`, `orders` for the Order Service; `session`, `sales`, `admin` for the site service; `payments`, the webhook, for the order processor) |
 | `src/cache.rs` | Redis keys and the Rust wrappers around the Lua scripts |
-| `src/processor.rs`, `src/inbox.rs` | Checkout event handling with progress tracking; payment events: the decision between payment and deadline, confirm or refund, on receipt and on retry |
+| `src/processor.rs`, `src/inbox.rs` | Checkout event handling (commits only the contiguous finished prefix of each partition); payment events: the decision between payment and deadline, confirm or refund, on receipt and on retry |
 | `src/expiry.rs` | Expiration worker logic: expire pass (PostgreSQL decides, Redis follows) and sweep |
 | `src/queue.rs` | Kafka producer and topic creation |
 | `src/payment/` | Provider interface and its HTTP client, the fake provider (state, API, payment page), webhook signing, webhook dispatcher |
 | `src/actions/`, `src/models.rs`, `src/schema.rs` | PostgreSQL queries (Diesel), models |
-| `scripts/` | Lua: `checkout`, `return_unit`, `set_status`, `set_max`, and the fake provider's `fakepay_*` |
+| `scripts/` | Lua: `checkout`, `return_unit`, `set_status`, and the fake provider's `fakepay_*`; `create_sale.sh` (see [Creating sales](#creating-sales)) |
 | `migrations/` | The schema migrations (embedded in the Order Service, run at startup) |
 | `tests/` | Integration tests against real PostgreSQL, Redis and Kafka |
 | `gateway/` | NGINX configuration, bot list, njs JWT reader, `smoke.sh` ([README](gateway/README.md)) |
-| `web/` | Preact + Vite storefront ([README](web/README.md)) |
-| `load/` | Load generator, backlog test, oversell demo, `RESULTS.md` ([README](load/README.md)) |
+| `web/` | Preact + Vite storefront ([README](web/README.md)); `scripts/demo-run.mjs` drives a purchase in a real browser (`npm run demo`) |
+| `load/` | Load generator, backlog test, oversell demo, `compose.pin.yml` (CPU pinning for load runs), `RESULTS.md` ([README](load/README.md)) |
 | `docker-compose.yml`, `Dockerfile` | Infrastructure and the application image (all five binaries) |
 
 ## More documents
 
 - [API_REFERENCE.md](API_REFERENCE.md): every route, status code, header and example.
 - [CASE_STUDY.md](CASE_STUDY.md): the case study mapped to the code and the measured results, with the trade-offs.
-- [ROADMAP.md](ROADMAP.md): the design, Redis keys and the build stages.
 - [docs/FAILURE_CASES.md](docs/FAILURE_CASES.md): the rare failures the design accepts on purpose.

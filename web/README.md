@@ -27,6 +27,16 @@ npm run build
 `tsc --noEmit` type-checks, then Vite writes `dist/` with hashed, immutable
 asset names and `/` as the base path (NGINX serves it, Stage 7).
 
+## Browser run-through
+
+```bash
+npm run demo                 # against the compose stack on :8000; screenshots in demo-shots/
+npm run demo -- <saleId>     # an existing sale instead of a new one
+```
+
+`scripts/demo-run.mjs` (Playwright, system Chromium at `CHROMIUM_PATH`) creates a sale through the gateway container,
+buys, pays on the fake provider's page and waits for "Order confirmed". See the root README.
+
 ## Tests and budgets
 
 ```bash

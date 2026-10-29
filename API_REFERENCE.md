@@ -40,7 +40,7 @@ Internal errors answer `500 {"message": "internal error"}`; the detail goes to t
 | Method and path | Served by | Auth | Purpose |
 |---|---|---|---|
 | `POST /v1/session` | site | none | Create a guest session |
-| `GET /v1/sales` | site | none | The latest sales (home page) |
+| `GET /v1/sales` | site | none | The latest sales still selling (home page) |
 | `GET /v1/sales/search?q=` | site | none | Search sales by name |
 | `GET /v1/sales/{sale_id}` | site | none | Sale details |
 | `POST /v1/admin/sales` | site | `X-Admin-Token` | Create a sale |
@@ -67,7 +67,7 @@ curl -s -X POST http://localhost:8000/v1/session
 
 ### `GET /v1/sales`
 
-Public, served by the site service. The latest 50 sales, latest start time first, each with the same fields as `GET /v1/sales/{sale_id}`. Cached by the gateway for 5 s (a new sale shows within about 5 s, nothing is purged; the query string is ignored); read from PostgreSQL (one query) and Redis (one `MGET` for `sold_out`) on a miss.
+Public, served by the site service. The latest 50 sales still selling, latest start time first (a sale whose every unit is paid for is over and left out; one whose stock is only reserved stays, shown `sold_out`, since unpaid units come back), each with the same fields as `GET /v1/sales/{sale_id}`. Cached by the gateway for 5 s (a new sale shows within about 5 s, nothing is purged; the query string is ignored); read from PostgreSQL (one query) and Redis (one `MGET` for `sold_out`) on a miss.
 
 ```bash
 curl -s http://localhost:8000/v1/sales
@@ -79,7 +79,7 @@ curl -s http://localhost:8000/v1/sales
 
 ### `GET /v1/sales/search?q=`
 
-Public, served by the site service. The sales whose name contains `q`, any case, in the shape and order of the list, at most 50. The server trims `q`, lowercases it and uses its first 64 characters; `%`, `_` and `\` in it match themselves, not as wildcards. An empty or missing `q` answers like `GET /v1/sales`. Cached by the gateway for 5 s per `q` (other query parameters are ignored); a per-IP limit of 5 r/s (burst 20) applies, over which the gateway answers `429`.
+Public, served by the site service. The sales still selling whose name contains `q`, any case, in the shape and order of the list, at most 50. The server trims `q`, lowercases it and uses its first 64 characters; `%`, `_` and `\` in it match themselves, not as wildcards. An empty or missing `q` answers like `GET /v1/sales`. Cached by the gateway for 5 s per `q` (other query parameters are ignored); a per-IP limit of 5 r/s (burst 20) applies, over which the gateway answers `429`.
 
 ```bash
 curl -s 'http://localhost:8000/v1/sales/search?q=phone'
@@ -149,7 +149,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 
 | `status` | Extra fields | Meaning |
 |---|---|---|
-| `PENDING` | `position` | In the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache only). `position` 1 is next, `0` is being processed. It counts messages on the same Kafka partition, other sales' included, so it is an upper bound. Missing if the entry does not know its partition |
+| `PENDING` | | A unit is reserved and the checkout is in the queue; no order exists yet (`PENDING` is never stored in PostgreSQL: it comes from the read cache only). Usually lasts a few seconds, until the processor writes the payment link |
 | `AWAITING_PAYMENT` | `payment_url`, `expires_at` | Pay at `payment_url` before `expires_at` (RFC 3339, milliseconds) |
 | `CONFIRMED` | | Paid in time (PostgreSQL decided and counted it in `products.sold`). Final. The unit stays taken: the expiration worker never returns a confirmed order's stock |
 | `EXPIRED` | | The payment window ran out; the expiration worker expired the order and returned the unit. Final |
@@ -157,7 +157,7 @@ curl -s http://localhost:8000/v1/orders/status/1.6f1c2a0e-... -H "Authorization:
 | `REFUNDED` | | A payment arrived but could not be honoured (the order was already `EXPIRED` or `FAILED`, or the PostgreSQL guard refused an in-time payment) and was refunded. Final. Replaces `EXPIRED` and `FAILED`, never `CONFIRMED` |
 
 ```json
-{"status": "PENDING", "position": 42}
+{"status": "PENDING"}
 {"status": "AWAITING_PAYMENT", "payment_url": "http://localhost:8090/fake-pay/fake_cs_3f2a...", "expires_at": "2026-10-28T20:05:01.234Z"}
 {"status": "CONFIRMED"}
 ```
